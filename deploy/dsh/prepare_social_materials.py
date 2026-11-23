@@ -9,6 +9,8 @@ import shutil
 
 import yaml
 
+from configure_social import strict_json   # 严格的 JSON（拒绝 NaN／重复键等）；上游的 package.json 也不当成可信的
+
 
 class DataLoader(yaml.SafeLoader):
     pass
@@ -23,7 +25,7 @@ OPENCC_T2CN_SHA256 = "b78e83f940e73a022d8d996333e924edf07aa5b6133b8cddd46fbbff1a
 
 
 def prepare(fish, persona, target, opencc):
-    package = json.loads((fish / "package.json").read_text(encoding="utf-8"))
+    package = strict_json((fish / "package.json").read_bytes())
     if package["version"] != "1.3.7" or package["license"] != "MIT":
         raise ValueError("记忆库版本或许可不符。")
     expected = "0fe490abf945ce00ac3156d4f1ff0caa2b1ade02337c31306d1381454b439444"
@@ -34,13 +36,13 @@ def prepare(fish, persona, target, opencc):
     shutil.copytree(fish / "lib", fish_target / "lib", dirs_exist_ok=True)
     for name in ("package.json", "LICENSE", "cordis.patch.yml", "README.md"):
         shutil.copyfile(fish / name, fish_target / name)
-    social = target / "social-0.1.42"
+    social = target / "social-0.1.50"
     social.mkdir(exist_ok=True)
     source = pathlib.Path(__file__).resolve().parents[1] / "social"
-    for name in ("package.json", "cordis.patch.yml", "index.mjs", "bridge.mjs", "ledger.mjs", "memory.mjs", "discord-tools.mjs", "notes.mjs", "archive.mjs", "spend.mjs", "chat-tools.mjs", "gif-tools.mjs", "image-memory.mjs", "balance-tool.mjs", "meme-library.mjs","compaction.mjs", "compaction-label.mjs", "doctor.mjs"):
+    for name in ("package.json", "cordis.patch.yml", "index.mjs", "bridge.mjs", "ledger.mjs", "memory.mjs", "discord-tools.mjs", "notes.mjs", "archive.mjs", "spend.mjs", "chat-tools.mjs", "gif-tools.mjs", "image-memory.mjs", "balance-tool.mjs", "meme-library.mjs","compaction.mjs", "compaction-label.mjs", "doctor.mjs", "usage-log.mjs", "feedings.mjs"):
         shutil.copyfile(source / name, social / name)
     # 繁简转换只取单一 ESM 档，连同 MIT／Apache-2.0 授权一起放进私人 VM 材料。
-    opencc_package = json.loads((opencc / "package.json").read_text(encoding="utf-8"))
+    opencc_package = strict_json((opencc / "package.json").read_bytes())
     cn2t = opencc / "dist/esm/cn2t.js"
     # t2cn：贴图标记里的繁体情绪词转回简体，才查得到表情资料。
     t2cn = opencc / "dist/esm/t2cn.js"
@@ -103,9 +105,9 @@ def prepare(fish, persona, target, opencc):
 """ + prefix[end:]
         role["config"]["prefix"] = prefix
         rows.append(row)
-    preset = target / "social-presets-0.45.0"
+    preset = target / "social-presets-0.53.0"
     preset.mkdir(exist_ok=True)
-    (preset / "package.json").write_text(json.dumps({"name": "dsh-social-presets", "version": "0.45.0", "private": True, "dsh": {"bundle": {"patch": "./cordis.patch.yml"}}}, indent=2) + "\n", encoding="utf-8")
+    (preset / "package.json").write_text(json.dumps({"name": "dsh-social-presets", "version": "0.53.0", "private": True, "dsh": {"bundle": {"patch": "./cordis.patch.yml"}}}, indent=2) + "\n", encoding="utf-8")
     (preset / "cordis.patch.yml").write_text(yaml.safe_dump([{"insert": rows}], allow_unicode=True, sort_keys=False), encoding="utf-8")
     shutil.copyfile(persona / "LICENSE", preset / "LICENSE")
     print(json.dumps({"prepared": True, "fish_entry_sha256": hashlib.sha256((fish / "lib/index.js").read_bytes()).hexdigest(), "preset_ids": [row["config"]["id"] for row in rows]}))

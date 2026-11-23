@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Buffer } from 'node:buffer';
+import { randomUUID } from 'node:crypto';
 import {
 	existsSync,
 	mkdirSync,
@@ -15,7 +16,12 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { TokenLedger } from './ledger.mjs';
 import { MemoryStore } from './memory.mjs';
-import { SocialRuntime, TURN_STEPS_TEXT } from './index.mjs';
+import { blocksDuplicate, collapseRevised, judgeSources } from './archive.mjs';
+import {
+	SocialRuntime,
+	TURN_STEPS_TEXT,
+	formatStickerCatalog,
+} from './index.mjs';
 import { assertGroupSession, redactSecrets } from './bridge.mjs';
 import {
 	OWNER_ONLY_TOOLS,
@@ -36,6 +42,7 @@ import { gifTitle, gifTools } from './gif-tools.mjs';
 import { ImageMemory, distance, snowflakeTime } from './image-memory.mjs';
 import { balanceTools } from './balance-tool.mjs';
 import { MemeLibrary } from './meme-library.mjs';
+import { UsageLog, callKind } from './usage-log.mjs';
 import { summaryLabel, withSummaryLabel } from './compaction-label.mjs';
 import { SpendWatch, spendText } from './spend.mjs';
 import { doctorText, runDoctor } from './doctor.mjs';
@@ -365,6 +372,120 @@ test('模型流水线实际占额与结算，费用命令不会在群内输出�
 	assert.throws(() => new TokenLedger(runtime.ledger.root), /损坏/);
 });
 
+test('用量监控：认出调用类别，记每轮第几次对话调用与版本', async (t) => {
+	assert.equal(callKind({ sessionId: 's', tools: [{}] }), 'chat');
+	assert.equal(callKind({ sessionId: 's' }), 'compaction');
+	assert.equal(callKind({ system: '你负责判断一位鲸鱼娘 AI 群友' }), 'judge');
+	assert.equal(callKind({ system: '你在幫鯨魚娘整理她在 Discord' }), 'notes');
+	assert.equal(callKind({ system: '人设\n\n你現在在 Discord 群聊。' }), 'eval');
+	assert.equal(callKind({ system: [{ text: '别的' }] }), 'other');
+	const { runtime } = fixture(t);
+	runtime.bindings.s1 = 'group';
+	async function* stream() {
+		yield {
+			type: 'usage',
+			usage: { inputTokens: 100, cacheReadTokens: 900, outputTokens: 7 },
+		};
+	}
+	const call = (options) => runtime.stream({ ...request, ...options }, stream);
+	for (const options of [
+		{ sessionId: 's1', tools: [{}] },
+		{ sessionId: 's1' },
+		{ sessionId: 's1', tools: [{}] },
+	])
+		for await (const chunk of call(options)) void chunk;
+	const rows = readFileSync(runtime.usage.callsPath, 'utf8')
+		.trim()
+		.split('\n')
+		.map((line) => JSON.parse(line));
+	assert.deepEqual(
+		rows.map(({ kind, scope, step, fresh, cache, out }) => ({
+			kind,
+			scope,
+			step,
+			fresh,
+			cache,
+			out,
+		})),
+		[
+			{ kind: 'chat', scope: 'group', step: 1, fresh: 100, cache: 900, out: 7 },
+			{
+				kind: 'compaction',
+				scope: 'group',
+				step: undefined,
+				fresh: 100,
+				cache: 900,
+				out: 7,
+			},
+			{ kind: 'chat', scope: 'group', step: 2, fresh: 100, cache: 900, out: 7 },
+		],
+	);
+	assert.equal(
+		rows[0].v,
+		JSON.parse(
+			readFileSync(
+				new globalThis.URL('./package.json', import.meta.url),
+				'utf8',
+			),
+		).version,
+		'版本取自套件的 package.json',
+	);
+});
+
+test('用量报告：按部署切版本，算每轮 token 与期间余额减少（充值不算）', (t) => {
+	const dir = temporary(t);
+	const hour = 3600000;
+	const first = new UsageLog(dir, { version: '0.1.1', now: 0 });
+	const turn = (t, step, cache) =>
+		first.record({
+			kind: 'chat',
+			scope: 'group',
+			step,
+			usage: { inputTokens: 1000, cacheReadTokens: cache, outputTokens: 50 },
+			now: t,
+		});
+	turn(1, 1, 100000);
+	turn(2, 2, 100000);
+	first.record({ kind: 'judge', usage: { inputTokens: 500 }, now: 3 });
+	first.balance(10, 0);
+	first.balance(9.5, hour);
+	first.balance(20, hour + 1);
+	assert.equal(
+		new UsageLog(dir, { version: '0.1.1', now: 5 }).versions(5).length,
+		1,
+		'同一版重启不算部署',
+	);
+	const second = new UsageLog(dir, { version: '0.1.2', now: 2 * hour });
+	second.record({
+		kind: 'chat',
+		step: 1,
+		usage: { inputTokens: 2000, cacheReadTokens: 108000, outputTokens: 40 },
+		now: 2 * hour + 1,
+	});
+	second.balance(20, 2 * hour + 2);
+	second.balance(19.9, 3 * hour);
+	const [old, now] = second.versions(4 * hour);
+	assert.equal(old.turns, 1);
+	assert.equal(old.chatCalls, 2);
+	assert.equal(old.cache, 200000);
+	assert.deepEqual(old.kinds.judge, { calls: 1, tokens: 500 });
+	assert.ok(Math.abs(old.spent - 0.5) < 1e-9, '充值那笔不算花费');
+	assert.equal(now.turns, 1);
+	assert.ok(Math.abs(now.spent - 0.1) < 1e-9);
+	const text = second.report(4 * hour, () => 'T');
+	assert.ok(text.includes('【0.1.1】T 起'));
+	assert.ok(
+		text.includes('每轮 2.00 次调用；每轮新输入 2000、快取 200000、输出 100'),
+	);
+	assert.ok(text.includes('【0.1.2】'));
+	assert.ok(text.includes('每轮约 10.00 分'));
+	assert.ok(text.includes('轮数还少'));
+	assert.equal(
+		new UsageLog(temporary(t)).report(),
+		'还没有用量纪录（这版上线后才开始记）。',
+	);
+});
+
 function groupRuntime(t, config = {}, ctx = { get: () => undefined }) {
 	return new SocialRuntime(
 		ctx,
@@ -385,7 +506,8 @@ test('群聊说明用繁体口吻，不教模型解释记录；主人称呼可�
 		{ at: '2026-10-27T15:00:00.000Z', authorName: '阿明', text: '喜歡海風' },
 	]);
 	assert.ok(text.includes('這次說話的人：阿明［站長］'));
-	assert.ok(text.includes('叫 TA「主人」'));
+	assert.ok(text.includes('叫站長「主人」'));
+	assert.ok(!text.includes('不要叫主人'));
 	assert.ok(text.includes('- 10-27 阿明：喜歡海風'));
 	for (const banned of ['坦白不知道', '没有记忆', 'JSON', 'isOwner'])
 		assert.ok(!text.includes(banned), banned);
@@ -395,13 +517,22 @@ test('群聊说明用繁体口吻，不教模型解释记录；主人称呼可�
 	);
 	assert.ok(plain.includes('不要叫主人'));
 	assert.ok(!plain.includes('你記得的事'));
+	// 换成别的称呼：用那个称呼，也明说不要叫主人。
+	const custom = groupRuntime(t, { ownerTitle: '生物爹' }).groupContext(
+		{ authorName: '阿明', owner: true },
+		[],
+	);
+	assert.ok(custom.includes('叫站長「生物爹」'));
+	assert.ok(custom.includes('不要叫主人'));
 });
 
 test('饭钱不到 5 元委婉暗示（2 小时一次），不到 2 元直接要饭（40 分钟一次）', (t) => {
 	const runtime = groupRuntime(t);
 	const source = { authorName: '阿明', owner: false, channelId: 'room' };
 	runtime.spend.state.readings = [{ t: Date.now(), total: 6 }];
-	assert.ok(!runtime.groupContext(source, []).includes('飯錢'), '还够就不提');
+	const enough = runtime.groupContext(source, []);
+	assert.ok(enough.includes('大約剩 6.00 元'), '每轮都附饭钱');
+	assert.ok(!/有點緊|要飯/.test(enough), '还够就不提要饭');
 	runtime.spend.state.readings.push({ t: Date.now(), total: 3.6 });
 	const start = Date.now();
 	const gentle = runtime.hungerNote({ ...source, channelId: 'gentle' }, start);
@@ -430,6 +561,46 @@ test('饭钱不到 5 元委婉暗示（2 小时一次），不到 2 元直接要
 		'别的频道各算各的',
 	);
 	assert.match(runtime.hungerNote(source, now + 41 * 60000), /要飯/);
+});
+
+test('投餵纪录：只有站长私讯 /投餵 能登记，她每轮看得到名单', async (t) => {
+	const runtime = groupRuntime(t);
+	runtime.spend.state.readings = [{ t: Date.now(), total: 10.24 }];
+	const source = { authorName: 'ロクサス', owner: false, channelId: 'room' };
+	assert.match(
+		runtime.groupContext(source, []),
+		/目前沒有記下誰投餵過你/,
+	);
+	const replies = [];
+	const send = async (content, author = 'owner', guild) =>
+		runtime.control(
+			{ guild_id: guild, channel_id: 'dm', author: { id: author }, content },
+			async (text) => replies.push(text),
+		);
+	assert.equal(await send('/投餵 ロクサス 10', 'roxas'), true);
+	assert.equal(replies.length, 0, '别人登记不了，也不回');
+	await send('/投餵 ロクサス 10', 'owner', 'guild');
+	assert.match(replies.at(-1), /请私讯/);
+	assert.equal(runtime.feedings.list().length, 0, '群里登记不算');
+	await send('/投喂 ロクサス 10 元 TNG');
+	assert.match(replies.at(-1), /记下了：ロクサス 投餵 10 元/);
+	await send('/投餵 rylsatan 5.5');
+	await send('/投餵 ロクサス 2');
+	await send('/投餵 阿明 abc');
+	assert.match(replies.at(-1), /用法/);
+	await send('/投餵');
+	assert.match(replies.at(-1), /1\. .* ロクサス 10 元（TNG）\n2\. .* rylsatan 5\.5 元\n3\. .* ロクサス 2 元/);
+	const context = runtime.groupContext(source, []);
+	assert.match(context, /大約剩 10\.24 元/);
+	assert.match(context, /真的投餵過你的人.*：ロクサス 12 元.*、rylsatan 5\.5 元/, '喂最多的排前面');
+	assert.match(context, /rylsatan 5\.5 元/);
+	assert.match(context, /誰餵過你只認這份/);
+	assert.ok(!context.includes('站長確認'), '不提站长确认');
+	await send('/投餵 删 2');
+	assert.match(replies.at(-1), /删掉了：rylsatan/);
+	assert.ok(!runtime.groupContext(source, []).includes('rylsatan'));
+	await send('/投餵 删 9');
+	assert.match(replies.at(-1), /没有第 9 笔/);
 });
 
 test('风格测试从 inbox 读题、跑模型、写 outbox，不经过 Discord', async (t) => {
@@ -1624,7 +1795,7 @@ test('人物卡：Obsidian 格式、同一件事不重复、曾用名累积；�
 	const context = notes.context([{ id: '500000000000000808' }, { id: '1' }]);
 	assert.ok(context.includes('- 群裡禁止洗版'));
 	assert.ok(!context.includes('打牌'), '待确认的不带');
-	assert.ok(context.includes('【xiaoluo】'));
+	assert.ok(context.includes('【xiaoluo｜500000000000000808】'));
 	assert.ok(context.includes('- 家裡有兩隻貓'));
 });
 
@@ -1797,7 +1968,7 @@ test('背景整理：模型挑出的事写进人物卡、日记、召回记录�
 	);
 });
 
-test('贴图标记：繁体情绪词转简体再查，换成 GIF 附件，最多两张，查不到的略过', async (t) => {
+test('贴图标记：繁体转简体再查，只认目录里的名字，换成 GIF 附件，最多两张，查不到的略过', async (t) => {
 	const root = temporary(t);
 	const gif = join(root, 'kaixin.gif');
 	writeFileSync(gif, Buffer.from('GIF89a'));
@@ -1819,6 +1990,12 @@ test('贴图标记：繁体情绪词转简体再查，换成 GIF 附件，最多
 			if (sticker.id === '坏掉') throw new Error('download failed');
 			return { path: gif, sticker };
 		},
+		// 目录里有的名字；「无语」只是情绪词。
+		async resolve(ref) {
+			return ['开心', '坏掉', '猫猫搓手'].includes(ref)
+				? { id: ref }
+				: undefined;
+		},
 	};
 	const runtime = groupRuntime(
 		t,
@@ -1833,7 +2010,8 @@ test('贴图标记：繁体情绪词转简体再查，换成 GIF 附件，最多
 	);
 	assert.equal(
 		asked[0],
-		'好啦 [sticker:开心] [sticker:坏掉] [sticker:无语] [sticker:开心]',
+		'好啦 [sticker:开心] [sticker:坏掉]  [sticker:开心]',
+		'目录里没有的（情绪词）不交给插件随机抽',
 	);
 	assert.equal(result.files.length, 2);
 	assert.equal(result.files[0].filename, 'kaixin.gif');
@@ -2291,6 +2469,121 @@ test('台词梗图：按台词找最像的一张，不像就不给，轮着发',
 	const second = library.find('得加钱').filename;
 	assert.notEqual(first, second, '差不多像的轮着发');
 	assert.deepEqual([first, second].sort(), ['097.webp', '098.webp']);
+	// 给她看的台词清单：只列短的、有字的。
+	assert.deepEqual(library.quotes(), [
+		'真当我是便宜货啊',
+		'得加钱',
+		'这活得加钱',
+	]);
+	const runtime = groupRuntime(t);
+	runtime.memeLibrary = library;
+	assert.equal(
+		runtime.memeCatalog(),
+		'梗圖台詞（圖上寫的就是這句話；[梗圖:台詞] 照抄一句）：\n真当我是便宜货啊、得加钱、这活得加钱',
+	);
+	runtime.memeLibrary = undefined;
+	runtime.memeCatalogKey = undefined;
+	assert.equal(runtime.memeCatalog(), '', '没有图库就不列');
+});
+
+test('台词梗图：原图超过 Discord 上限时发送才压，压过的重复用，压不下去送预览', async (t) => {
+	const root = temporary(t);
+	mkdirSync(join(root, 'img-original'), { recursive: true });
+	mkdirSync(join(root, 'img'), { recursive: true });
+	const memes = [
+		{ n: '001', quote: '得加钱', file: 'img-original/001.jpg' },
+		{
+			n: '002',
+			quote: '吃白饭',
+			file: 'img-original/002.png',
+			fallback: 'img/002.webp',
+		},
+		{
+			n: '003',
+			quote: '晚安鲸鱼',
+			file: 'img-original/003.png',
+			fallback: 'img/003.webp',
+		},
+	];
+	writeFileSync(join(root, 'img-original/001.jpg'), 'small');
+	writeFileSync(join(root, 'img-original/002.png'), Buffer.alloc(10_000_001));
+	writeFileSync(join(root, 'img-original/003.png'), Buffer.alloc(10_000_001));
+	writeFileSync(join(root, 'img/002.webp'), 'preview2');
+	writeFileSync(join(root, 'img/003.webp'), 'preview3');
+	writeFileSync(join(root, 'index.json'), JSON.stringify({ memes }));
+	const library = new MemeLibrary(root);
+	const calls = [];
+	const compress = async (source, base) => {
+		calls.push(source);
+		if (source.endsWith('003.png')) return undefined;
+		writeFileSync(base + '.webp', 'squeezed');
+		return base + '.webp';
+	};
+	const small = await library.attachment(library.find('得加钱'), { compress });
+	assert.deepEqual(
+		[small.filename, String(small.data)],
+		['001.jpg', 'small'],
+		'上限内原图照送',
+	);
+	const big = await library.attachment(library.find('吃白饭'), { compress });
+	assert.deepEqual([big.filename, String(big.data)], ['002.webp', 'squeezed']);
+	await library.attachment(library.find('吃白饭'), { compress });
+	assert.equal(calls.length, 1, '压过的存起来重复用');
+	assert.equal(
+		readFileSync(join(root, 'img-original/002.png')).length,
+		10_000_001,
+		'原图不动',
+	);
+	const fallback = await library.attachment(library.find('晚安鲸鱼'), {
+		compress,
+	});
+	assert.deepEqual(
+		[fallback.filename, String(fallback.data)],
+		['003.webp', 'preview3'],
+		'压不下去送预览图',
+	);
+});
+
+test('台词梗图：真的用 ffmpeg 把超过上限的图压下去', { skip: !process.env.PATH?.match(/ffmpeg/i) && process.platform === 'win32' }, async (t) => {
+	const { compressForDiscord } = await import('./meme-library.mjs');
+	const { execFileSync } = await import('node:child_process');
+	const root = temporary(t);
+	const still = join(root, 'noise.png');
+	const gif = join(root, 'noise.gif');
+	execFileSync('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'nullsrc=s=1600x1200,geq=random(1)*255:128:128', '-frames:v', '1', still]);
+	execFileSync('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'nullsrc=s=640x480:d=1,geq=random(1)*255:128:128', gif]);
+	for (const [source, ext] of [[still, '.webp'], [gif, '.gif']]) {
+		const limit = Math.floor(readFileSync(source).length / 3);
+		const made = await compressForDiscord(source, join(root, 'out-' + ext.slice(1)), limit);
+		assert.ok(made?.endsWith(ext), source);
+		assert.ok(readFileSync(made).length <= limit);
+	}
+});
+
+test('贴图目录：按情绪分组写出名字与用途，图上的字也写，名字重复用档名', () => {
+	const text = formatStickerCatalog([
+		{
+			name: '猫猫搓手',
+			stem: '10N01_猫猫搓手',
+			emotion: '兴奋',
+			use: '期待好事发生时',
+		},
+		{
+			name: '宣判',
+			stem: '16N04_宣判',
+			emotion: '生气',
+			use: '宣判死刑时',
+			text: '死刑',
+		},
+		{ name: '睡', stem: '1N01_睡', emotion: '疲惫', use: '想睡时' },
+		{ name: '睡', stem: '2N01_睡', emotion: '疲惫', use: '睡着时' },
+		{ name: '没用途', stem: 'X_没用途', emotion: '其他' },
+	]);
+	assert.ok(text.includes('【兴奋】\n猫猫搓手：期待好事发生时'));
+	assert.ok(text.includes('宣判：宣判死刑时（圖上寫「死刑」）'));
+	assert.ok(text.includes('1N01_睡：想睡时\n2N01_睡：睡着时'));
+	assert.ok(!text.includes('没用途'));
+	assert.equal(formatStickerCatalog([]), '');
 });
 
 test('my_balance：报余额、今天花多少、还能撑几天；读不到就不猜', async () => {
@@ -2338,4 +2631,521 @@ test('群聊文字转繁体但不动程式码与网址，转换器坏掉时送�
 		async () => fake,
 	);
 	assert.equal(text, '簡单 `后台` 之後 https://x.cn/后 ```\n后\n```');
+});
+
+// ---------- 派生层使用前核对出处（记忆记录、人物卡、日记、事实带进提示之前，用原文帐本核对来源） ----------
+const WHERE = { channel_id: '700000001', guild_id: '5550001' };
+const KAI = { id: '910000000000000001', global_name: '阿甲' };
+const BOT = { id: '910000000000000077', global_name: '鯨魚娘', bot: true };
+const ISO = (text) => Date.parse(text);
+
+function provenanceRuntime(t, config = {}) {
+	const runtime = groupRuntime(t, config);
+	runtime.archive = new ArchiveStore(join(temporary(t), 'archive'));
+	const say = (id, author, content, timestamp) =>
+		runtime.archive.record('message', { id, ...WHERE, timestamp, author, content });
+	const remove = (id, at) => {
+		runtime.archive.now = () => ISO(at);
+		runtime.archive.record('delete', { id, ...WHERE });
+	};
+	const edit = (id, author, content, at) =>
+		runtime.archive.record('edit', { id, ...WHERE, author, content, edited_timestamp: at, timestamp: at });
+	const remember = (text, messageId, { at = '2026-10-20T02:00:00.000Z', kind = 'event' } = {}) =>
+		runtime.memory.append(
+			'group',
+			{ id: randomUUID(), type: 'memory', at, authorId: KAI.id, authorName: '阿甲', messageId, kind, importance: 0.5, tags: [] },
+			text,
+		);
+	return { runtime, say, remove, edit, remember };
+}
+
+test('出处核对：来源被删的记忆记录、人物卡条目、事实不带进提示；查不到来源的照旧带', (t) => {
+	const { runtime, say, remove, remember } = provenanceRuntime(t);
+	say('900000001', KAI, '我下個月要去日本出差', '2026-10-20T01:00:00Z');
+	say('900000002', KAI, '我養了兩隻貓', '2026-10-20T02:00:00Z');
+	remove('900000001', '2026-10-21T01:00:00Z');
+	remember('阿甲下個月要去日本出差', '900000001');
+	remember('阿甲養了兩隻貓', '900000002');
+	remember('早期的記憶沒有出處', 'consolidated');
+	assert.deepEqual(
+		runtime.memory.recallAcross(['group'], '阿甲').map((record) => record.text).sort(),
+		['早期的記憶沒有出處', '阿甲養了兩隻貓'],
+	);
+	const now = ISO('2026-10-20T03:00:00Z');
+	runtime.notes.updateCard(KAI.id, '阿甲', [
+		{ text: '下個月要去日本出差', src: ['900000001'] },
+		{ text: '養了兩隻貓', src: ['900000002'] },
+		{ text: '喜歡海風' },
+	], now);
+	runtime.notes.addFact('群規：不洗版（出差那位說的）', { src: ['900000001'], now });
+	runtime.notes.addFact('固定週五打牌', { src: ['900000002'], now });
+	const context = runtime.notes.context([{ id: KAI.id }]);
+	assert.ok(!context.includes('日本'), '被删来源整理出的人物卡条目不带');
+	assert.ok(!context.includes('洗版'), '被删来源整理出的事实不带');
+	assert.ok(context.includes('養了兩隻貓〔原文 900000002〕'));
+	assert.ok(context.includes('喜歡海風'), '没有出处的照旧带');
+	assert.ok(context.includes('固定週五打牌〔原文 900000002〕'));
+});
+
+test('出处核对：来源是她自己说的话不当证据——记忆记录不带；人物卡条目全是她自己的话不带，混着真话的带真话的出处', (t) => {
+	const { runtime, say, remember } = provenanceRuntime(t);
+	say('900000010', KAI, '我家養了兩隻貓', '2026-10-10T01:00:00Z');
+	say('900000011', BOT, '阿甲家養了三隻狗喔我記得', '2026-10-14T01:00:00Z');
+	remember('阿甲家養了三隻狗', '900000011');
+	remember('阿甲家養了兩隻貓', '900000010');
+	assert.deepEqual(runtime.memory.recallAcross(['group'], '阿甲家').map((record) => record.text), ['阿甲家養了兩隻貓']);
+	const now = ISO('2026-10-15T03:00:00Z');
+	runtime.notes.updateCard(KAI.id, '阿甲', [
+		{ text: '家裡養了三隻狗', src: ['900000011'] },
+		{ text: '家裡養了兩隻貓', src: ['900000010'] },
+		{ text: '喜歡海風', src: ['900000011', '900000010'] },
+	], now);
+	const context = runtime.notes.context([{ id: KAI.id }]);
+	assert.ok(!context.includes('三隻狗'));
+	assert.ok(context.includes('家裡養了兩隻貓〔原文 900000010〕'));
+	assert.ok(context.includes('喜歡海風〔原文 900000010〕'), '来源混着真话，出处挑不是她自己说的那个');
+	assert.ok(!context.includes('〔原文 900000011〕'));
+});
+
+test('出处核对：来源在整理之后被编辑过就改成编辑后的原话；编辑在整理之前就不动', (t) => {
+	const { runtime, say, edit, remember } = provenanceRuntime(t);
+	say('900000020', KAI, '我下週三要搬家，需要人幫忙搬箱子', '2026-10-20T01:00:00Z');
+	edit('900000020', KAI, '我下週五要搬家，需要人幫忙搬箱子', '2026-10-21T01:00:00Z');
+	remember('阿甲下週三要搬家', '900000020', { at: '2026-10-20T02:00:00.000Z' });
+	const stale = runtime.memory.recallAcross(['group'], '搬家');
+	assert.equal(stale.length, 1);
+	assert.ok(stale[0].text.includes('下週五') && !stale[0].text.includes('週三'));
+	assert.ok(stale[0].text.startsWith('（這條記憶整理的原文後來被編輯過'));
+	assert.equal(stale[0].edited, true);
+	// 在编辑之后才整理出来的：本来就是编辑后的版本，不动。
+	const after = provenanceRuntime(t);
+	after.say('900000021', KAI, '我下週三要搬家', '2026-10-20T01:00:00Z');
+	after.edit('900000021', KAI, '我下週五要搬家', '2026-10-21T01:00:00Z');
+	after.remember('阿甲下週五要搬家', '900000021', { at: '2026-10-22T02:00:00.000Z' });
+	const fresh = after.runtime.memory.recallAcross(['group'], '搬家');
+	assert.deepEqual(fresh.map((record) => record.text), ['阿甲下週五要搬家']);
+	// 人物卡：整理日在编辑日之前或同一天，附上编辑后的原话；整理日在编辑日之后不动。
+	runtime.notes.updateCard(KAI.id, '阿甲', [{ text: '下週三要搬家', src: ['900000020'] }], ISO('2026-10-20T03:00:00Z'));
+	let context = runtime.notes.context([{ id: KAI.id }]);
+	assert.match(context, /下週三要搬家（原文後來被編輯過，現在的原話：「我下週五要搬家，需要人幫忙搬箱子」）〔原文 900000020〕/);
+	after.runtime.notes.updateCard(KAI.id, '阿甲', [{ text: '下週五要搬家', src: ['900000021'] }], ISO('2026-10-22T03:00:00Z'));
+	context = after.runtime.notes.context([{ id: KAI.id }]);
+	assert.ok(context.includes('下週五要搬家〔原文 900000021〕') && !context.includes('後來被編輯'));
+});
+
+test('问一个帐本里从没出现过的人：事件记忆与想起的旧话不带（事实照带）；有已知的人名、一般词、被提过的名字不算', (t) => {
+	const { runtime, say, remember } = provenanceRuntime(t, { recallMinScore: 0.1 });
+	say('900000030', KAI, '最近我在學吉他，每天練半小時', '2026-10-10T01:00:00Z');
+	say('900000031', KAI, '阿戊昨天有來過', '2026-10-11T01:00:00Z');
+	remember('阿甲最近在學吉他', '900000030');
+	remember('群裡每週五打牌', '900000030', { kind: 'fact' });
+	// 提问本身早就记进帐本了（桥接先记帐本才交给会话）：不能因为它而让「阿己」变成有人提过。
+	say('900000039', KAI, '阿己最近在忙什麼', '2026-10-12T01:00:00Z');
+	say('900000038', KAI, '阿庚最近我在學吉他每天練半小時嗎', '2026-10-12T02:00:00Z');
+	const texts = (query) => runtime.memory.recallAcross(['group'], query).map((record) => record.text).sort();
+	assert.deepEqual(runtime.archive.subject('阿己最近在忙什麼'), { known: [], unknown: ['阿己最'] });
+	assert.deepEqual(texts('阿己最近在忙什麼'), ['群裡每週五打牌'], '从没出现过的人：只剩常驻的事实');
+	assert.deepEqual(texts('阿甲最近在學什麼'), ['群裡每週五打牌', '阿甲最近在學吉他'], '已知的人名：照常');
+	assert.deepEqual(texts('阿戊最近在忙什麼'), ['群裡每週五打牌', '阿甲最近在學吉他'], '帐本里有人提过阿戊：不算没出现过');
+	assert.deepEqual(runtime.archive.subject('小心一點，老師來了，阿姨也來了').unknown, [], '一般词不是外號');
+	assert.deepEqual(runtime.archive.subject('今天吃什麼').unknown, []);
+	// 想起旧话也一样：问阿己，不用「最近」「在學」去凑别人的话。
+	const agent = { id: 'a', session: { header: { cwd: '/srv/dsh/discord' } } };
+	const ask = (text) => runtime.relatedLines(agent, { text, channelId: 'other', messageId: 'q' }).map((row) => row.id);
+	assert.ok(ask('最近我在學吉他每天練半小時嗎').includes('900000030'), '对照：同样的字词，没有陌生的名字就想得起来');
+	assert.deepEqual(ask('阿庚最近我在學吉他每天練半小時嗎'), [], '问的是没出现过的阿庚（只有这句提问本身提到）：不带别人的话');
+});
+
+test('翻原文：同名的两个人在结果里带 discord id；预设不含她自己说的话，要核对才带', async (t) => {
+	const { runtime, say } = provenanceRuntime(t);
+	runtime.channelLabel = async () => ({ channel: '閒聊' });
+	say('900000040', { id: '910000000000000021', global_name: '小明' }, '我對花生過敏', '2026-10-20T01:00:00Z');
+	say('900000041', { id: '910000000000000022', global_name: '小明' }, '我正在準備考研究所', '2026-10-20T02:00:00Z');
+	say('900000042', KAI, '我也要考研究所', '2026-10-20T03:00:00Z');
+	say('900000043', BOT, '你們都在考研究所對吧我記得', '2026-10-20T04:00:00Z');
+	const tools = Object.fromEntries(chatTools(runtime).map((tool) => [tool.name, tool]));
+	const group = { agent: { session: { header: { cwd: '/srv/dsh/discord' } } } };
+	let result = await tools.chat_search.execute({ author: '小明' }, group);
+	assert.match(result.message, /小明（910000000000000021）：我對花生過敏/);
+	assert.match(result.message, /小明（910000000000000022）：我正在準備考研究所/);
+	result = await tools.chat_search.execute({ query: '研究所' }, group);
+	assert.ok(!result.message.includes('我記得'), '她自己说的话预设不算');
+	assert.ok(!result.message.includes('（910000000000000022）') || !result.message.includes('阿甲（'), '只有一个阿甲：不附 id');
+	assert.match(result.message, /阿甲：我也要考研究所/);
+	result = await tools.chat_search.execute({ query: '研究所', include_self: true }, group);
+	assert.match(result.message, /鯨魚娘：你們都在考研究所對吧我記得/);
+	result = await tools.chat_search.execute({ author: '鯨魚娘' }, group);
+	assert.match(result.message, /鯨魚娘：你們都在考研究所對吧我記得/, '指定作者就是她自己：找得到');
+	assert.equal(tools.chat_search.parameters.properties.include_self.type, 'boolean');
+});
+
+test('人物卡标题带 discord id：同名的两个人分得开', (t) => {
+	const { runtime, say } = provenanceRuntime(t);
+	say('900000050', { id: '910000000000000021', global_name: '小明' }, '我對花生過敏', '2026-10-20T01:00:00Z');
+	say('900000051', { id: '910000000000000022', global_name: '小明' }, '我正在準備考研究所', '2026-10-20T02:00:00Z');
+	const now = ISO('2026-10-20T03:00:00Z');
+	runtime.notes.updateCard('910000000000000021', '小明', [{ text: '對花生過敏', src: ['900000050'] }], now);
+	runtime.notes.updateCard('910000000000000022', '小明', [{ text: '正在準備考研究所', src: ['900000051'] }], now);
+	const context = runtime.notes.context([{ id: '910000000000000021' }, { id: '910000000000000022' }]);
+	const headings = context.match(/^【[^】]*】/gm);
+	assert.deepEqual(headings, ['【小明｜910000000000000021】', '【小明｜910000000000000022】']);
+});
+
+test('帐本逐档快取：档案变了就重读；回传的行被改不会污染快取；index 跟着删除走', (t) => {
+	const archive = new ArchiveStore(join(temporary(t), 'archive'));
+	const row = (id, content) => archive.record('message', { id, ...WHERE, timestamp: '2026-10-20T01:00:00Z', author: KAI, content });
+	row('900000060', '第一句');
+	const first = archive.load();
+	first[0].content = '被呼叫端改掉了';
+	assert.equal(archive.load()[0].content, '第一句', '快取里的行不会被呼叫端改到');
+	row('900000061', '第二句');
+	assert.deepEqual(archive.load().map((r) => r.id), ['900000060', '900000061'], '档案变大就重读');
+	assert.equal(archive.lookup('900000061').content, '第二句');
+	assert.equal(archive.lookup('900000099'), undefined);
+	archive.now = () => ISO('2026-10-21T01:00:00Z');
+	archive.record('delete', { id: '900000060', ...WHERE });
+	assert.equal(archive.lookup('900000060').deleted, true);
+	assert.deepEqual(archive.load().map((r) => r.id), ['900000061']);
+	assert.equal(archive.index().messages.get('900000061').bot, false);
+});
+
+test('出处核对本身出错不挡聊天：照旧带', (t) => {
+	const { runtime, remember } = provenanceRuntime(t);
+	remember('阿甲養了兩隻貓', '900000070');
+	runtime.notes.updateCard(KAI.id, '阿甲', [{ text: '養了兩隻貓', src: ['900000070'] }], ISO('2026-10-20T03:00:00Z'));
+	const boom = () => {
+		throw new Error('boom');
+	};
+	runtime.memory.provenance = { resolver: boom };
+	runtime.notes.provenance = { resolver: () => ({ lookup: boom }) };
+	assert.deepEqual(runtime.memory.recallAcross(['group'], '阿甲').map((record) => record.text), ['阿甲養了兩隻貓']);
+	assert.ok(runtime.notes.context([{ id: KAI.id }]).includes('養了兩隻貓〔原文 900000070〕'));
+	runtime.memory.provenance = null;
+	runtime.notes.provenance = null;
+	assert.equal(runtime.memory.recallAcross(['group'], '阿甲').length, 1, '没接帐本：不核对');
+});
+
+// ---------- 出处核对之后的去重：来源已失效的旧条目不能再挡住后来有效出处说的同一件事 ----------
+function staleThenFresh(t) {
+	const env = provenanceRuntime(t);
+	env.say('900000101', KAI, '我下個月要去日本出差', '2026-10-20T01:00:00Z');
+	env.remove('900000101', '2026-10-21T01:00:00Z');
+	env.say('900000102', KAI, '我下個月真的要去日本出差喔', '2026-10-22T01:00:00Z');
+	env.runtime.archive.now = () => ISO('2026-10-22T02:00:00Z');
+	return env;
+}
+const SOURCE = (messageId) => ({ authorId: KAI.id, authorName: '阿甲', messageId });
+
+test('去重：旧来源被删后，同一件事用新的有效出处再提，记忆会写入并召回；来源还有效的重复照样抑制', (t) => {
+	const { runtime } = staleThenFresh(t);
+	const first = runtime.memory.remember('group', SOURCE('900000101'), { text: '阿甲下個月要去日本出差' }, ISO('2026-10-20T02:00:00Z'));
+	assert.equal(first.ok, true);
+	assert.deepEqual(runtime.memory.recallAcross(['group'], '日本'), [], '旧来源已被删：带不进提示');
+	const second = runtime.memory.remember('group', SOURCE('900000102'), { text: '阿甲下個月要去日本出差' }, ISO('2026-10-22T02:00:00Z'));
+	assert.equal(second.ok, true);
+	assert.ok(!second.duplicate, '不能再被已失效的旧记忆当成重复');
+	assert.notEqual(second.id, first.id);
+	assert.deepEqual(runtime.memory.recallAcross(['group'], '日本').map((record) => [record.text, record.messageId]), [['阿甲下個月要去日本出差', '900000102']]);
+	assert.equal(runtime.memory.all('group').filter((record) => record.type === 'memory').length, 2, '旧记录留在档案里不动（只追加）');
+	const third = runtime.memory.remember('group', SOURCE('900000102'), { text: '阿甲下個月要去日本出差' }, ISO('2026-10-22T03:00:00Z'));
+	assert.deepEqual([third.duplicate, third.id], [true, second.id], '来源有效的重复照样抑制');
+});
+
+test('去重：旧记忆的来源后来被编辑成别的内容，同样的字不算同一件事', (t) => {
+	const { runtime, say, edit } = provenanceRuntime(t);
+	say('900000110', KAI, '我下週三要搬家', '2026-10-20T01:00:00Z');
+	edit('900000110', KAI, '我下週五要搬家', '2026-10-21T01:00:00Z');
+	say('900000111', KAI, '搬家那天是下週三沒錯', '2026-10-22T01:00:00Z');
+	const old = runtime.memory.remember('group', SOURCE('900000110'), { text: '阿甲下週三要搬家' }, ISO('2026-10-20T02:00:00Z'));
+	const again = runtime.memory.remember('group', SOURCE('900000111'), { text: '阿甲下週三要搬家' }, ISO('2026-10-22T02:00:00Z'));
+	assert.ok(!again.duplicate && again.id !== old.id);
+	// 人物卡同理
+	runtime.notes.updateCard(KAI.id, '阿甲', [{ text: '下週三要搬家', src: ['900000110'] }], ISO('2026-10-20T03:00:00Z'));
+	assert.deepEqual(runtime.notes.updateCard(KAI.id, '阿甲', [{ text: '下週三要搬家', src: ['900000111'] }], ISO('2026-10-22T03:00:00Z')), ['下週三要搬家']);
+});
+
+test('去重：人物卡——旧来源被删，新的有效出处再提，会加进来并带出；有效的重复照样不重复加', (t) => {
+	const { runtime } = staleThenFresh(t);
+	const t1 = ISO('2026-10-20T03:00:00Z');
+	const t2 = ISO('2026-10-22T03:00:00Z');
+	assert.deepEqual(runtime.notes.updateCard(KAI.id, '阿甲', [{ text: '下個月要去日本出差', src: ['900000101'] }], t1), ['下個月要去日本出差']);
+	assert.equal(runtime.notes.context([{ id: KAI.id }]), '', '来源被删：整张卡藏起来');
+	assert.deepEqual(runtime.notes.updateCard(KAI.id, '阿甲', [{ text: '下個月要去日本出差', src: ['900000102'] }], t2), ['下個月要去日本出差']);
+	assert.match(runtime.notes.context([{ id: KAI.id }]), /下個月要去日本出差〔原文 900000102〕/);
+	assert.deepEqual(runtime.notes.updateCard(KAI.id, '阿甲', [{ text: '下個月要去日本出差', src: ['900000102'] }], t2), [], '有效的重复照样不重复加');
+	assert.equal(runtime.notes.card(KAI.id).notes.length, 2, '被删来源的旧条目留在档案里不动');
+});
+
+test('去重：长期事实与待确认提议——旧来源被删，新的有效出处再提，会加进来；有效的重复照样不加', (t) => {
+	const { runtime } = staleThenFresh(t);
+	const t1 = ISO('2026-10-20T03:00:00Z');
+	const t2 = ISO('2026-10-22T03:00:00Z');
+	assert.equal(runtime.notes.addFact('阿甲下個月去日本出差', { src: ['900000101'], now: t1 }), true);
+	assert.equal(runtime.notes.addFact('阿甲下個月去日本出差', { src: ['900000102'], now: t2 }), true);
+	assert.equal(runtime.notes.addFact('阿甲下個月去日本出差', { src: ['900000102'], now: t2 }), false, '有效的重复不加');
+	assert.deepEqual(runtime.notes.context([]).split('\n').filter((line) => line.includes('日本')), ['- 阿甲下個月去日本出差〔原文 900000102〕']);
+	assert.equal(runtime.notes.facts().facts.length, 2, '旧事实留着');
+	// 待确认的提议同理
+	assert.equal(runtime.notes.addFact('阿甲要搬去大阪', { pending: true, src: ['900000101'], now: t1 }), true);
+	assert.equal(runtime.notes.addFact('阿甲要搬去大阪', { pending: true, src: ['900000102'], now: t2 }), true);
+	assert.equal(runtime.notes.facts().pending.length, 2);
+});
+
+test('去重：背景整理的流程（updateCard 回传新增的几条，再逐条 remember）在旧来源被删后会重新带出', (t) => {
+	const { runtime } = staleThenFresh(t);
+	for (const [messageId, now] of [['900000101', ISO('2026-10-20T03:00:00Z')], ['900000102', ISO('2026-10-22T03:00:00Z')]]) {
+		const added = runtime.notes.updateCard(KAI.id, '阿甲', [{ text: '下個月要去日本出差', src: [messageId] }], now);
+		for (const text of added) runtime.memory.remember('group', SOURCE(messageId), { text }, now);
+	}
+	assert.deepEqual(runtime.memory.recallAcross(['group'], '日本').map((record) => record.messageId), ['900000102']);
+	assert.match(runtime.notes.context([{ id: KAI.id }]), /下個月要去日本出差〔原文 900000102〕/);
+});
+
+test('长期事实先核对再取前 30 条：被藏起来的旧事实不占名额', (t) => {
+	const { runtime, say, remove } = provenanceRuntime(t);
+	say('900000120', KAI, '會被刪的話', '2026-10-20T01:00:00Z');
+	say('900000121', KAI, '一直都在的話', '2026-10-20T02:00:00Z');
+	remove('900000120', '2026-10-21T01:00:00Z');
+	const now = ISO('2026-10-22T00:00:00Z');
+	for (let i = 0; i < 30; i++) runtime.notes.addFact(`第${i}條事實，來源會被刪`, { src: ['900000120'], now });
+	runtime.notes.addFact('最後一條還活著的事實', { src: ['900000121'], now });
+	assert.ok(runtime.notes.context([]).includes('最後一條還活著的事實'), '31 条里前 30 条都藏起来了，第 31 条要带出');
+});
+
+// ---------- 第 3 轮：同一个来源被编辑后再整理、配额、全面一致性 ----------
+// 来源 900000201 "我下週三要搬家" 在 10-21 01:00 被编辑；整理分别发生在编辑之前（10-20）与之后（10-21 03:00）。
+function editedSource(t, config) {
+	const env = provenanceRuntime(t, config);
+	env.say('900000201', KAI, '我家有兩隻猫', '2026-10-20T01:00:00Z');
+	env.edit('900000201', KAI, '我家有兩隻貓', '2026-10-21T01:00:00Z');
+	return env;
+}
+const T1 = ISO('2026-10-20T02:00:00Z');
+const T2 = ISO('2026-10-21T03:00:00Z');
+const consolidate = (runtime, text, messageId, now) => {
+	// 背景整理的流程：updateCard 回传新增的几条，再逐条 remember
+	const added = runtime.notes.updateCard(KAI.id, '阿甲', [{ text, src: [messageId] }], now);
+	return added.map((one) => runtime.memory.remember('group', SOURCE(messageId), { text: one }, now));
+};
+
+test('来源被编辑后再整理（意思没变，同样的字）：不重复写入；记忆只召回一条、人物卡只有一条', (t) => {
+	const { runtime } = editedSource(t);
+	assert.equal(consolidate(runtime, '阿甲家有兩隻貓', '900000201', T1).length, 1);
+	assert.deepEqual(consolidate(runtime, '阿甲家有兩隻貓', '900000201', T2), [], '同一个来源重新整理出一样的字＝同一件事：不再写');
+	assert.equal(runtime.memory.all('group').filter((record) => record.type === 'memory').length, 1);
+	assert.equal(runtime.notes.card(KAI.id).notes.length, 1);
+	assert.equal(runtime.memory.recallAcross(['group'], '阿甲').length, 1);
+	assert.equal(runtime.notes.context([{ id: KAI.id }]).split('\n').filter((line) => line.startsWith('- ')).length, 1);
+	// 直接 remember 也一样
+	const again = runtime.memory.remember('group', SOURCE('900000201'), { text: '阿甲家有兩隻貓' }, T2);
+	assert.equal(again.duplicate, true);
+});
+
+test('来源被编辑后再整理（改成别的意思）：新旧都留档，召回与人物卡新旧都带，旧的一定附编辑后的原话', (t) => {
+	const { runtime } = editedSource(t);
+	consolidate(runtime, '阿甲家有三隻貓', '900000201', T1);
+	assert.equal(consolidate(runtime, '阿甲家有兩隻貓', '900000201', T2).length, 1);
+	assert.equal(runtime.memory.all('group').filter((record) => record.type === 'memory').length, 2, '旧的留在档案里（只追加）');
+	assert.equal(runtime.notes.card(KAI.id).notes.length, 2);
+	const recalled = runtime.memory.recallAcross(['group'], '阿甲');
+	assert.equal(recalled.length, 2, '不藏：新旧都带');
+	assert.ok(recalled.some((record) => record.text === '阿甲家有兩隻貓'));
+	assert.ok(recalled.some((record) => record.edited === true && record.text.includes('我家有兩隻貓') && record.text.startsWith('（這條記憶整理的原文後來被編輯過')), '旧的以编辑后的原话带出');
+	const lines = runtime.notes.context([{ id: KAI.id }]).split('\n').filter((line) => line.startsWith('- '));
+	assert.equal(lines.length, 2);
+	assert.ok(lines.some((line) => line.includes('三隻貓') && line.includes('現在的原話：「我家有兩隻貓」')), '旧条目附编辑后的原话');
+	assert.ok(lines.some((line) => line.includes('阿甲家有兩隻貓')));
+});
+
+test('来源被编辑后只有旧的：记忆显示的是同一句编辑后的原话，几条合并成最新一条；人物卡／事实各自附上自己的文字，不合并也不藏', (t) => {
+	const { runtime } = editedSource(t);
+	runtime.memory.remember('group', SOURCE('900000201'), { text: '阿甲有貓' }, T1);
+	runtime.memory.remember('group', SOURCE('900000201'), { text: '阿甲家的貓有兩隻' }, T1 + 60000);
+	const recalled = runtime.memory.recallAcross(['group'], '阿甲');
+	assert.equal(recalled.length, 1, '显示的内容一模一样：合并成一条（不丢信息）');
+	assert.ok(recalled[0].text.includes('我家有兩隻貓') && recalled[0].edited === true);
+	runtime.notes.updateCard(KAI.id, '阿甲', [{ text: '有貓', src: ['900000201'] }, { text: '貓有兩隻', src: ['900000201'] }], T1);
+	const lines = runtime.notes.context([{ id: KAI.id }]).split('\n').filter((line) => line.startsWith('- '));
+	assert.equal(lines.length, 2, '没有新条目取代它们：两条都带（宁可重复，不藏还有效的说法）');
+	assert.ok(lines.every((line) => line.includes('現在的原話')));
+});
+
+test('长期事实与待确认：来源被编辑后同样的字不重复，改成别的意思新旧都带（旧的附编辑后的原话）', (t) => {
+	const { runtime } = editedSource(t);
+	assert.equal(runtime.notes.addFact('阿甲家有三隻貓', { src: ['900000201'], now: T1 }), true);
+	assert.equal(runtime.notes.addFact('阿甲家有三隻貓', { src: ['900000201'], now: T2 }), false, '同一个来源、一样的字：不重复');
+	assert.equal(runtime.notes.addFact('阿甲家有三隻貓', { pending: true, src: ['900000201'], now: T2 }), false);
+	assert.equal(runtime.notes.addFact('阿甲家有兩隻貓', { src: ['900000201'], now: T2 }), true);
+	const facts = runtime.notes.context([]).split('\n').filter((line) => line.startsWith('- '));
+	assert.equal(facts.length, 2, '不藏：新旧都带');
+	assert.ok(facts.some((line) => line.includes('三隻貓') && line.includes('現在的原話')));
+	assert.ok(facts.some((line) => line.includes('阿甲家有兩隻貓')));
+});
+
+test('每日配额只算出处核对后有效的记忆：旧来源被删后，新的有效来源不会因为配额被拒绝', (t) => {
+	const { runtime } = staleThenFresh(t);
+	runtime.memory.dailyQuota = 1;
+	const day = ISO('2026-10-22T04:00:00Z');
+	assert.equal(runtime.memory.remember('group', SOURCE('900000101'), { text: '阿甲下個月要去日本出差' }, day).ok, true, '先记一条（来源之后被删）');
+	// 来源还没被删之前配额已满；删了以后那一条不再算
+	assert.equal(runtime.memory.remember('group', SOURCE('900000102'), { text: '阿甲下個月真的要去日本出差' }, day).ok, true, '旧来源已被删：不占配额');
+	assert.equal(runtime.memory.remember('group', SOURCE('900000102'), { text: '阿甲還說了另一件事' }, day).ok, false, '有效的记录照样占配额');
+});
+
+test('三种失效情形（被删、自我引用、被编辑）在记忆、人物卡、事实、配额、列表上处理一致', (t) => {
+	const { runtime, say, remove, edit } = provenanceRuntime(t);
+	say('900000301', KAI, '會被刪的話', '2026-10-20T01:00:00Z');
+	say('900000302', BOT, '她自己說的話', '2026-10-20T01:01:00Z');
+	say('900000303', KAI, '會被編輯的話', '2026-10-20T01:02:00Z');
+	say('900000304', KAI, '一直有效的話', '2026-10-20T01:03:00Z');
+	remove('900000301', '2026-10-21T00:00:00Z');
+	edit('900000303', KAI, '編輯後的話', '2026-10-21T01:00:00Z');
+	const when = ISO('2026-10-20T02:00:00Z');
+	runtime.memory.dailyQuota = 3;
+	for (const [text, id] of [['來自被刪', '900000301'], ['來自自己', '900000302'], ['來自編輯', '900000303'], ['來自有效', '900000304']]) {
+		runtime.memory.remember('group', SOURCE(id), { text }, when);
+		runtime.notes.updateCard(KAI.id, '阿甲', [{ text, src: [id] }], when);
+		runtime.notes.addFact(text, { src: [id], now: when });
+	}
+	const shown = runtime.memory.visible(['group']).map((record) => runtime.memory.present(record).text);
+	assert.equal(shown.length, 2);
+	assert.ok(shown.some((text) => text.includes('編輯後的話')) && shown.includes('來自有效'));
+	const lines = runtime.notes.context([{ id: KAI.id }]);
+	for (const hidden of ['來自被刪', '來自自己']) assert.ok(!lines.includes(hidden), hidden + ' 不带（记忆、人物卡、事实一致）');
+	assert.equal(runtime.memory.visible(['group']).length, 2, '列表（/记忆 查）用的是同一份');
+	// 配额：4 条里只有 2 条有效（被编辑的与有效的），上限 3 → 还能再记一条
+	assert.equal(runtime.memory.remember('group', SOURCE('900000304'), { text: '再一条' }, when).ok, true);
+	assert.equal(runtime.memory.remember('group', SOURCE('900000304'), { text: '再另一条' }, when).ok, false);
+	// 失效来源再提：被删、自我引用的旧条目不挡新来源；被编辑的旧条目不挡别的来源
+	say('900000310', KAI, '又提了一次', '2026-10-22T00:00:00Z');
+	for (const text of ['來自被刪', '來自自己', '來自編輯']) {
+		assert.deepEqual(runtime.notes.updateCard(KAI.id, '阿甲', [{ text, src: ['900000310'] }], ISO('2026-10-22T01:00:00Z')), [text], text + ' 用新来源再提要加得进来');
+		assert.equal(runtime.notes.addFact(text, { src: ['900000310'], now: ISO('2026-10-22T01:00:00Z') }), true);
+	}
+});
+
+test('共用函数：judgeSources／collapseRevised／blocksDuplicate', () => {
+	const infos = { del: { deleted: true }, bot: { bot: true }, ok: { bot: false }, ed: { bot: false, edited: 100, content: '新' } };
+	const lookup = (id) => infos[id];
+	const after = () => true;
+	assert.equal(judgeSources(['del', 'ok'], lookup, after).keep, false, '任何一个被删就不带');
+	assert.equal(judgeSources(['bot'], lookup, after).keep, false, '全是她自己说的话不带');
+	assert.deepEqual([judgeSources(['bot', 'ok'], lookup, after).keep, judgeSources(['bot', 'ok'], lookup, after).cite], [true, 'ok'], '混着真话：带真话的出处');
+	assert.equal(judgeSources(['unknown'], lookup, after).keep, true, '查不到来源照旧带');
+	assert.equal(judgeSources([], lookup, after).keep, true);
+	const edited = judgeSources(['ed'], lookup, after);
+	assert.deepEqual([edited.edited, edited.revised], ['新', true]);
+	assert.equal(judgeSources(['ed'], lookup, () => false).edited, undefined, '编辑发生在整理之前：不算 stale');
+	// collapseRevised：不藏任何条目，只在「显示的内容一模一样、来源共享」时合并成最新一条
+	const item = (order, extra = {}) => ({ ids: ['a'], stale: true, order, ...extra });
+	const shown = [item(1, { shown: 'X' }), item(2, { shown: 'X' }), item(3, { shown: 'Y' }), item(4), { ids: ['c'], stale: false, order: 1, shown: 'X' }, item(5, { ids: ['z'], shown: 'X' })];
+	assert.deepEqual([...collapseRevised(shown)].sort(), [1, 2, 3, 4, 5], '只有 0 号（同来源、显示一模一样、较旧）被合并；没被编辑过的、别的来源的、没有 shown 的都不动');
+	assert.deepEqual([...collapseRevised([item(1), item(2), item(3)])].sort(), [0, 1, 2], '没有 shown（人物卡／事实）：谁也不合并');
+	const stale = { keep: true, stale: true, ids: ['a'] };
+	assert.equal(blocksDuplicate({ keep: false, ids: ['a'] }, ['a']), false);
+	assert.equal(blocksDuplicate({ keep: true, stale: false, ids: ['a'] }, ['z']), true);
+	assert.equal(blocksDuplicate(stale, ['a']), true, '同一个来源、被编辑过：同一件事');
+	assert.equal(blocksDuplicate(stale, ['z']), false, '别的来源：不挡');
+});
+
+// ---------- 窄审（保守版）：来源被编辑过的旧条目一律照常带出并标注，不判断谁取代谁 ----------
+const MULTI = { A: '阿甲下週三要搬家', B: '阿甲家裡有兩隻貓', C: '阿甲下週五要搬家' };
+const which = (texts) => ['A', 'B', 'C'].filter((name) => texts.some((text) => text.includes(MULTI[name])));
+
+test('同一个来源有 A、B 两件事，编辑后只重新整理出 C：A（附编辑后的原话）、B、C 都可见——记忆、/记忆 查 的列表、召回、人物卡、事实一致', (t) => {
+	const env = provenanceRuntime(t);
+	const { runtime } = env;
+	env.say('900000401', KAI, '我下週三要搬家，而且家裡有兩隻貓', '2026-10-20T01:00:00Z');
+	for (const text of [MULTI.A, MULTI.B]) {
+		runtime.notes.updateCard(KAI.id, '阿甲', [{ text, src: ['900000401'] }], T1);
+		runtime.memory.remember('group', SOURCE('900000401'), { text }, T1);
+		runtime.notes.addFact(text, { src: ['900000401'], now: T1 });
+	}
+	env.edit('900000401', KAI, '我下週五要搬家，而且家裡有兩隻貓', '2026-10-21T01:00:00Z');
+	runtime.notes.updateCard(KAI.id, '阿甲', [{ text: MULTI.C, src: ['900000401'] }], T2);
+	runtime.memory.remember('group', SOURCE('900000401'), { text: MULTI.C }, T2);
+	runtime.notes.addFact(MULTI.C, { src: ['900000401'], now: T2 });
+	assert.equal(runtime.memory.all('group').filter((record) => record.type === 'memory').length, 3, '三笔都留在档案里');
+	// 记忆：A、B 的旧记录显示的都是同一句编辑后的整句原话（里面有 A 和 B 的内容），合并成一条；C 另带
+	assert.equal(runtime.memory.visible(['group']).length, 3, 'visible 一条都不合并：A、B、C 都在（检索和打分要对所有记录进行）');
+	// 输出时才合并（/记忆 查 的列表：新的在前，取完才合并；召回：分数高的在前）
+	const listed = runtime.memory
+		.dedupeShown(runtime.memory.visible(['group']).sort((a, b) => b.at.localeCompare(a.at)))
+		.map((record) => runtime.memory.present(record).text);
+	assert.equal(listed.length, 2);
+	assert.ok(listed.includes(MULTI.C));
+	assert.ok(listed.some((text) => text.startsWith('（這條記憶整理的原文後來被編輯過') && text.includes('我下週五要搬家，而且家裡有兩隻貓')), '旧的以编辑后的整句原话带出：A、B 的内容都在里面');
+	assert.deepEqual(runtime.memory.recallAcross(['group'], '阿甲').map((record) => record.text).sort(), [...listed].sort(), '召回与列表是同一份');
+	// 人物卡和事实：A、B、C 各自都在；A、B 附编辑后的原话
+	const lines = runtime.notes.context([{ id: KAI.id }]).split('\n').filter((line) => line.startsWith('- '));
+	assert.deepEqual(which(lines), ['A', 'B', 'C']);
+	assert.equal(lines.length, 6, '人物卡 3 条、事实 3 条');
+	assert.ok(lines.filter((line) => line.includes(MULTI.A) || line.includes(MULTI.B)).every((line) => line.includes('現在的原話')));
+});
+
+test('Rin 复现一：短句「要結婚」对「要搬家」（Dice 正好 0.5）——两条都可见，没有任何一条被藏', (t) => {
+	const { runtime, say, edit } = provenanceRuntime(t);
+	say('900000421', KAI, '我要結婚，也要搬家', '2026-10-20T01:00:00Z');
+	for (const text of ['阿甲要結婚', '阿甲要搬家']) {
+		runtime.memory.remember('group', SOURCE('900000421'), { text }, T1);
+		runtime.notes.updateCard(KAI.id, '阿甲', [{ text, src: ['900000421'] }], T1);
+	}
+	edit('900000421', KAI, '我要結婚，也要搬到台中', '2026-10-21T01:00:00Z');
+	runtime.memory.remember('group', SOURCE('900000421'), { text: '阿甲要搬到台中' }, T2);
+	runtime.notes.updateCard(KAI.id, '阿甲', [{ text: '阿甲要搬到台中', src: ['900000421'] }], T2);
+	const shown = runtime.memory.visible(['group']).map((record) => runtime.memory.present(record).text);
+	assert.ok(shown.some((text) => text.includes('我要結婚，也要搬到台中')), '結婚那件事（在编辑后的原话里）看得到');
+	assert.ok(shown.includes('阿甲要搬到台中'));
+	const lines = runtime.notes.context([{ id: KAI.id }]).split('\n').filter((line) => line.startsWith('- '));
+	for (const text of ['阿甲要結婚', '阿甲要搬家', '阿甲要搬到台中']) assert.ok(lines.some((line) => line.includes(text)), text + ' 看得到');
+});
+
+test('Rin 复现二：旧会话很晚才整理完（写入时间比正确的新事实晚）——新旧两条都可见，不会因为“更晚”把正确的新事实藏掉', (t) => {
+	const { runtime, say, edit } = provenanceRuntime(t);
+	say('900000431', KAI, '我下週三要搬家', '2026-10-20T01:00:00Z');
+	edit('900000431', KAI, '我下週五要搬家', '2026-10-21T01:00:00Z');
+	// 先整理出正确的新事实，再有一个很晚才跑完的旧会话整理出旧说法（写入时间 T2+1 小时、行序也在后面）
+	runtime.memory.remember('group', SOURCE('900000431'), { text: MULTI.C }, T2);
+	runtime.notes.updateCard(KAI.id, '阿甲', [{ text: MULTI.C, src: ['900000431'] }], T2);
+	runtime.memory.remember('group', SOURCE('900000431'), { text: MULTI.A }, T2 + 3600000);
+	runtime.notes.updateCard(KAI.id, '阿甲', [{ text: MULTI.A, src: ['900000431'] }], T2 + 3600000);
+	const shown = runtime.memory.visible(['group']).map((record) => runtime.memory.present(record).text);
+	assert.deepEqual(shown.sort(), [MULTI.A, MULTI.C].sort(), '两条都可见：正确的新事实没有被藏');
+	const lines = runtime.notes.context([{ id: KAI.id }]).split('\n').filter((line) => line.startsWith('- '));
+	assert.deepEqual(which(lines), ['A', 'C']);
+});
+
+test('同一个来源下无关的新条目不影响旧条目：旧的以编辑后的原话带出，新的照常带', (t) => {
+	const { runtime, say, edit } = provenanceRuntime(t);
+	say('900000411', KAI, '我下週三要搬家', '2026-10-20T01:00:00Z');
+	runtime.memory.remember('group', SOURCE('900000411'), { text: '阿甲下週三要搬家' }, T1);
+	edit('900000411', KAI, '我下週五要搬家', '2026-10-21T01:00:00Z');
+	runtime.memory.remember('group', SOURCE('900000411'), { text: '阿甲住在台北' }, T2);
+	const texts = runtime.memory.visible(['group']).map((record) => runtime.memory.present(record).text);
+	assert.equal(texts.length, 2);
+	assert.ok(texts.includes('阿甲住在台北') && texts.some((text) => text.includes('我下週五要搬家')));
+});
+
+test('Rin 窄审：检索和打分对所有记录进行，合并只在最后输出——同一则讯息的两条旧记忆，查 move 和查 cats 都找得到那句编辑后的原话，且只出现一次', (t) => {
+	const { runtime, say, edit } = provenanceRuntime(t);
+	// 会按查询过滤的引擎：记忆文字里有查询词的才入选（真正的鱼记忆也是按查询打分，测试里默认的假引擎是全选，测不出这个问题）
+	runtime.memory.engine = {
+		blank: () => ({ policy: {} }),
+		recall: (data, query) => ({ selected: data.memories.filter((memory) => memory.text.includes(query)).map((memory) => ({ m: memory })) }),
+	};
+	say('900000501', KAI, 'move wednesday and cats', '2026-10-20T01:00:00Z');
+	runtime.memory.remember('group', SOURCE('900000501'), { text: 'move wednesday' }, T1);
+	runtime.memory.remember('group', SOURCE('900000501'), { text: 'cats' }, T1 + 60000);
+	edit('900000501', KAI, 'move friday and cats', '2026-10-21T01:00:00Z');
+	const found = (query) => runtime.memory.recallAcross(['group'], query).map((record) => record.text);
+	for (const query of ['move', 'cats'])
+		assert.deepEqual(found(query).filter((text) => text.includes('move friday and cats')).length, 1, `查 ${query}：找得到那句编辑后的原话，且只一次`);
+	assert.equal(found('move').length, 1);
+	assert.equal(found('cats').length, 1);
+	assert.equal(found('').length, 1, '两条都命中时合并成一条（最后输出才合并）');
+	assert.deepEqual(found('nothing'), [], '没命中的不会因为合并而冒出来');
+	// 列表（/记忆 查 无关键字）：先取最近 8 条，取完才合并
+	const listed = runtime.memory.dedupeShown(runtime.memory.visible(['group']).sort((a, b) => b.at.localeCompare(a.at)).slice(0, 8));
+	assert.equal(listed.length, 1);
+	assert.equal(runtime.memory.visible(['group']).length, 2, 'visible 本身不合并');
 });

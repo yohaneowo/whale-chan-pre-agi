@@ -1,0 +1,48 @@
+# krita-gate: whitelist proxy between the dsh bot and Krita. Runs as krita so it can read the
+# bridge token; listens on /run/krita-gate/gate.sock (group kritaio, 0660).
+[Unit]
+Description=krita-gate whitelist proxy for whale-chan drawing
+Requires=krita.service
+After=krita.service
+
+[Service]
+User=krita
+Group=kritaio
+UMask=0007
+RuntimeDirectory=krita-gate
+RuntimeDirectoryMode=0750
+Environment=KRITA6_MCP_STATE_DIR=/var/lib/krita/.local/state/krita6-mcp
+Environment=KRITA6_MCP_SRC=/opt/krita6-mcp/current/src
+Environment=KRITA6_MCP_PLUGIN=/opt/krita6-mcp/current/plugin
+Environment=KRITA_GATE_OUT=/srv/krita-io/out
+Environment=KRITA_GATE_IN=/srv/krita-io/in
+Environment=KRITA_GATE_STAGING=/var/lib/krita/staging
+Environment=KRITA_GATE_STUCK=/var/lib/krita/gate/stuck.json
+Environment=KRITA_GATE_SOCKET=/run/krita-gate/gate.sock
+ExecStart=/usr/bin/python3 -s /opt/krita-gate/krita_gate.py
+Restart=on-failure
+RestartSec=5
+
+MemoryMax=200M
+TasksMax=32
+OOMScoreAdjust=800
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+ReadOnlyPaths=/var/lib/krita
+ReadWritePaths=/var/lib/krita/staging /var/lib/krita/gate
+BindPaths=/srv/dsh/krita-io:/srv/krita-io
+# Everything private to the dsh bot (a leading '-' means: fine if it does not exist).
+InaccessiblePaths=/srv/dsh /var/lib/dsh /opt/dsh /root -/etc/dsh -/var/backups/dsh -/var/log/dsh -/run/dsh
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

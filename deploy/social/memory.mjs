@@ -9,6 +9,10 @@ import {
 	writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { blocksDuplicate, collapseRevised, judgeSources } from './archive.mjs';
+
+// 记忆整理的原文后来被编辑过：带进提示的是编辑后的原话。
+const EDITED = '（這條記憶整理的原文後來被編輯過，以編輯後的原話為準）';
 
 export class MemoryStore {
 	constructor(root, engine, { timeZone = 'Asia/Taipei', dailyQuota = 8 } = {}) {
@@ -17,7 +21,71 @@ export class MemoryStore {
 		this.timeZone = timeZone;
 		this.dailyQuota = dailyQuota;
 		this.lastRecall = new Map();
+		// 原文帐本的出处核对（由 SocialRuntime 接上：resolver() 回传 { lookup(id), subject(text) }）；没接上就不核对。
+		this.provenance = null;
 		mkdirSync(root, { recursive: true, mode: 0o700 });
+	}
+
+	resolver() {
+		try {
+			return this.provenance?.resolver?.() ?? null;
+		} catch {
+			return null;
+		}
+	}
+
+	// 一条记忆在被带进她的提示之前，先用原文帐本核对出处（规则见 archive.mjs 的 judgeSources）：
+	// 来源被删／只是她自己说的话 → 不带；来源在整理之后被编辑过 → 带编辑后的原话；查不到来源或核对出错 → 照旧带。
+	vet(record, resolve = this.resolver()) {
+		const ids = record.messageId ? [String(record.messageId)] : [];
+		const plain = { keep: true, ids, stale: false, revised: false };
+		if (!resolve) return plain;
+		try {
+			const check = judgeSources(ids, resolve.lookup, (info) => info.edited > Date.parse(record.at));
+			return { ...check, stale: check.edited !== undefined };
+		} catch {
+			return plain;
+		}
+	}
+
+	// 现在带得进提示的记忆：出处核对后留下的，**一条都不合并、不藏**——检索和打分要对所有记录进行（合并要等排好序、最后输出时才做，见 dedupeShown）。
+	// 来源在整理之后被编辑过的旧记忆带着 editedText（编辑后的原话），present() 把它换进去并加注「以編輯後的原話為準」；编辑之后整理的新记忆也照常在里面。
+	visible(scopes, resolve = this.resolver()) {
+		return scopes
+			.flatMap((scope) => this.active(scope).map((record) => ({ ...record, scope })))
+			.map((record) => ({ record, check: this.vet(record, resolve) }))
+			.filter(({ check }) => check.keep)
+			.map(({ record, check }) => (check.stale ? { ...record, editedText: check.edited } : record));
+	}
+
+	// 最后一步才合并：显示出来的文字一模一样的 stale 记忆（同一来源的几条旧记忆，换进去的都是同一句编辑后的原话）只留排在最前面的一条。
+	// records 要已经按「好的在前」排好（召回是分数高的在前，/记忆 查 的列表是新的在前）；检索和打分已经对所有记录做完了，这里不会让任何一条搜不到。
+	dedupeShown(records) {
+		const keep = collapseRevised(
+			records.map((record, index) => ({
+				ids: record.messageId ? [String(record.messageId)] : [],
+				stale: record.editedText !== undefined,
+				order: -index,
+				shown: record.editedText,
+			})),
+		);
+		return records.filter((_, index) => keep.has(index));
+	}
+
+	present(record) {
+		return record.editedText === undefined
+			? record
+			: { ...record, text: EDITED + record.editedText, edited: true };
+	}
+
+	// 问的是一个帐本里从没出现过的人（阿戊）：靠常用词（最近、在忙）撞上的别人的事，不是答案。
+	strangers(query, resolve = this.resolver()) {
+		try {
+			const subject = resolve?.subject(query);
+			return Boolean(subject?.unknown?.length) && !subject.known?.length;
+		} catch {
+			return false;
+		}
 	}
 
 	directory(scope) {
@@ -103,16 +171,24 @@ export class MemoryStore {
 			)
 		)
 			throw new Error('内容不适合写入记忆。');
-		const existing = this.active(scope);
-		const duplicate = existing.find(
-			(record) => record.authorId === source.authorId && record.text === text,
+				// 重复与配额都只看出处核对后仍然有效的旧记忆（vet）：来源已被删（或只是她自己说的话）的旧记忆带不进提示，
+		// 不能挡住后来有效出处说的同一件事，也不占每日配额；来源被编辑过的旧记忆，同一个来源重新整理出一样的字才算重复。
+		// 旧记忆留在档案里不动（只追加），新的另写一条。
+		const resolve = this.resolver();
+		const newIds = [String(source.messageId)];
+		const duplicate = this.active(scope).find(
+			(record) =>
+				record.authorId === source.authorId &&
+				record.text === text &&
+				blocksDuplicate(this.vet(record, resolve), newIds),
 		);
 		if (duplicate) return { ok: true, id: duplicate.id, duplicate: true };
 		if (
 			this.all(scope).filter(
 				(record) =>
 					record.type === 'memory' &&
-					this.day(Date.parse(record.at)) === this.day(now),
+					this.day(Date.parse(record.at)) === this.day(now) &&
+					this.vet(record, resolve).keep,
 			).length >= this.dailyQuota
 		)
 			return { ok: false, message: '今天先记到这里。' };
@@ -165,9 +241,8 @@ export class MemoryStore {
 	// 她是同一个人：群聊与拥有者私讯的记忆一起找，结果带上来自哪个范围（私讯的就是「私下」的事）。
 	// 各范围仍存在自己的资料夹，召回刷新也写回原范围。
 	recallAcross(scopes, query, now = Date.now()) {
-		const records = scopes.flatMap((scope) =>
-			this.active(scope).map((record) => ({ ...record, scope })),
-		);
+		const resolve = this.resolver();
+		const records = this.visible(scopes, resolve);
 		const recalled = new Map();
 		for (const scope of scopes)
 			for (const event of this.all(scope)) {
@@ -198,10 +273,13 @@ export class MemoryStore {
 			activation0: 1,
 		}));
 		const result = this.engine.recall(data, query, now, scopes[0]);
-		const selected = result.selected
+		const strangers = this.strangers(query, resolve);
+		const ranked = result.selected
 			.slice(0, 6)
 			.map((row) => records.find((record) => record.id === row.m.id))
-			.filter(Boolean);
+			.filter(Boolean)
+			.filter((record) => !strangers || record.kind === 'fact');
+		const selected = this.dedupeShown(ranked).map((record) => this.present(record));
 		const summary = {
 			time: now,
 			ids: selected.map((record) => record.id),

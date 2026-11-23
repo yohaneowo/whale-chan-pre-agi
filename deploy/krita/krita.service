@@ -1,0 +1,74 @@
+# Krita 6 with the krita6-mcp bridge plugin, headless on Xvfb, isolated from the dsh bot.
+# Installed by install_krita.sh to /etc/systemd/system/krita.service. Stop everything with:
+#   sudo systemctl stop krita-gate.service krita.service
+[Unit]
+Description=Krita 6 (krita6-mcp bridge) for whale-chan drawing, headless
+After=network.target
+
+[Service]
+User=krita
+Group=krita
+SupplementaryGroups=kritaio
+# 0027: what Krita writes into out/ is group-readable (kritaio: dsh can read her artwork) but not
+# group-writable, so dsh cannot overwrite finished .kra / PNG files (phase 2 found 660 with 0007).
+UMask=0027
+WorkingDirectory=/var/lib/krita
+Environment=HOME=/var/lib/krita
+Environment=XDG_CONFIG_HOME=/var/lib/krita/.config
+Environment=XDG_DATA_HOME=/var/lib/krita/.local/share
+Environment=XDG_CACHE_HOME=/var/lib/krita/.cache
+Environment=XDG_STATE_HOME=/var/lib/krita/.local/state
+Environment=KRITA6_MCP_STATE_DIR=/var/lib/krita/.local/state/krita6-mcp
+# Imports come only from the krita-only staging folder; the gate copies them there from in/.
+# The single quotes around the whole assignment are required: systemd strips double quotes, and
+# the bridge then refuses to start ("must be a JSON object") - found in phase 1, 2026-11-01.
+Environment='KRITA6_MCP_INPUT_ROOTS={"in":"/var/lib/krita/staging"}'
+Environment='KRITA6_MCP_OUTPUT_ROOTS={"out":"/srv/krita-io/out"}'
+# The extracted AppImage's AppRun does not export APPDIR (the AppImage runtime normally does);
+# without it Krita's embedded Python 3.13 cannot find its standard library and no Python plugin
+# loads. Must be the REAL folder that holds the AppRun in ExecStart: the symlink path
+# /opt/krita/current does not work (phase 2, 2026-11-02: same "No module named 'encodings'"),
+# /opt/krita/6.0.4 does (phases 1 and 2). Change both lines together when Krita is upgraded.
+Environment=APPDIR=/opt/krita/6.0.4
+Environment=QT_QPA_PLATFORM=xcb
+Environment=QT_QPA_PLATFORMTHEME=
+Environment=QT_STYLE_OVERRIDE=Fusion
+Environment=LIBGL_ALWAYS_SOFTWARE=1
+ExecStart=/usr/bin/xvfb-run -a -s "-screen 0 1600x1200x24 -nolisten tcp" /usr/bin/dbus-run-session -- /opt/krita/6.0.4/AppRun --nosplash
+Restart=on-failure
+RestartSec=10
+
+# Resources: own cgroup, never counted against dsh. Killed before dsh if memory runs out.
+MemoryHigh=1200M
+MemoryMax=1600M
+MemorySwapMax=0
+CPUQuota=200%
+TasksMax=256
+OOMScoreAdjust=800
+
+# Sandbox
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/krita
+# The only shared folder; it lives under /srv/dsh but Krita sees it as /srv/krita-io.
+BindPaths=/srv/dsh/krita-io:/srv/krita-io
+# Everything private to the dsh bot (a leading '-' means: fine if it does not exist).
+InaccessiblePaths=/srv/dsh /var/lib/dsh /opt/dsh /root -/etc/dsh -/var/backups/dsh -/var/log/dsh -/run/dsh
+# Krita itself never reads in/ (dsh-writable); only the gate does.
+InaccessiblePaths=-/srv/krita-io/in
+# Network: loopback only; Krita can be reached from this VM only and cannot reach anything.
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

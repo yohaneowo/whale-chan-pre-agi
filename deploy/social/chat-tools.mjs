@@ -48,11 +48,19 @@ export function chatTools(runtime, { timeZone = 'Asia/Taipei' } = {}) {
 								.then((label) => (label?.channel ? '#' + label.channel : '#?'))
 								.catch(() => '#?'),
 				);
+		// 同名的不同群友（两个「小明」）：结果里同一个名字对到不止一个 discord id，就在名字后面附上 id，才分得清谁是谁。
+		const ids = new Map();
+		for (const row of rows)
+			ids.set(row.author, new Set([...(ids.get(row.author) ?? []), row.author_id]));
+		const who = (row) =>
+			(ids.get(row.author)?.size ?? 0) > 1
+				? `${row.author}（${row.author_id}）`
+				: row.author;
 		return [
 			HEADER,
 			...rows.map(
 				(row) =>
-					`${stamp(row.t)} ${places.get(row.channel_id)} ${row.author}${row.edited ? '（改過）' : ''}：${String(
+					`${stamp(row.t)} ${places.get(row.channel_id)} ${who(row)}${row.edited ? '（改過）' : ''}：${String(
 						row.content,
 					)
 						.replace(/\s*\n\s*/g, ' / ')
@@ -86,7 +94,7 @@ export function chatTools(runtime, { timeZone = 'Asia/Taipei' } = {}) {
 	return [
 		tool(
 			'chat_search',
-			'翻聊天紀錄原文：有人問過去的具體事情（誰說過什麼、哪天發生什麼）時先用這個查，再回答，不要憑印象。可以用關鍵詞（空白分開、全部都要有，繁簡都找得到）、說話的人（名字或 Discord ID）、頻道 id、日期範圍（YYYY-MM-DD）篩選，至少給一個。回最新的幾則原文，每則後面〔〕裡是訊息 id，可以用 chat_open 看前後文。',
+			'翻聊天紀錄原文：有人問過去的具體事情（誰說過什麼、哪天發生什麼）時先用這個查，再回答，不要憑印象。可以用關鍵詞（空白分開、全部都要有，繁簡都找得到）、說話的人（名字或 Discord ID）、頻道 id、日期範圍（YYYY-MM-DD）篩選，至少給一個。回最新的幾則原文，每則後面〔〕裡是訊息 id，可以用 chat_open 看前後文。預設不含妳自己說過的話（那不算證據）；要核對自己說過什麼，author 填妳自己的名字，或帶 include_self。同名的不同人，名字後面會附 Discord ID。',
 			object({
 				query: { type: 'string', maxLength: 100 },
 				author: { type: 'string', maxLength: 40 },
@@ -94,8 +102,12 @@ export function chatTools(runtime, { timeZone = 'Asia/Taipei' } = {}) {
 				since: date,
 				until: date,
 				limit: { type: 'integer', minimum: 1, maximum: 30 },
-			}),
-			async ({ query, author, channel_id, since, until, limit = 20 }, from) => {
+					include_self: { type: 'boolean' },
+				}),
+				async (
+					{ query, author, channel_id, since, until, limit = 20, include_self },
+					from,
+				) => {
 				if (!query && !author && !channel_id && !since)
 					throw new Error('至少要給關鍵詞、人、頻道或日期其中一個。');
 				const rows = runtime.archive.search({
@@ -105,10 +117,11 @@ export function chatTools(runtime, { timeZone = 'Asia/Taipei' } = {}) {
 					since: edge(since, false),
 					until: edge(until, true),
 					scopes: from,
-					limit,
-					normalize,
-				});
-				return rows.length ? await render(rows) : '沒找到符合的聊天紀錄。';
+						limit,
+						includeBot: Boolean(include_self),
+						normalize,
+					});
+					return rows.length ? await render(rows) : '沒找到符合的聊天紀錄。';
 			},
 		),
 		tool(

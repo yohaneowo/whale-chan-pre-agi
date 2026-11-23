@@ -144,11 +144,10 @@ export async function prepareGroupReply(
 	// [梗圖:台词或关键词]：在社群台词梗图库里找最像的一张附上（每则最多一张）；找不到就只拿掉标记。
 	for (const [, query] of [...rest.matchAll(MEME_MARK)].slice(0, 1))
 		try {
-			const hit = currentRuntime().memeLibrary?.find(
-				await toSimplifiedText(query),
-			);
-			if (hit)
-				files.push({ filename: hit.filename, data: readFileSync(hit.path) });
+			const library = currentRuntime().memeLibrary;
+			const hit = library?.find(await toSimplifiedText(query));
+			const file = hit && (await library.attachment(hit));
+			if (file) files.push(file);
 		} catch {
 			/* 找图失败只送文字。 */
 		}

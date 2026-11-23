@@ -9,6 +9,7 @@ import {
 	writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { blocksDuplicate, collapseRevised, judgeSources } from './archive.mjs';
 
 const SECRET =
 	/dp\.st\.|sk-[a-z0-9]{16,}|[a-z0-9_-]{20,}\.[a-z0-9_-]{6,}\.[a-z0-9_-]{20,}/i;
@@ -27,6 +28,8 @@ export class NotesStore {
 	constructor(root, { timeZone = 'Asia/Taipei' } = {}) {
 		this.root = root;
 		this.timeZone = timeZone;
+				// 原文帐本的出处核对（由 SocialRuntime 接上：resolver() 回传 { lookup(id) }）；没接上就不核对。
+		this.provenance = null;
 		for (const folder of ['', 'people', 'journal'])
 			mkdirSync(join(root, folder), { recursive: true, mode: 0o700 });
 		if (!existsSync(this.factsPath))
@@ -104,12 +107,23 @@ export class NotesStore {
 		const names = [...new Set([...(meta.names ?? []), clean(name, 40)])].filter(
 			Boolean,
 		);
-		const known = new Set(existing.map((line) => this.noteText(line)));
+				// 「已经有这一条」只拿出处核对后仍然有效的旧条目当基准（规则见 archive.mjs 的 blocksDuplicate）：来源被删（或全是她自己说的话）的旧条目
+		// 带不进提示，不能挡住后来有效出处说的同一件事；来源被编辑过的旧条目，同一个来源重新整理出一样的字才算同一件事。旧条目留着，新的另加一行。
+		const resolve = this.resolver();
+		const earlier = existing.map((line) => ({ text: this.noteText(line), check: this.vet(line, resolve) }));
+		const batch = new Set();
 		const added = [];
 		for (const note of notes) {
 			const text = clean(note.text, 200);
-			if (!text || SECRET.test(text) || known.has(text)) continue;
-			known.add(text);
+			const from = (note.src ?? []).map(String);
+			if (
+				!text ||
+				SECRET.test(text) ||
+				batch.has(text) ||
+				earlier.some((old) => old.text === text && blocksDuplicate(old.check, from))
+			)
+				continue;
+			batch.add(text);
 			const importance = Math.max(
 				1,
 				Math.min(5, Math.round(note.importance) || 3),
@@ -155,10 +169,55 @@ export class NotesStore {
 		return /\(src:: ([\d, ]+)\)/.exec(line)?.[1].split(/,\s*/) ?? [];
 	}
 
-	// 带进聊天的样子：文字加第一个出处，她可以用 chat_open 打开原话。
-	cite(line) {
-		const [first] = this.noteSources(line);
-		return this.noteText(line) + (first ? `〔原文 ${first}〕` : '');
+	// 一条整理出来的笔记在被带进聊天之前，先用原文帐本核对出处：
+	// - 任何一个来源讯息被删了 → 不带；
+	// - 所有来源都是她自己说的话 → 不带（自我引用不是证据）；
+	// - 来源讯息在整理之后被编辑过 → 带编辑后的原话，让她以它为准；
+	// 查不到来源的（没有 src、帐本之前的）照旧带；核对本身出错不挡聊天，照旧带。
+		resolver() {
+		try {
+			return this.provenance?.resolver?.() ?? null;
+		} catch {
+			return null;
+		}
+	}
+
+	// 一条整理出来的笔记在被带进聊天之前，先用原文帐本核对出处（规则见 archive.mjs 的 judgeSources）：
+	// 任何一个来源被删／所有来源都是她自己说的话 → 不带；来源在整理（日期）之后被编辑过 → 带编辑后的原话；
+	// 查不到来源的（没有 src、帐本之前的）照旧带；核对本身出错不挡聊天，照旧带。
+	vet(line, resolve = this.resolver()) {
+		const ids = this.noteSources(line);
+		const plain = { keep: true, ids, cite: ids[0], stale: false, revised: false };
+		if (!ids.length || !resolve) return plain;
+		try {
+			const date = /^\d{4}-\d{2}-\d{2}(?= )/.exec(line)?.[0];
+			const check = judgeSources(ids, resolve.lookup, (info) => !date || this.day(info.edited) >= date);
+			return { ...check, stale: check.edited !== undefined };
+		} catch {
+			return plain;
+		}
+	}
+
+	// 带得进聊天的笔记：出处核对后留下的；来源被编辑过的旧条目照常带（附上编辑后的原话），不判断谁取代谁。
+	visibleLines(lines, resolve = this.resolver()) {
+		const checked = lines
+			.map((line, index) => ({ line, index, check: this.vet(line, resolve) }))
+			.filter(({ check }) => check.keep);
+		const keep = collapseRevised(
+			checked.map(({ index, check }) => ({ ids: check.ids, stale: check.stale, order: index })),
+		);
+		return checked.filter((_, position) => keep.has(position));
+	}
+
+	// 带进聊天的样子：文字加一个出处（优先挑不是她自己说的），她可以用 chat_open 打开原话；原文被编辑过就附上编辑后的原话。
+	cite(line, vetted = this.vet(line)) {
+		return (
+			this.noteText(line) +
+			(vetted.edited !== undefined
+				? `（原文後來被編輯過，現在的原話：「${vetted.edited.replace(/\s+/g, ' ').slice(0, 80)}」）`
+				: '') +
+			(vetted.cite ? `〔原文 ${vetted.cite}〕` : '')
+		);
 	}
 
 	addJournal(entries, place, now) {
@@ -198,8 +257,15 @@ export class NotesStore {
 	addFact(text, { pending = false, now = Date.now(), src = [] } = {}) {
 		const fact = clean(text, 200);
 		if (!fact || SECRET.test(fact)) return false;
-		const { facts, pending: waiting } = this.facts();
-		if ([...facts, ...waiting].some((line) => line.includes(fact)))
+				const { facts, pending: waiting } = this.facts();
+		// 同样只拿出处核对后仍然有效的当基准（被删来源的旧事实、旧提议不能挡住新的有效出处）；写回时旧的照样留着。
+		const resolve = this.resolver();
+		const from = (src ?? []).map(String);
+		if (
+			[...facts, ...waiting].some(
+				(line) => line.includes(fact) && blocksDuplicate(this.vet(line, resolve), from),
+			)
+		)
 			return false;
 		const next = pending
 			? {
@@ -223,26 +289,31 @@ export class NotesStore {
 	// 每次聊天带上：已确认的长期事实，与在场的人的人物卡（每人最近 12 条）。
 	context(people) {
 		const parts = [];
-		const { facts } = this.facts();
+				const resolve = this.resolver();
+		// 先核对再取：来源被删（或全是她自己说的话）而带不进提示的旧事实，不能占掉名额。
+		const facts = this.visibleLines(this.facts().facts, resolve).slice(0, 30);
 		if (facts.length)
 			parts.push(
 				'你知道的長期事實：\n' +
 					facts
-						.slice(0, 30)
-						.map((line) => '- ' + this.cite(line))
+						.map(({ line, check }) => '- ' + this.cite(line, check))
 						.join('\n'),
 			);
 		const cards = people
 			.filter(({ id }) => ID.test(String(id)))
-			.map(({ id }) => ({ id, ...this.card(id) }))
+			.map(({ id }) => {
+				const card = this.card(id);
+				return { id, ...card, notes: this.visibleLines(card.notes, resolve) };
+			})
 			.filter((card) => card.notes.length)
 			.slice(0, 4)
 			.map(
 				(card) =>
-					`【${card.meta.names?.at(-1) ?? card.id}】（曾用名：${(card.meta.names ?? []).join('、')}）\n` +
+					// 標題帶 discord id：同名的兩個人（兩個「小明」）靠它分得開，也和翻原文時作者後面的 id 對得上。
+					`【${card.meta.names?.at(-1) ? card.meta.names.at(-1) + '｜' : ''}${card.id}】（曾用名：${(card.meta.names ?? []).join('、')}）\n` +
 					card.notes
 						.slice(-12)
-						.map((line) => '- ' + this.cite(line))
+						.map(({ line, check }) => '- ' + this.cite(line, check))
 						.join('\n'),
 			);
 		if (cards.length)

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { filterDiscordMessage } from './discord-policy.mjs';
+import { calledAsFish, filterDiscordMessage } from './discord-policy.mjs';
 
 test('叫名字与回复 bot 都不需要再次提及', () => {
 	const base = {
@@ -85,4 +85,42 @@ test('机器人不回应，私聊保留普通内容；缺少 bot 身分时拒绝
 		'你好',
 	);
 	assert.equal(filterDiscordMessage(message('<@123> hi'), undefined), null);
+});
+
+test('群友叫「魚」算在叫她，一般说到鱼不算', () => {
+	// 都是群里真的出现过的叫法。
+	for (const text of [
+		'鱼',
+		'魚！',
+		'鱼鱼鱼鱼鱼鱼鱼！',
+		'oi 鱼',
+		'ok鱼',
+		'@鱼',
+		'鱼？',
+		'鱼~',
+		'你在干嘛鱼',
+		'你没事吧鱼',
+		'没在聊天的话，你在干嘛，鱼',
+		'晚安，鱼',
+		'请开始您的表演，鱼，重要的事情要说三遍',
+		'鱼，我在直播，你看得到吗',
+		'鱼看得到吗',
+		'鱼你的余额剩多少',
+		'鱼我加你的粮了你看得到吗',
+	])
+		assert.ok(calledAsFish(text), text);
+	for (const text of [
+		'我在他原本的鱼缸里面啊',
+		'我们这边养鱼',
+		'我们养的鱼',
+		'晚餐吃鱼',
+		'它是弱丁鱼，你是傻鱼',
+		'那人家鱿鱼娘还会炒饭',
+		'偶尔查一下鱼的余额',
+		'鱼香肉丝好吃',
+		'这条鱼10块钱可以活蛮久的',
+	])
+		assert.ok(!calledAsFish(text), text);
+	assert.equal(filterDiscordMessage(message('晚安，鱼'), '123'), '晚安，鱼');
+	assert.equal(filterDiscordMessage(message('我们这边养鱼'), '123'), null);
 });

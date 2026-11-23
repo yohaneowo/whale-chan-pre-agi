@@ -5,11 +5,12 @@ import hashlib
 import json
 import pathlib
 import shutil
+from configure_social import strict_json   # 严格的 JSON（拒绝 NaN／重复键等）；上游的 package.json 也不当成可信的
 from social_patch import social_patch
 
 
 def prepare(source, target, expected_sha256, social=False):
-    package = json.loads((source / "package.json").read_text(encoding="utf-8"))
+    package = strict_json((source / "package.json").read_bytes())
     entry = source / "lib/index.js"
     raw = entry.read_bytes()
     if package["name"] != "dsh-plugin-discord" or package["version"] != "0.6.0":
@@ -65,8 +66,8 @@ const onMessage = (message) => {
         shutil.copyfile(source / name, target / name)
     package["version"] = "0.6.0-natural.3"
     if social:
-        package["version"] = "0.6.0-social.48"
-        package.setdefault("dependencies", {})["dsh-social-runtime"] = "file:/opt/dsh/vendor/social-0.1.42"
+        package["version"] = "0.6.0-social.56"
+        package.setdefault("dependencies", {})["dsh-social-runtime"] = "file:/opt/dsh/vendor/social-0.1.50"
     (target / "package.json").write_text(json.dumps(package, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (target / "lib/index.js").write_text(content, encoding="utf-8")
     shutil.copyfile(pathlib.Path(__file__).with_name("discord-policy.mjs"), target / "lib/discord-policy.mjs")

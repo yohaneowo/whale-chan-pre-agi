@@ -1,6 +1,6 @@
 {
 	"name": "dsh-social-runtime",
-	"version": "0.1.42",
+	"version": "0.1.50",
 	"private": true,
 	"type": "module",
 	"main": "index.mjs",
