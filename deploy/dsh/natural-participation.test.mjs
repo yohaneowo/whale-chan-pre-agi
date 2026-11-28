@@ -1153,57 +1153,48 @@ test('只 @ 她、没有内容：像人一样问一句，不交给模型；同�
 	assert.equal(f.delivered.length, 4);
 });
 
-test('要做比较久的事：20 秒没动静先说一句；已经有东西送达就不说；画图不在聊天回合里，不为画图先说', async (t) => {
+test('一般聊天就算慢也不先说「等我一下」；只有交给画室以后、还没说话才先说一句', async (t) => {
 	const timers = [];
 	const f = await fixture(t);
-	f.participation.timer = (run, ms) => timers.push({ run, ms });
-	const drawing = gate();
+	f.participation.timer = (run, ms) => (
+		timers.push({ run, ms }),
+		timers.length
+	);
+	const slow = gate();
 	const { deliver } = bridgeFor(f.participation, {
-		A: { run: async () => (await drawing.promise, { chunks: ['畫好了'] }) },
-		B: { run: async () => (await drawing.promise, { chunks: ['晴天'] }) },
+		A: { run: async () => (await slow.promise, { chunks: ['晴天'] }) },
+		B: { run: async () => (await slow.promise, { chunks: ['好，我去畫'] }) },
 	});
 	const pending = directCalls(f, deliver, [
-		'<@123> KEY-A 畫貓',
-		'<@123> KEY-B 天氣',
+		'<@123> KEY-A 天氣',
+		'<@123> KEY-B 畫貓',
 	]);
 	await new Promise((resolve) => setImmediate(resolve));
 	const [a, b] = [...f.participation.calls.values()];
-	// 以前 turn-guard 看到 Krita start 会叫她先说「好，我畫一下」；画图交给画室以后不再有这个事件，
-	// 就算收到旧格式的事件也不说（快速画完时会多插一句话，第 2 轮审查）。
-	f.participation.turnEvent({
-		type: 'progress',
+	// 主人：一般聊天常常 20～60 秒，几乎每次都插这句，不像真人。所以不按时间排。
+	assert.deepEqual(timers, [], '一般聊天不排「等我一下」');
+	// B 交给画室了：这时才排，还没说话就先说一句。
+	f.participation.drawEvent({
+		type: 'accepted',
 		channelId: 'room',
-		messageId: a.messageId,
-		drawing: true,
+		messageId: b.messageId,
+		status: 'started',
 	});
 	assert.deepEqual(
 		timers.map((row) => row.ms),
-		[20_000, 20_000],
+		[20_000],
 	);
-	// B 的 20 秒计时到了：还没任何东西送达，说「等我一下」。
-	timers[1].run();
-	// 工具已经替 A 送出东西：A 的计时到了也不再说。
-	f.participation.recordToolMessage('room', a.messageId);
 	timers[0].run();
-	drawing.open();
+	slow.open();
 	const { controls, logs } = await pending;
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.deepEqual(
 		controls.map((row) => row.text),
 		['等我一下，我弄一下'],
 	);
-	assert.deepEqual(f.participation.calls.size, 0, '呼叫结束后纪录清掉');
-	assert.ok(
-		logs.some(
-			(line) =>
-				line === `直接呼叫 先说一句 #${b.messageId} kind=slow status=sent`,
-		),
-	);
 	assert.equal(logs.filter((line) => line.includes('先说一句')).length, 1);
-	assert.match(
-		result(logs, a.messageId)[0],
-		/status=answered .*tool=1 sendFail=0 preface=no /,
-	);
+	assert.match(result(logs, a.messageId)[0], /status=answered .*preface=no /);
+	assert.match(result(logs, b.messageId)[0], /preface=slow /);
 });
 
 test('交给画室：这轮没说话就替她说「好，我去畫」或「前面還有一張…」，不说「卡住了」', async (t) => {

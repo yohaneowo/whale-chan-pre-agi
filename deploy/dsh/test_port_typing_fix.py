@@ -26,7 +26,7 @@ def fake_release():
     anchors += [sp.FOLLOWUP[0], port.RELEASE_WAIT, sp.NOTICE_TICKET[0], port.RELEASE_SEND, port.COMMITMENT_REPLY[0],
                 sp.TRACKED_REST[0], port.PARTICIPATION_LOG[0], port.LEASE_DECLARE[0], LEASE_BLOCK,
                 port.LEASE_END[0], port.HISTORY_GUIDE[0], port.SUBSCRIBE_ANCHOR, port.OLD_MESSAGE_FAILED, port.OLD_EDIT_FAILED,
-                port.STUDIO_DELETE[0]]
+                port.STUDIO_DELETE[0], port.DELIVER_CHECK[0]]
     kept = [k for k in KEPT if k not in ("this.gatewayScopes.turn(agent,channelId,messageId)",
                                          "recordSocialCommitment(message, sent,", "tools.referenceHint(")]
     return "\n/*--*/\n".join(anchors + kept) + "\n"
@@ -65,14 +65,17 @@ class PortIndexTests(unittest.TestCase):
         self.assertIn("const beginTypingFor = (channelId) => socialTyping(rest, channelId, config.typingIntervalMs);", ported)
         self.assertNotIn("rest.triggerTyping(channelId)", ported)
         self.assertIn("incoming attachment failed #${messageId}：${errorTrace(error)}", ported)
-        # 闸道附上的工具说明：聊天会话改成交给画室。
-        self.assertIn(".DRAW_GUIDE+tools.referenceHint(", ported)
+        # 闸道附上的工具说明：聊天会话改成交给画室，附上画室最近的结果（没画成的已经回报过了）。
+        self.assertIn("studioModule.DRAW_GUIDE+studioModule.studioRecentNote(", ported)
+        # 送答前的核对没过就隔一下再核对（2026-11-28 第 4 则）。
+        self.assertIn("!await socialCanDeliver(() => this.gatewayScopes.historyCanDeliver(agent,messageId), {", ported)
+        self.assertIn("socialCanDeliver }", port.STUDIO_IMPORT)
 
     def test_round_three_deleted_request_stops_the_studio(self):
         ported = port.port_index(fake_release())
         # 讯息被删（含批次删除）：通知画室安静停掉那张，图不会掉成一般群讯。
         self.assertIn('socialArchive("delete",data);noteSocialStudioDeleted(data);};', ported)
-        self.assertIn("noteSocialStudioDeleted }", port.STUDIO_IMPORT)
+        self.assertIn("noteSocialStudioDeleted,", port.STUDIO_IMPORT)
         self.assertIn("export function noteSocialStudioDeleted(data) {", port.BRIDGE_EXPORT)
         self.assertIn("data.ids", port.BRIDGE_EXPORT)
 
@@ -83,6 +86,25 @@ class PortIndexTests(unittest.TestCase):
             port.port_index(fake_release().replace("historyView.note(", ""))
         with self.assertRaises(ValueError):
             port.port_index(port.port_index(fake_release()))
+
+
+class HistoryViewTests(unittest.TestCase):
+    def test_replay_is_dated_bounded_and_keeps_her_replies(self):
+        fake = "".join(anchor for anchor, _ in (port.HISTORY_HELPERS, port.HISTORY_AGE, port.HISTORY_TEXT,
+                                                 port.HISTORY_REPLIES, port.HISTORY_PUSH))
+        ported = port.port_history(fake)
+        self.assertIn("const REPLAY_MAX_AGE_MS=6*3600_000;", ported)
+        self.assertIn("filter(([id,event])=>id===liveId || !(Number(event.time)<since))", ported)
+        self.assertIn("text:replayText(current,native,id===liveId)", ported)
+        self.assertIn("if (event.seq<start && replies.has(event.seq)) result.push(replies.get(event.seq));", ported)
+        with self.assertRaises(ValueError):
+            port.port_history(ported)
+
+    def test_history_source_carries_name_and_time(self):
+        ported = port.port_scopes(port.SCOPES_SOURCE[0])
+        self.assertIn("name,at:Date.parse(row.timestamp)}", ported)
+        with self.assertRaises(ValueError):
+            port.port_scopes(ported)
 
 
 class RuntimeAndKritaTests(unittest.TestCase):
@@ -115,7 +137,7 @@ class RuntimeAndKritaTests(unittest.TestCase):
         self.assertIn("sendOrigin(exec) {", ported)
         self.assertIn("socialSendOriginTool(tool, (exec) => runtime.sendOrigin(exec))", ported)
         self.assertEqual(ported.count("ctx.tools.register("), 1)
-        self.assertIn('import { socialSendOriginTool } from "./turn-guard.mjs";', ported)
+        self.assertIn('import { socialSendOriginTool, socialRecencyNote } from "./turn-guard.mjs";', ported)
         with self.assertRaises(ValueError):
             port.port_runtime(self.fake_runtime().replace("\tctx.tools.register(other);\n" * 3, ""))
 
@@ -186,6 +208,7 @@ class RealReleaseCopyTests(unittest.TestCase):
                 path.chmod(0o755 if path.is_dir() else 0o644)
             port.main([str(target), "--worktree"])
             for name in ("dsh-plugin-discord/lib/index.js", "dsh-plugin-discord/lib/natural-participation.mjs",
+                         "dsh-plugin-discord/lib/history-view.mjs", "dsh-plugin-discord/lib/gateway-scopes.mjs",
                          "dsh-social-runtime/bridge.mjs", "dsh-social-runtime/turn-guard.mjs",
                          "dsh-social-runtime/studio.mjs", "dsh-social-runtime/index.mjs",
                          "dsh-social-runtime/krita-tools.mjs"):

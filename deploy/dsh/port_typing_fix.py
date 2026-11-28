@@ -49,10 +49,17 @@ LEASE_DECLARE = ("let scopeAgent;", "let scopeAgent;\n\t\tlet socialLease;")
 LEASE_GUARD = ("scopeAgent=agent;", "if (socialBudget?.signal.aborted) return { chunks: [TURN_DEADLINE_NOTICE], files: [] };\n\t\t\tscopeAgent=agent;")
 LEASE_TAKE = ("if (this.gatewayScopes && !await this.gatewayScopes.turn(agent,channelId,messageId))\n\t\t\treturn {chunks:[],files:[]};",
               "if (this.gatewayScopes && !await this.gatewayScopes.turn(agent,channelId,messageId))\n\t\t\treturn {chunks:[],files:[]};\n\t\tsocialLease = this.gatewayScopes?.active.get(agent);")
+# 送答前的核对偶尔会因为 Discord 慢或限流没过，整轮答覆就被丢掉（2026-11-28 第 4 则）：没过隔一下再核对。
+DELIVER_CHECK = ("if (this.gatewayScopes && !await this.gatewayScopes.historyCanDeliver(agent,messageId))\n\t\t\t\treturn {chunks:[],files:[]};",
+                 "if (this.gatewayScopes && !await socialCanDeliver(() => this.gatewayScopes.historyCanDeliver(agent,messageId), {\n"
+                 "\t\t\t\tsignal: socialBudget?.signal,\n"
+                 "\t\t\t\trevoked: () => Boolean(this.gatewayScopes.revoked?.has(messageId)),\n"
+                 "\t\t\t\tonMiss: (attempt) => this.log(\"warn\", `送答核对没过 #${messageId}：第 ${attempt} 次`),\n"
+                 "\t\t\t}))\n\t\t\t\treturn {chunks:[],files:[]};")
 LEASE_END = ("if (scopeAgent) this.gatewayScopes?.end(scopeAgent);",
              "if (scopeAgent && this.gatewayScopes?.active.get(scopeAgent) === socialLease) this.gatewayScopes.end(scopeAgent);")
 # 背景画室：/stop 也停画室；登入后建画室，画室收下请求时告诉群聊行为处理。
-STUDIO_IMPORT = 'import { createSocialStudio, stopSocialStudio, noteSocialStudioDeleted } from "dsh-social-runtime/bridge";\n'
+STUDIO_IMPORT = 'import { createSocialStudio, stopSocialStudio, noteSocialStudioDeleted, socialCanDeliver } from "dsh-social-runtime/bridge";\n'
 # 请求讯息被删（含批次删除）：画室那张安静停掉，画好的图不会掉成一般群讯（第 3 轮审查）。
 STUDIO_DELETE = ('const onMessageDelete = (data) => {scopeAuthority?.noteRevoked(data);socialArchive("delete",data);};',
                  'const onMessageDelete = (data) => {scopeAuthority?.noteRevoked(data);socialArchive("delete",data);noteSocialStudioDeleted(data);};')
@@ -62,8 +69,53 @@ STUDIO_WIRING = '''const socialStudio = createSocialStudio({ bridges: { group: b
 socialStudio.on((event) => participation.drawEvent(event));
 '''
 # 闸道核验过的聊天请求由 history-view 附上的工具说明：聊天会话改成「交给画室」的说明。
+# 另外附上这个频道画室最近的结果（没画成的已经回报过了，不要自己补画）。
 HISTORY_GUIDE = ("return tools.KRITA_GUIDE+tools.referenceHint(",
-                 "return (await import(new URL('../../dsh-social-runtime/studio.mjs',import.meta.url))).DRAW_GUIDE+tools.referenceHint(")
+                 "const studioModule=await import(new URL('../../dsh-social-runtime/studio.mjs',import.meta.url));\n"
+                 "        return studioModule.DRAW_GUIDE+studioModule.studioRecentNote(ctx.get('socialHeartbeatSessions')?.runtime.studio,target.channelId)+tools.referenceHint(")
+
+# ---- dsh-plugin-discord/lib/history-view.mjs 与 gateway-scopes.mjs：闸道核验过的聊天回放 ----
+# 现行 release 在每次呼叫模型前，把聊天会话改写成「这个频道最近 26 则核验过的群友讯息原文」：
+# 没有日期、没有说话的人、没有她当时的回答，也没有「叫你」的标记。所以几天前没头没尾的一句会被当成刚刚的话
+# （2026-11-28：4 天前同一个频道的一句闲聊），之前的画图请求看起来都还没回，她就一直交给画室（同日第 6、8 则）。
+HISTORY_HELPERS = ("let authority;\n", '''let authority;
+// 聊天回放只放这么久以内的讯息；更早的不当成眼前的对话（要找旧事用记忆与聊天纪录搜寻）。
+const REPLAY_MAX_AGE_MS=6*3600_000;
+const snowflakeTime=id=>{ try { return Number((BigInt(id)>>22n)+1420070400000n); } catch { return NaN; } };
+const replayStamp=at=>Number.isFinite(at) ? new Intl.DateTimeFormat('zh-TW',{timeZone:'Asia/Taipei',month:'2-digit',day:'2-digit',
+	hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(new Date(at)) : '時間不明';
+// 回放的每一则都标上时间与说话的人（都取自 Discord 核对过的原讯息）；这次的那则再标明是不是在叫她
+// （取桥接自己写的那行标头，群友的内文伪造不了换行）。
+function replayText(current,native,live) {
+	const when=replayStamp(Number.isFinite(current.at)?current.at:snowflakeTime(current.id));
+	const who=current.name ? current.name+'：' : '';
+	if (!live) return `［${when}，之前的訊息］${who}${current.text}`;
+	const header=String(native?.content?.find(block=>block.type==='text')?.text??'').split('\\n',1)[0];
+	const how=/沒人叫你/u.test(header) ? '沒人叫你，是你自己想插一句，只說一兩句'
+		: /沒人直接叫你/u.test(header) ? '沒人直接叫你，但大家在接你剛說的話' : '這則在叫你';
+	return `［${when}，這次的新訊息；${how}］${who}${current.text}`;
+}
+''')
+HISTORY_AGE = ("\tconst chosen=[...sources].slice(-26);",
+               "\t// 聊天（有当轮讯息）时，太久以前的不再当成眼前的对话回放。\n"
+               "\tconst since=liveId ? Date.now()-REPLAY_MAX_AGE_MS : -Infinity;\n"
+               "\tconst chosen=[...sources].filter(([id,event])=>id===liveId || !(Number(event.time)<since)).slice(-26);")
+HISTORY_TEXT = ("content:[{type:'text',text:current.text}]}};",
+                "content:[{type:'text',text:replayText(current,native,id===liveId)}]}};")
+HISTORY_REPLIES = ("\tconst bySeq=new Map(proven.filter(row=>verified.has(row.id)).map(row=>[row.seq,row]));\n",
+                   "\tconst bySeq=new Map(proven.filter(row=>verified.has(row.id)).map(row=>[row.seq,row]));\n"
+                   "\t// 回放的旧讯息后面接上她当时的回答（只取文字）：不然一串旧问题看起来都还没回。\n"
+                   "\tconst replies=new Map();\n\tlet asked;\n\tfor (const event of whole) {\n\t\tif (event.seq>=start) break;\n"
+                   "\t\tif (event.type==='user/message' && origin(event)) asked=bySeq.has(event.seq) ? event.seq : undefined;\n"
+                   "\t\telse if (asked!==undefined && event.type==='assistant/message') {\n"
+                   "\t\t\tconst message=derivedWithoutCursor(session,event);\n"
+                   "\t\t\tconst text=(message?.content??[]).filter(block=>block.type==='text').map(block=>block.text??'').join('').trim();\n"
+                   "\t\t\tif (text) replies.set(asked,{...message,content:[{type:'text',text}]});\n\t\t}\n\t}\n")
+HISTORY_PUSH = ("\t\t\tresult.push(retained.message);\n",
+                "\t\t\tresult.push(retained.message);\n\t\t\tif (event.seq<start && replies.has(event.seq)) result.push(replies.get(event.seq));\n")
+SCOPES_SOURCE = ("return row.content.trim() || attachments.length ? {id:event,text:row.content,actor,attachments,images} : null;",
+                 "const name=String(row.author.global_name||row.author.username||'').replace(/[\\r\\n［］[\\]←：:]/gu,'').slice(0,40);\n"
+                 "\t\t\treturn row.content.trim() || attachments.length ? {id:event,text:row.content,actor,attachments,images,name,at:Date.parse(row.timestamp)} : null;")
 
 BRIDGE_IMPORT = ("import { currentRuntime } from './index.mjs';",
                  "import { currentRuntime } from './index.mjs';\nimport { foldSocialReply } from './turn-guard.mjs';\nimport { connectStudio } from './studio.mjs';")
@@ -114,8 +166,8 @@ RUNTIME = [
     ('import { kritaTools, kritaGuideFor, reportKritaRoute, observeKritaScope, referenceAttachments } from "./krita-tools.mjs";',
      'import { kritaTools, kritaGuideFor, reportKritaRoute, observeKritaScope, referenceAttachments } from "./krita-tools.mjs";\n'
      'import { referenceHint as kritaReferenceHint } from "./krita-tools.mjs";\n'
-     'import { drawRequestTool, DRAW_GUIDE } from "./studio.mjs";\n'
-     'import { socialSendOriginTool } from "./turn-guard.mjs";'),
+     'import { drawRequestTool, DRAW_GUIDE, studioRecentNote } from "./studio.mjs";\n'
+     'import { socialSendOriginTool, socialRecencyNote } from "./turn-guard.mjs";'),
     ('for (const tool of kritaTools(runtime)) ctx.tools.register(tool);',
      'for (const tool of kritaTools(runtime)) ctx.tools.register(tool);\n\tctx.tools.register(drawRequestTool(runtime));'),
     # 画室会话的编号（→ 它服务的聊天会话）；模型请求另外计数，画图时聊天不会被「目前有点忙」挡下。
@@ -144,7 +196,12 @@ RUNTIME = [
     ("exec.name !== 'remember' && exec.name !== 'krita_batch'",
      "exec.name !== 'remember' && exec.name !== 'draw_request'"),
     ("agent.ctx.systemPrompt.context({ name: 'krita-works', order: 951, interpolate: false, required: true, text: () => kritaGuideFor(this, agent) });",
-     "agent.ctx.systemPrompt.context({ name: 'krita-works', order: 951, interpolate: false, required: true, text: () => this.studios.has(agent.id) ? kritaGuideFor(this, agent) : (kritaGuideFor(this, agent) ? DRAW_GUIDE + kritaReferenceHint(this.turns.get(agent.id)) : '') });"),
+     "agent.ctx.systemPrompt.context({ name: 'krita-works', order: 951, interpolate: false, required: true, text: () => this.studios.has(agent.id) ? kritaGuideFor(this, agent) : (kritaGuideFor(this, agent) ? DRAW_GUIDE + studioRecentNote(this.studio, this.turns.get(agent.id)?.channelId) + kritaReferenceHint(this.turns.get(agent.id)) : '') });\n"
+     # 同一个频道的会话会延续好几天：离上一则群友讯息很久了，就说之前的话题已经过去（2026-11-28：4 天前的闲聊被当成刚刚的话）。
+     "\t\tagent.ctx.systemPrompt.context({ name: 'social-recency', order: 949, interpolate: false, required: true, text: () => this.studios.has(agent.id) ? '' : socialRecencyNote(agent.session?.snapshotEvents?.() ?? [], this.turns.get(agent.id)) });"),
+    # 不把换气（huanqi）的提示从画室拿掉：拿掉以后那一轮会变成完全空白，换气额度 0 时它处理空白回合会在
+    # 会话事件里同步写入，宿主当成重入、整个 dsh 停掉（2026-11-28 沙盒实测）。改由画室提示词说明那是给聊天用的，
+    # 没画完由 runStudioJob 自己接着画。
     ("if (this.isGroup(agent) && !this.groupToolsFull) {\n\t\t\tagent.ctx.tools.restrict({\n\t\t\t\tallow: ['remember', 'chat_search', 'chat_open', 'krita_batch'],\n\t\t\t});",
      "if (this.studios.has(agent.id)) {\n\t\t\tagent.ctx.tools.restrict({ allow: ['krita_batch'] });\n\t\t\tagent.ctx.tools.presentAs('native');\n"
      "\t\t} else if (this.isGroup(agent) && !this.groupToolsFull) {\n\t\t\tagent.ctx.tools.restrict({\n\t\t\t\tallow: ['remember', 'chat_search', 'chat_open', 'draw_request'],\n\t\t\t});"),
@@ -189,13 +246,14 @@ def port_index(content):
     content = once(content, sp.FOLLOWUP[0], sp.FOLLOWUP[1])
     content = once(content, RELEASE_WAIT, sp.WAIT)
     for anchor, replacement in (sp.NOTICE_TICKET, SEND, COMMITMENT_REPLY, sp.TRACKED_REST, PARTICIPATION_LOG,
-                                LEASE_DECLARE, LEASE_GUARD, LEASE_TAKE, LEASE_END, STUDIO_STOP, HISTORY_GUIDE, STUDIO_DELETE):
+                                LEASE_DECLARE, LEASE_GUARD, LEASE_TAKE, LEASE_END, STUDIO_STOP, HISTORY_GUIDE, STUDIO_DELETE,
+                                DELIVER_CHECK):
         content = once(content, anchor, replacement)
     content = once(content, SUBSCRIBE_ANCHOR, sp.SUBSCRIBE + STUDIO_WIRING + SUBSCRIBE_ANCHOR)
     content = once(content, OLD_MESSAGE_FAILED, sp.MESSAGE_FAILED)
     content = once(content, OLD_EDIT_FAILED, sp.EDIT_FAILED)
     # 保留现行 release 自己的补丁（gatewayScopes、history-view、drain、承诺、Krita）。
-    for kept in ("this.gatewayScopes.turn(agent,channelId,messageId)", "historyCanDeliver(agent,messageId)",
+    for kept in ("this.gatewayScopes.turn(agent,channelId,messageId)", "this.gatewayScopes.historyCanDeliver(agent,messageId)",
                  "historyView.note(", "dsh.maintenance-drain.root.v1", "parseCommitmentReply(chunk)",
                  "await prepareSocialTurn(agent, channelId, messageId);", "recordSocialCommitment(message, sent,",
                  "tools.referenceHint("):
@@ -236,6 +294,20 @@ def port_runtime(content):
         raise ValueError("现行 release 的 apply 注册工具的写法变了，须重新审阅。")
     body = sp.once(body.replace("ctx.tools.register(", "registerTool("), *APPLY_RUNTIME)
     return head + body
+
+
+def port_history(content):
+    if "replayText(" in content:
+        raise ValueError("这份 release 的 history-view.mjs 已经移植过。")
+    for anchor, replacement in (HISTORY_HELPERS, HISTORY_AGE, HISTORY_TEXT, HISTORY_REPLIES, HISTORY_PUSH):
+        content = sp.once(content, anchor, replacement)
+    return content
+
+
+def port_scopes(content):
+    if "at:Date.parse(row.timestamp)" in content:
+        raise ValueError("这份 release 的 gateway-scopes.mjs 已经移植过。")
+    return sp.once(content, *SCOPES_SOURCE)
 
 
 def port_krita(content):
@@ -335,6 +407,7 @@ def main(argv=None, replace=os.replace):
     plugin = args.release / "dsh-plugin-discord/lib"
     runtime = args.release / "dsh-social-runtime"
     index_path, np_path = plugin / "index.js", plugin / "natural-participation.mjs"
+    history_path, scopes_path = plugin / "history-view.mjs", plugin / "gateway-scopes.mjs"
     bridge_path, runtime_path, krita_path = runtime / "bridge.mjs", runtime / "index.mjs", runtime / "krita-tools.mjs"
     read = lambda path: path.read_text(encoding="utf-8").replace("\r\n", "\n")
     source = lambda name: (args.repo / name).read_bytes() if args.worktree else git(args.repo, "show", f"{args.rev}:{name}")
@@ -343,6 +416,8 @@ def main(argv=None, replace=os.replace):
     bridge = port_bridge(read(bridge_path), develop_bridge)
     social = port_runtime(read(runtime_path))
     krita = port_krita(read(krita_path))
+    history = port_history(read(history_path))
+    scopes = port_scopes(read(scopes_path))
     # natural-participation.mjs：现行 release = develop + 承诺的几行，把本分支对 develop 的改动逐段套上去
     # （每段的上下文都要在现行 release 里刚好出现一次）。
     patch = git(args.repo, "diff", "-U3", args.base, *([] if args.worktree else [args.rev]), "--", "deploy/dsh/natural-participation.mjs").decode("utf-8")
@@ -355,10 +430,12 @@ def main(argv=None, replace=os.replace):
         (bridge_path, encode(bridge)),
         (runtime_path, encode(social)),
         (krita_path, encode(krita)),
+        (history_path, encode(history)),
+        (scopes_path, encode(scopes)),
         (runtime / "turn-guard.mjs", source("deploy/social/turn-guard.mjs")),
         (runtime / "studio.mjs", source("deploy/social/studio.mjs")),
     ], replace=replace)
-    print("已移植：index.js、natural-participation.mjs、bridge.mjs、index.mjs、krita-tools.mjs，新增 turn-guard.mjs、studio.mjs")
+    print("已移植：index.js、natural-participation.mjs、history-view.mjs、gateway-scopes.mjs、bridge.mjs、index.mjs、krita-tools.mjs，新增 turn-guard.mjs、studio.mjs")
 
 
 if __name__ == "__main__":

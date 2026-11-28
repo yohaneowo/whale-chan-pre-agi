@@ -554,8 +554,10 @@ async function play(scene) {
 		continuity: new Map(),
 	});
 	scopes.rpc = async () => 'scope';
-	// 只看租约是不是还是这一则的（不连 Discord 核对来源）。
+	// 只看租约是不是还是这一则的（不连 Discord 核对来源）。scene.deliverMiss(key) 回传 true 时
+	// 这次核对当成没过（Discord 慢或限流，2026-11-28 第 4 则）。
 	scopes.historyCanDeliver = async (current, event) =>
+		!scene.deliverMiss?.(keyOf(event)) &&
 		scopes.active.get(current)?.row.event === event;
 
 	// 桥接：从 index.js 取出的真方法，挂在一个只有必要栏位的物件上。
@@ -840,6 +842,14 @@ function judge(scene, result) {
 			if (!replies.includes(text)) problems.push(`#${key} 没有回覆「${text}」`);
 		for (const text of expect.never ?? [])
 			if (replies.includes(text)) problems.push(`#${key} 不该回覆「${text}」`);
+		for (const text of expect.absent ?? [])
+			if (posted.some((row) => row.content === text))
+				problems.push(`#${key} 不该送出「${text}」`);
+		if (
+			expect.noStudio &&
+			logs.some((line) => line.text.startsWith(`畫室 收到 #${message.id} `))
+		)
+			problems.push(`#${key} 不该交给画室`);
 		if (expect.prefaceBy) {
 			const preface = posted.find(
 				(row) => row.replyTo === message.id && row.content === expect.preface,
@@ -1272,7 +1282,8 @@ const scenes = [
 		},
 	},
 	{
-		name: '比较久的事：20 秒没动静先说一句',
+		// 主人：一般聊天常常 20～60 秒，几乎每次都先插「等我一下」，不像真人。只有交给画室才可能先说。
+		name: '一般聊天慢一点（45 秒）也不先插「等我一下」',
 		messages: [{ key: 'A', at: 0, content: `${mention} 查天氣 PRIVATE-A` }],
 		async model(turn, tools) {
 			await tools.wait(45_000);
@@ -1280,11 +1291,146 @@ const scenes = [
 		},
 		expect: {
 			A: {
-				preface: '等我一下，我弄一下',
-				prefaceBy: 21_000,
 				posts: ['晴天'],
+				absent: ['等我一下，我弄一下'],
 				status: 'answered',
 			},
+		},
+	},
+	{
+		// 2026-11-28 真频道验收：换气（huanqi）要画室「落盘进度、请人手动压缩」，画室照做、回一段文字就结束，
+		// 画室把第一个有文字的回合当成结果，4 次都判失败。
+		name: '画室收到换气提示、回一段「需要手动压缩」就结束：期限内接着画完交付',
+		messages: [
+			{
+				key: 'A',
+				at: 0,
+				content: `${mention} 可以幫我畫一隻小鯨魚嗎 PRIVATE-A`,
+			},
+		],
+		async model(turn, tools) {
+			return chatDraw(tools, turn);
+		},
+		async studio(turn, tools) {
+			if (!/接著畫/.test(turn.text)) {
+				await tools.wait(10_000);
+				tools.tool('krita_batch', { action: 'start', width: 512, height: 512 });
+				await tools.wait(40_000);
+				tools.say('**需要手動壓縮。** 進度：已建畫布，下一步畫身體。');
+				return;
+			}
+			return studioDraw(turn, tools, 1);
+		},
+		typingMax: 30_000,
+		expect: {
+			A: {
+				posts: [GO],
+				final: 300_000,
+				never: [STUDIO_FAILED, STUCK],
+				status: 'answered',
+			},
+		},
+	},
+	{
+		// 同日第 2 轮：画室回了一句、换气排了补救轮，补救轮被聊天回合的 discord-turn-answered 中止。
+		name: '画室的补救轮不被聊天回合的 discord-turn-answered 中止，照样画完',
+		messages: [
+			{ key: 'A', at: 0, content: `${mention} 畫一隻小鯨魚 PRIVATE-A` },
+		],
+		async model(turn, tools) {
+			return chatDraw(tools, turn);
+		},
+		// 补救轮的讯息不是群友的讯息，Krita 核对不到请求者、交付不了（正式环境也一样），
+		// 所以要靠画室自己「接着画」那一轮（绑着原本那则请求）才画得完。
+		async studio(turn, tools) {
+			if (turn.kind === 'rescue')
+				return (await tools.wait(5_000), tools.say('嗯'));
+			if (/接著畫/.test(turn.text)) return studioDraw(turn, tools, 1);
+			await tools.wait(20_000);
+			tools.say('我先想一下構圖');
+			return tools.rescue(1);
+		},
+		typingMax: 30_000,
+		expect: {
+			A: {
+				posts: [GO],
+				final: 300_000,
+				never: [STUDIO_FAILED, STUCK],
+				status: 'answered',
+			},
+		},
+	},
+	{
+		// 同日第 6、8 则：画室失败以后，跟画图无关的 @ 她也呼叫 draw_request，回「我去畫」接着又「卡住了」。
+		// 这里的模型每则都先呼叫 draw_request（最坏的情况），要靠程式挡下。
+		name: '画室失败以后，一般聊天不会被交给画室（程式挡下，不只靠提示词）',
+		messages: [
+			{
+				key: 'A',
+				at: 0,
+				content: `${mention} 可以幫我畫一隻小鯨魚嗎 PRIVATE-A`,
+			},
+			{
+				key: 'B',
+				at: 120_000,
+				content: `${mention} 你最喜歡什麼顏色 PRIVATE-B`,
+			},
+			{
+				key: 'C',
+				at: 240_000,
+				content: `${mention} 你畫畫的時候還能聊天嗎 PRIVATE-C`,
+			},
+		],
+		async model(turn, tools) {
+			if (!tools.drawRequest) {
+				await tools.wait(3_000);
+				return tools.say(turn.key === 'A' ? GO : '藍色吧');
+			}
+			const result = await tools.drawRequest({
+				brief: '畫小鯨魚 PRIVATE-BRIEF',
+			});
+			await tools.wait(1_500);
+			tools.say(result.ok ? GO : turn.key === 'B' ? '藍色吧' : '可以啊');
+		},
+		async studio(turn, tools) {
+			await tools.wait(10_000);
+			tools.fail();
+		},
+		typingMax: 30_000,
+		expect: {
+			A: { posts: [GO], replies: [STUDIO_FAILED], never: [STUCK] },
+			B: {
+				posts: ['藍色吧'],
+				never: [GO, STUDIO_FAILED, STUCK],
+				noStudio: true,
+				status: 'answered',
+			},
+			C: {
+				posts: ['可以啊'],
+				never: [GO, STUDIO_FAILED, STUCK],
+				noStudio: true,
+				status: 'answered',
+			},
+		},
+	},
+	{
+		// 同日第 4 则：回合正常答完，送答前的核对（向 Discord 重新取原讯息，3 秒期限）没过，答覆被丢掉。
+		name: '连 @ 第二则：送答前的核对第一次没过，隔一下再核对就送出',
+		messages: [
+			{ key: 'A', at: 0, content: `${mention} 晚餐吃什麼好 PRIVATE-A` },
+			{ key: 'B', at: 5_000, content: `${mention} 想吃點熱的 PRIVATE-B` },
+		],
+		deliverMiss: (() => {
+			let missed = 0;
+			return (key) => key === 'B' && missed++ === 0;
+		})(),
+		async model(turn, tools) {
+			await tools.wait(8_000);
+			tools.say(turn.key === 'A' ? '白飯配罐頭' : '湯麵吧');
+		},
+		expect: {
+			A: { posts: ['白飯配罐頭'], never: [STUCK], status: 'answered' },
+			B: { posts: ['湯麵吧'], never: [STUCK], status: 'answered' },
 		},
 	},
 	{
@@ -2183,7 +2329,151 @@ async function hostContractCheck() {
 	return problems;
 }
 
+// 闸道核验过的聊天回放（副本真的 history-view.mjs）：2026-11-28：4 天前（11/24）同一个频道有人说了一句闲聊，
+// 她当时回过了；11/28 站长没 @ 她说了一句，模型拿到的是一串没有日期、没有她回答的原文，把那句当成刚刚的话。
+const snowflake = (ms) => ((BigInt(ms) - 1420070400000n) << 22n).toString();
+async function historyReplayCheck() {
+	const { historyView } = await import(
+		pathToFileURL(join(plugin, 'history-view.mjs')).href
+	);
+	const problems = [];
+	const now = Date.now();
+	const run = async (oldAt, label) => {
+		const oldId = snowflake(oldAt);
+		const liveId = snowflake(now - 2_000);
+		const user = (seq, time, id, text) => ({
+			type: 'user/message',
+			seq,
+			time,
+			data: {
+				message: {
+					id: 'm' + seq,
+					role: 'user',
+					content: [{ type: 'text', text }],
+					source: {
+						kind: 'user',
+						discordMessageId: id,
+						discordChannelId: CHANNEL,
+					},
+				},
+			},
+		});
+		const events = [
+			{ type: 'turn/start', seq: 1, time: oldAt, data: { turn: 1 } },
+			user(
+				2,
+				oldAt,
+				oldId,
+				'（#閒聊｜沙盒，群聊新訊息。沒人叫你，是你自己想插一句，只說一兩句。）\n#0001 14:26 群友甲：明天幫我搬家',
+			),
+			{
+				type: 'assistant/message',
+				seq: 3,
+				time: oldAt + 2_000,
+				data: {
+					message: {
+						id: 'a3',
+						role: 'assistant',
+						content: [{ type: 'text', text: '下雨是要送什麼啦' }],
+						source: { kind: 'model' },
+					},
+				},
+			},
+			{
+				type: 'turn/end',
+				seq: 4,
+				time: oldAt + 2_000,
+				data: { reason: { kind: 'completed' } },
+			},
+			{ type: 'turn/start', seq: 5, time: now - 1_000, data: { turn: 2 } },
+			user(
+				6,
+				now - 1_000,
+				liveId,
+				'（#閒聊｜沙盒，群聊新訊息。沒人叫你，是你自己想插一句，只說一兩句。）\n#0002 14:46 站長：你今天好安靜',
+			),
+		];
+		const session = {
+			header: {},
+			snapshotEvents: () => events,
+			eventAt: (seq) => events.find((event) => event.seq === seq),
+			deriveEventMessage: (event) => event.data.message,
+		};
+		const raw = {
+			[oldId]: { text: '明天幫我搬家', name: '群友甲', at: oldAt },
+			[liveId]: { text: '你今天好安靜', name: '站長', at: now - 2_000 },
+		};
+		historyView.install({
+			owns: () => true,
+			route: async () => ({ channelId: CHANNEL, sessionId: SESSION }),
+			eligible: async (target, ids) => new Set(ids),
+			batch: async (target, ids) => new Map(ids.map((id) => [id, { id }])),
+			source: async (target, id) =>
+				raw[id] && {
+					id,
+					actor: FRIEND,
+					attachments: [],
+					images: [],
+					...raw[id],
+				},
+			live: () => true,
+			memories: async () => [],
+			guide: async () => '',
+		});
+		const options = { sessionId: SESSION, messages: [] };
+		historyView.mark(options, {
+			kind: 'chat',
+			session,
+			turn: 2,
+			sequences: [],
+			system: {
+				id: 'sys',
+				role: 'system',
+				content: [{ type: 'text', text: '系統' }],
+			},
+			live: [events[5].data.message],
+		});
+		const projected = await historyView.apply(options);
+		const texts = (projected?.messages ?? []).map((message) => ({
+			role: message.role,
+			text: (message.content ?? []).map((block) => block.text ?? '').join(''),
+		}));
+		const at = texts.findIndex((row) => row.text.includes('明天幫我搬家'));
+		const live = texts.find((row) => row.text.includes('你今天好安靜'));
+		return { texts, at, live, label };
+	};
+	// 4 天前的那句：不能再当成眼前的对话回放。
+	const stale = await run(now - 4 * 86_400_000, '4 天前');
+	if (stale.at >= 0)
+		problems.push(
+			`4 天前的「明天幫我搬家」仍被回放成眼前的对话（${stale.texts[stale.at + 1]?.role === 'assistant' ? '有' : '没有'}接上她当时的回答）`,
+		);
+	if (!stale.live) problems.push('这次的讯息没有回放');
+	else {
+		if (!/\d{2}\/\d{2}/.test(stale.live.text))
+			problems.push('这次的讯息没有标日期');
+		if (!stale.live.text.includes('沒人叫你'))
+			problems.push('这次的讯息没有标明是她自己想插话（没人叫她）');
+		if (!stale.live.text.includes('站長'))
+			problems.push('这次的讯息没有标说话的人');
+	}
+	// 1 小时前的：还在眼前的对话里，要标「之前的訊息」并接上她当时的回答。
+	const recent = await run(now - 3_600_000, '1 小时前');
+	if (recent.at < 0) problems.push('1 小时前的讯息没有回放');
+	else {
+		if (!recent.texts[recent.at].text.includes('之前的訊息'))
+			problems.push('1 小时前的讯息没有标成「之前的訊息」');
+		if (recent.texts[recent.at + 1]?.text !== '下雨是要送什麼啦')
+			problems.push('1 小时前的讯息后面没有接上她当时的回答');
+	}
+	return problems;
+}
+
 const runtimeChecks = [
+	{
+		name: '聊天回放：几天前的旧讯息不当成眼前的对话；回放的讯息标日期、说话的人，接上她当时的回答',
+		run: historyReplayCheck,
+	},
 	{
 		name: '照正式宿主规则登记全部工具、挂上聊天与画室会话、组系统提示（不丢错）',
 		run: hostContractCheck,

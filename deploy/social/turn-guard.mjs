@@ -469,6 +469,8 @@ function cancelOwned(agent, prompt, state, reason) {
 // 回合已经完整回答就不等补救轮（顺手停掉它，省 token），到期限就只取消自己的那一轮。
 // 回传 status：answered／settled／lost（讯息没进会话）／deadline-cancelled／
 // deadline-unsettled（取消了但 5 秒内没收尾）／deadline-not-owner（正在跑的是别人的回合，没有取消）。
+// untilIdle：等到会话整个闲下来（含补救轮）才回来，不因为第一轮有文字就提早回传、也不停掉补救轮
+// （画室用：画室要看的是图有没有交付，不是有没有说话）。
 export async function awaitSocialTurn(
 	agent,
 	prompt,
@@ -479,6 +481,7 @@ export async function awaitSocialTurn(
 		pause = (ms) => delay(ms),
 		now = () => Date.now(),
 		poll = 500,
+		untilIdle = false,
 	} = {},
 ) {
 	const started = startedAt ?? now();
@@ -495,7 +498,7 @@ export async function awaitSocialTurn(
 	for (;;) {
 		await Promise.race([done.catch(() => {}), pause(poll)]);
 		const state = socialTurnState(eventsOf(agent), promptId);
-		if (state.answered) {
+		if (state.answered && !untilIdle) {
 			const stopped =
 				state.rescueRunning ||
 				(agent.inbox?.nextTurn ?? []).some(
@@ -565,6 +568,59 @@ async function settleRescues(agent, pause) {
 			return;
 		await agent.whenIdle();
 	}
+}
+
+// 送答前的核对（闸道的 historyCanDeliver：要向 Discord 重新取原讯息、频道、成员与身分组，3 秒期限）
+// 偶尔会因为 Discord 慢或限流而没过；没过就整轮答覆丢掉、补一句「我剛剛卡住了」
+// （2026-11-28 第 4 则：回合正常答完，3 秒后核对没过）。所以没过时隔一下再核对，最多 attempts 次；
+// 讯息已经被删或改掉（revoked）、期限到或 /stop 就不再试。
+export async function socialCanDeliver(
+	check,
+	{
+		signal,
+		revoked = () => false,
+		attempts = 3,
+		gapMs = 1_500,
+		pause = (ms) => delay(ms),
+		onMiss = () => {},
+	} = {},
+) {
+	for (let attempt = 1; ; attempt++) {
+		let ok;
+		try {
+			ok = await check();
+		} catch {
+			ok = false;
+		}
+		if (ok) return true;
+		onMiss(attempt);
+		if (attempt >= attempts || signal?.aborted || revoked()) return false;
+		await pause(gapMs);
+		if (signal?.aborted || revoked()) return false;
+	}
+}
+
+// 同一个频道的会话一直延续下去（几天前的对话都还在会话里）。距离上一则群友讯息很久了，
+// 就提醒她之前的话题已经过去（2026-11-28：4 天前同一个频道的一句闲聊，
+// 她把这句当成刚刚的话接着回）。events 是会话事件，source 是这一轮（ingress 的那一则）。
+export const STALE_GAP_MS = 3 * 3_600_000;
+export function socialRecencyNote(events, source, now = Date.now()) {
+	if (!source?.messageId || !Array.isArray(events)) return '';
+	let last;
+	for (let index = events.length - 1; index >= 0; index--) {
+		const event = events[index];
+		if (event?.type !== 'user/message') continue;
+		const from = messageOf(event)?.source;
+		if (from?.kind !== 'user' || !from.discordMessageId) continue;
+		if (String(from.discordMessageId) === String(source.messageId)) continue;
+		last = event;
+		break;
+	}
+	const at = Number(last?.time);
+	if (!Number.isFinite(at) || now - at < STALE_GAP_MS) return '';
+	const hours = Math.floor((now - at) / 3_600_000);
+	const gap = hours >= 48 ? `${Math.floor(hours / 24)} 天` : `${hours} 小時`;
+	return `距離你上次在這裡聊天已經過了 ${gap}。那之前的話題都已經過去了，不要接舊話題、不要回舊訊息，只看這次的新訊息。`;
 }
 
 // 送进 inbox 并留下这则讯息本身（它的 id 是这一轮的识别码）。

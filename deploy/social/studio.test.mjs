@@ -184,6 +184,7 @@ test('draw_request：请求者与要回覆的讯息取自宿主核对过的本�
 		guildId: ids(2),
 		authorId: ids(201),
 		authorName: '小羅',
+		text: '幫我畫一隻貓',
 		referenceAttachments: [{ id: ids(55) }],
 	};
 	const agent = { id: 'session-chat', session: { id: 'session-chat' } };
@@ -364,10 +365,14 @@ test('connectStudio：画室会话先登记再建立、每个聊天会话一个�
 	await flush(40);
 	await studio.idle;
 	assert.equal(created.length, 1, '同一个聊天会话共用一个画室会话');
+	// 第二张一直没交付：接着画的每一轮都绑回原本那则请求，最多 STUDIO_MAX_ROUNDS 轮。
 	assert.deepEqual(
 		runtime.prepared.map((row) => row.slice(1)),
 		[
 			[ids(1), ids(101)],
+			[ids(1), ids(102)],
+			[ids(1), ids(102)],
+			[ids(1), ids(102)],
 			[ids(1), ids(102)],
 		],
 	);
@@ -747,7 +752,7 @@ test('画室：补的那句一直送不出去也有期限，到了就放弃（�
 	assert.ok(
 		logs.some((line) =>
 			line.startsWith(
-				`畫室 结果 #${ids(101)} status=failed turn=settled note=timeout `,
+				`畫室 结果 #${ids(101)} status=failed turn=settled rounds=0 note=timeout `,
 			),
 		),
 	);
@@ -844,6 +849,7 @@ test('画室：请求那则被删了，正在画的与排队的都安静停掉�
 		guildId: ids(2),
 		authorId: ids(204),
 		authorName: '阿明',
+		text: '畫一隻貓',
 	};
 	const agent = {
 		id: 'chat',
@@ -862,4 +868,309 @@ test('画室：请求那则被删了，正在画的与排队的都安静停掉�
 	);
 	assert.equal(result.ok, true);
 	assert.match(result.message, /刪掉了/);
+});
+
+// ---- 2026-11-28 真频道验收后的修正 ----
+
+// 假的画室会话：每送进一则就照 rounds 跑一轮（写进事件档），回传这一轮 wait 的结果。
+function scriptedStudio(rounds) {
+	const events = [];
+	const prompts = [];
+	const delivered = { final: 0, previews: 0 };
+	let seq = 0;
+	const push = (type, data) => events.push({ seq: ++seq, type, data });
+	const agent = { session: { snapshotEvents: () => events } };
+	const deps = {
+		acquire: async () => agent,
+		bind: () => {},
+		followup: (current, text) => {
+			const prompt = { id: 'p' + prompts.length, source: { kind: 'user' } };
+			prompts.push(text);
+			push('user/message', prompt);
+			return prompt;
+		},
+		wait: async () => {
+			const round = rounds[prompts.length - 1] ?? { text: '' };
+			push('turn/start', {});
+			if (round.text)
+				push('assistant/message', {
+					message: { content: [{ type: 'text', text: round.text }] },
+				});
+			if (round.deliver) delivered.final++;
+			push('turn/end', { reason: round.reason ?? { kind: 'completed' } });
+			return { status: round.status ?? 'settled' };
+		},
+		deliveries: () => ({ ...delivered }),
+	};
+	return { deps, prompts };
+}
+
+test('画室：一轮结束、有文字却没交付（换气要它落盘、请人压缩）：期限内接着画，不当成失败', async () => {
+	const { runStudioJob } = await import('./studio.mjs');
+	const { deps, prompts } = scriptedStudio([
+		{ text: '**需要手動壓縮。** 進度：已建畫布', status: 'answered' },
+		{ text: '畫好了', deliver: true, status: 'answered' },
+	]);
+	const result = await runStudioJob(
+		deps,
+		job(1, { attachmentIds: [] }),
+		new globalThis.AbortController().signal,
+	);
+	assert.equal(result.delivered, 'final');
+	assert.equal(result.rounds, 2);
+	assert.match(prompts[0], /krita_batch/);
+	assert.match(prompts[0], /〔换气〕/, '提示词说明换气的提示在画室不用照做');
+	assert.match(prompts[1], /接著畫/);
+});
+
+test('画室：补救轮被 hook 中止、一直没交付：最多接着画几轮就停，判没画成', async () => {
+	const { runStudioJob, STUDIO_MAX_ROUNDS } = await import('./studio.mjs');
+	const { deps, prompts } = scriptedStudio(
+		Array.from({ length: 10 }, () => ({
+			reason: {
+				kind: 'aborted',
+				reason: { kind: 'hook', reason: 'discord-turn-answered' },
+			},
+		})),
+	);
+	const result = await runStudioJob(
+		deps,
+		job(1, { attachmentIds: [] }),
+		new globalThis.AbortController().signal,
+	);
+	assert.equal(result.delivered, 'none');
+	assert.equal(result.rounds, STUDIO_MAX_ROUNDS);
+	assert.equal(prompts.length, STUDIO_MAX_ROUNDS);
+});
+
+test('画室：被叫停（signal）就不再接着画', async () => {
+	const { runStudioJob } = await import('./studio.mjs');
+	const controller = new globalThis.AbortController();
+	const { deps, prompts } = scriptedStudio([{ text: '先這樣' }]);
+	const wait = deps.wait;
+	deps.wait = async (...args) => {
+		const value = await wait(...args);
+		controller.abort();
+		return value;
+	};
+	const result = await runStudioJob(
+		deps,
+		job(1, { attachmentIds: [] }),
+		controller.signal,
+	);
+	assert.equal(result.rounds, 1);
+	assert.equal(prompts.length, 1);
+});
+
+test('等画室那一轮（untilIdle）：不拿第一个有文字的回合当结果，也不用 discord-turn-answered 停掉补救轮', async () => {
+	const { awaitSocialTurn } = await import('./turn-guard.mjs');
+	const events = [];
+	let seq = 0;
+	const push = (type, data) => events.push({ seq: ++seq, type, data });
+	let idle;
+	const cancels = [];
+	const agent = {
+		session: { snapshotEvents: () => events },
+		inbox: { nextTurn: [], nextStep: [], remove: () => true },
+		whenIdle: () =>
+			new Promise((resolve) => {
+				idle = resolve;
+			}),
+		cancel: (...args) => cancels.push(args),
+	};
+	const prompt = { id: 'p1', source: { kind: 'user' } };
+	push('user/message', prompt);
+	push('turn/start', {});
+	push('assistant/message', {
+		message: { content: [{ type: 'text', text: '需要手動壓縮' }] },
+	});
+	push('turn/end', { reason: { kind: 'completed' } });
+	// 换气排了补救轮，正在跑。
+	push('user/message', { id: 'r1', source: { kind: 'loop-guard' } });
+	push('turn/start', {});
+	let settled = false;
+	const pause = () =>
+		new Promise((resolve) => globalThis.setImmediate(resolve));
+	const waiting = awaitSocialTurn(agent, prompt, {
+		deadlineMs: Infinity,
+		untilIdle: true,
+		pause,
+	}).then((value) => ((settled = true), value));
+	for (let index = 0; index < 20; index++) await pause();
+	assert.equal(settled, false, '补救轮还在跑就继续等');
+	assert.deepEqual(cancels, [], '不停掉补救轮');
+	push('turn/end', { reason: { kind: 'completed' } });
+	idle();
+	const result = await waiting;
+	assert.equal(result.status, 'settled');
+	// 聊天回合（没有 untilIdle）照旧：答完就回来，并停掉补救轮。
+	events.splice(5);
+	push('turn/start', {});
+	const chat = await awaitSocialTurn(
+		{ ...agent, whenIdle: () => new Promise(() => {}) },
+		prompt,
+		{ deadlineMs: Infinity, pause },
+	);
+	assert.equal(chat.status, 'answered');
+	assert.equal(cancels.length, 1, '聊天回合答完就停掉补救轮');
+});
+
+test('draw_request：只有这则明确要她画才交给画室；不是画图的不收，并说之前的已经回报过了', async () => {
+	const { drawRequestTool, drawIntent, Studio } = await import('./studio.mjs');
+	for (const text of [
+		'<@1> 可以幫我畫一隻小鯨魚嗎',
+		'那等等也幫我畫一隻小海豚',
+		'畫貓',
+		'再來一張',
+		'draw me a cat',
+	])
+		assert.equal(drawIntent(text), true, text);
+	for (const text of [
+		'你最喜歡什麼顏色',
+		'<@1> 你畫畫的時候還能聊天嗎',
+		'在嗎，下午好',
+		'這張畫得不錯',
+		'幫我看看這張圖',
+	])
+		assert.equal(drawIntent(text), false, text);
+	assert.equal(drawIntent('眼睛改大一點', { sourceJob: 'work-x' }), true);
+	assert.equal(drawIntent('眼睛改大一點'), false, '没有要改的作品就不算');
+	assert.equal(drawIntent('照這張', { attachments: 1 }), true);
+	const requests = [];
+	const studio = new Studio({
+		run: () => new Promise(() => {}),
+		notify: async () => {},
+		timer: manualTimers().timer,
+	});
+	const original = studio.request.bind(studio);
+	studio.request = (input) => (requests.push(input), original(input));
+	let source = {
+		messageId: ids(101),
+		channelId: ids(1),
+		guildId: ids(2),
+		authorId: ids(201),
+		authorName: '小羅',
+		text: '<@1> 你最喜歡什麼顏色',
+	};
+	const agent = { id: 'chat', session: { id: 'session-chat' } };
+	const runtime = {
+		studio,
+		studios: new Map(),
+		turns: new Map(),
+		sourceForTurn: () => source,
+	};
+	runtime.turns.set('chat', source);
+	const refused = await drawRequestTool(runtime).execute(
+		{ action: 'start', brief: '小鯨魚' },
+		{ agent },
+	);
+	assert.equal(refused.ok, false);
+	assert.match(refused.message, /沒有要你畫圖/);
+	assert.match(refused.message, /不要補畫/);
+	assert.equal(requests.length, 0, '不交给画室');
+	source = { ...source, messageId: ids(102), text: '<@1> 幫我畫一隻小鯨魚' };
+	runtime.turns.set('chat', source);
+	const accepted = await drawRequestTool(runtime).execute(
+		{ action: 'start', brief: '小鯨魚' },
+		{ agent },
+	);
+	assert.equal(accepted.ok, true);
+	assert.equal(requests.length, 1);
+});
+
+test('画室的结果留给聊天会话看：没画成的已经回报过了，不要自己补画', async () => {
+	const { Studio, studioRecentNote, STUDIO_TEXT } =
+		await import('./studio.mjs');
+	let now = 1_000_000;
+	const ends = [];
+	const studio = new Studio({
+		run: async () => ({ delivered: 'none', status: 'settled', rounds: 4 }),
+		notify: async () => ({ id: ids(900) }),
+		timer: manualTimers().timer,
+		now: () => now,
+	});
+	studio.on((event) => event.type === 'end' && ends.push(event));
+	studio.request(job(1));
+	await flush(30);
+	await studio.idle;
+	assert.equal(ends[0].text, STUDIO_TEXT.failed);
+	assert.equal(ends[0].noteId, ids(900), '桥接要把这句记成她说过的话');
+	const note = studioRecentNote(studio, ids(1));
+	assert.match(note, new RegExp('#' + ids(101).slice(-4)));
+	assert.match(note, /沒畫成/);
+	assert.match(note, /不要自己再交給畫室/);
+	assert.equal(studioRecentNote(studio, ids(9)), '', '别的频道不附');
+	now += 31 * 60_000;
+	assert.equal(studioRecentNote(studio, ids(1)), '', '半小时以前的不附');
+});
+
+test('送答前的核对没过：隔一下再核对；讯息已经被删或期限到就不再试', async () => {
+	const { socialCanDeliver } = await import('./turn-guard.mjs');
+	const pause = async () => {};
+	let calls = 0;
+	const misses = [];
+	assert.equal(
+		await socialCanDeliver(async () => ++calls >= 2, {
+			pause,
+			onMiss: (n) => misses.push(n),
+		}),
+		true,
+	);
+	assert.equal(calls, 2);
+	assert.deepEqual(misses, [1]);
+	calls = 0;
+	assert.equal(
+		await socialCanDeliver(async () => (calls++, false), { pause }),
+		false,
+	);
+	assert.equal(calls, 3, '最多三次');
+	calls = 0;
+	assert.equal(
+		await socialCanDeliver(async () => (calls++, false), {
+			pause,
+			revoked: () => true,
+		}),
+		false,
+	);
+	assert.equal(calls, 1, '讯息被删就不再试');
+	calls = 0;
+	assert.equal(
+		await socialCanDeliver(
+			async () => {
+				calls++;
+				throw new Error('discord REST GET failed: 429');
+			},
+			{ pause },
+		),
+		false,
+	);
+	assert.equal(calls, 3, '丢错也当成没过，再试');
+});
+
+test('同一个频道的会话延续好几天：离上一则群友讯息很久了，就说之前的话题已经过去', async () => {
+	const { socialRecencyNote } = await import('./turn-guard.mjs');
+	const now = Date.parse('2026-11-28T06:46:40Z');
+	const user = (time, id) => ({
+		type: 'user/message',
+		time,
+		data: {
+			message: { source: { kind: 'user', discordMessageId: id } },
+		},
+	});
+	const events = [
+		user(Date.parse('2026-11-24T06:27:35Z'), ids(1)),
+		user(now - 1_000, ids(2)),
+	];
+	const note = socialRecencyNote(events, { messageId: ids(2) }, now);
+	assert.match(note, /4 天/);
+	assert.match(note, /不要接舊話題/);
+	assert.equal(
+		socialRecencyNote(
+			[user(now - 3_600_000, ids(1)), user(now - 1_000, ids(2))],
+			{ messageId: ids(2) },
+			now,
+		),
+		'',
+		'一小时内的不提',
+	);
 });

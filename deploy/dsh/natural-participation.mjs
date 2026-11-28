@@ -437,10 +437,27 @@ export class NaturalParticipation {
 
 	// 画室收下了这则呼叫的画图请求（studio 的 accepted 事件）：开始画或排队。
 	drawEvent(event) {
+		if (event?.type === 'end') {
+			// 画室回覆对方的那句（没画成、画太久…）：会话里没有，记下来下一批附上。
+			if (event.text && event.noteId)
+				this.recordReply(
+					String(event.channelId),
+					String(event.text),
+					String(event.noteId),
+				);
+			return;
+		}
 		if (event?.type !== 'accepted') return;
 		const call = this.calls.get(String(event.messageId));
-		if (call && call.channelId === String(event.channelId))
+		if (call && call.channelId === String(event.channelId)) {
 			call.drawing = event.status === 'queued' ? 'queued' : 'started';
+			// 只有交给画室（真的要做比较久的事）以后才可能先说一句；一般聊天就算慢也不插这句。
+			if (!call.preface && !call.closed)
+				call.preface = this.timer(
+					() => void this.preface(call, 'slow'),
+					this.config.prefaceMs,
+				);
+		}
 	}
 
 	// 桥接送这一轮的某一段失败了（错误本身由桥接用 errorTrace 记，不经过这里）。
@@ -493,10 +510,9 @@ export class NaturalParticipation {
 			closed: false,
 		};
 		this.calls.set(call.messageId, call);
-		call.preface = this.timer(
-			() => void this.preface(call, 'slow'),
-			this.config.prefaceMs,
-		);
+		// 「等我一下」不再按时间先说（主人：一般聊天常常 20～60 秒，几乎每次都插这句，不像真人）；
+		// 只有交给画室以后才排（见 drawEvent）。
+		call.preface = undefined;
 		return call;
 	}
 
@@ -705,8 +721,8 @@ export class NaturalParticipation {
 	// refs：在本频道的纪录前面标编号，让她能指定回覆哪一则；别的频道的纪录不标。
 	renderLine(line, mark = '', refs = true) {
 		return line.role === 'assistant'
-			? `${this.clock(line.at)} 你${line.replyTo ? `（回覆 #${line.replyTo.ref} ${line.replyTo.name}）` : ''}：${line.text.replace(/\s*\r?\n\s*/g, ' / ')}`
-			: `${refs ? `#${this.ref(line)} ` : ''}${this.clock(line.at)} ${line.name}${line.owner ? '［站長］' : ''}${line.guildOwner ? '［群主］' : ''}${line.editOf ? `（把 ${this.clock(line.editedFrom)} 那則改成）` : ''}：${line.text}${mark}`;
+			? `${this.stamp(line.at)} 你${line.replyTo ? `（回覆 #${line.replyTo.ref} ${line.replyTo.name}）` : ''}：${line.text.replace(/\s*\r?\n\s*/g, ' / ')}`
+			: `${refs ? `#${this.ref(line)} ` : ''}${this.stamp(line.at)} ${line.name}${line.owner ? '［站長］' : ''}${line.guildOwner ? '［群主］' : ''}${line.editOf ? `（把 ${this.clock(line.editedFrom)} 那則改成）` : ''}：${line.text}${mark}`;
 	}
 
 	// 聊天行只有名字；要对人用 Discord 工具（踢人、改身分组）得有 ID，附上这段出现的人的对照，免得她自己编。
@@ -859,6 +875,19 @@ export class NaturalParticipation {
 			Object.assign(this.state, { day, proactive: 0, judgments: 0 });
 	}
 
+	// 今天的讯息只写时间；不是今天的连日期一起写（只写时间时，几天前的话看起来像刚刚说的）。
+	stamp(at) {
+		const zone = this.config.timeZone;
+		if (clockParts(at, zone).day === clockParts(this.now(), zone).day)
+			return this.clock(at);
+		const date = new Intl.DateTimeFormat('en-US', {
+			timeZone: zone,
+			month: '2-digit',
+			day: '2-digit',
+		}).format(new Date(at));
+		return `${date} ${this.clock(at)}`;
+	}
+
 	clock(at) {
 		return new Intl.DateTimeFormat('en-GB', {
 			timeZone: this.config.timeZone,
@@ -896,7 +925,7 @@ export class NaturalParticipation {
 				? `（${where ? where + '，' : ''}群聊新訊息，${today}。沒人叫你，是你自己想插一句，只說一兩句。）`
 				: mode === 'engaged'
 					? `（${where ? where + '，' : ''}群聊新訊息，${today}。沒人直接叫你，但大家在接你剛說的話，自然回一兩句。）`
-					: `（${where ? where + '，' : ''}群聊新訊息，${today}）`,
+					: `（${where ? where + '，' : ''}群聊新訊息，${today}。要回的是標「${mark.trim()}」的那則，前面的只是上下文；更早的訊息你都回過了，不要再回。）`,
 			skipped ? `（前面還有 ${skipped} 則沒列出）` : '',
 			this.speakerIds(fresh),
 			...fresh.map((line) =>

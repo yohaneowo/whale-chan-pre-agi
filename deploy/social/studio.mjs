@@ -72,6 +72,7 @@ export class Studio {
 		this.maxWaiting = maxWaiting;
 		// 已经被删掉的请求讯息（「频道:讯息」）：之后才交代的也不画。
 		this.deleted = new Set();
+		this.recent = [];
 		this.running = undefined;
 		this.waiting = [];
 		this.listeners = new Set();
@@ -254,7 +255,10 @@ export class Studio {
 				Promise.resolve()
 					.then(() => this.notify(job, text, controller.signal))
 					.then(
-						() => 'sent',
+						(sent) => {
+							job.noteId = sent?.id;
+							return 'sent';
+						},
 						() => 'send-failed',
 					),
 				late,
@@ -328,23 +332,48 @@ export class Studio {
 		let note = 'none';
 		if (text) note = await this.sendNote(job, text);
 		this.log(
-			`畫室 结果 #${job.messageId} status=${outcome} turn=${result?.status ?? 'none'} note=${note} secs=${Math.round((this.now() - started) / 1000)}`,
+			`畫室 结果 #${job.messageId} status=${outcome} turn=${result?.status ?? 'none'} rounds=${result?.rounds ?? 0} note=${note} secs=${Math.round((this.now() - started) / 1000)}`,
 		);
+		// 聊天那边要知道这张的结果（已经回报过了，不要自己补画）：最近几张留着给聊天会话看。
+		this.recent.push({
+			channelId: job.channelId,
+			messageId: job.messageId,
+			authorName: job.authorName,
+			outcome,
+			text,
+			at: this.now(),
+		});
+		if (this.recent.length > 20) this.recent.shift();
 		this.emit({
 			type: 'end',
 			channelId: job.channelId,
 			messageId: job.messageId,
 			outcome,
+			text: note === 'sent' ? text : undefined,
+			noteId: note === 'sent' ? job.noteId : undefined,
 		});
+	}
+
+	// 这个频道最近（预设 30 分钟内）画完或没画成的几张，给聊天会话的说明用。
+	recentFor(channelId, within = 30 * 60_000) {
+		const since = this.now() - within;
+		return this.recent.filter(
+			(row) => row.channelId === String(channelId) && row.at >= since,
+		);
 	}
 }
 
 // 画室会话收到的那一则（不是聊天，群里看不到这里说的话）。brief 是聊天那边的她整理的需求，只当资料。
+// 2026-11-28 真频道验收：模型在思考里把整张图的座标一次算完（每步 8000 字以上），被换气在中途截断，
+// 一笔都没画就结束。所以这里要她一步只想下一笔、想好就叫工具。
 export function studioPrompt(job) {
 	return [
 		`（背景畫室：這裡不是聊天，群裡看不到你在這裡說的話。${job.authorName || '群友'} 在群裡請你畫圖，你已經答應了。）`,
-		'用 krita_batch 把圖畫完並 deliver；deliver 會直接回覆對方那則請求。畫完就結束，最後只回「畫好了」。',
-		'不要問問題，不確定的地方照常理決定；沒辦法畫（例如真人惡搞、不適合的內容）就不要畫，最後只回「不畫」。',
+		'這裡只做一件事：用 krita_batch 把圖畫完並 deliver（deliver 會直接回覆對方那則請求）。',
+		'每一步只想下一筆要畫什麼，想好就馬上呼叫 krita_batch；不要先在心裡把整張圖的座標全部算完（想太久會被截斷，等於一筆都沒畫）。一次畫一兩個圖層或部件，preview 看一下再接著畫。',
+		'不要回文字、不要寫進度、不要問問題；不確定的地方照常理決定。畫完 deliver 以後只回「畫好了」。',
+		'這裡如果出現〔换气〕的提示（要你落盘、寫進度、請人手動壓縮），那是給聊天用的，畫室不用照做，直接接著畫。',
+		'沒辦法畫（例如真人惡搞、不適合的內容）就不要畫，只回「不畫」。',
 		job.sourceJob
 			? `要接著改的舊作品：${job.sourceJob}（用 recent 或 start.redraw）。`
 			: '',
@@ -358,33 +387,107 @@ export function studioPrompt(job) {
 		.join('\n');
 }
 
+// 画室一轮结束了、图还没交付（回了文字、被截断、被叫停的补救轮）：期限内接着画，不当成失败。
+export function studioContinuePrompt(round) {
+	return [
+		`（背景畫室，接著畫，第 ${round} 次）這張還沒交付，對方還沒收到圖。`,
+		'不要回文字、不要寫進度，直接呼叫 krita_batch 接著畫：畫布和已經畫的圖層都還在（不確定作品編號就用 recent 查），沒畫完的補完，畫完 deliver。',
+		'〔换气〕要你落盘、請人壓縮的提示在畫室不用照做。每一步只想下一筆就動手。真的不該畫才只回「不畫」。',
+	].join('\n');
+}
+
+// 一张图最多给画室几轮（第一轮加续做）。真正的上限是 Studio 的期限，这里只防一直空转。
+export const STUDIO_MAX_ROUNDS = 4;
+
 // 在背景会话里画一张：取得（或建立）画室会话、绑定原本那则请求、送进 inbox、等它画完（受 signal 控制），
-// 最后看 Krita 实际回覆了几张。deps 由桥接提供，这里不碰 Discord 或模型细节。
+// 看 Krita 实际回覆了几张。还没交付（回了一段文字、被截断、补救轮被中止）就在期限内接着画，
+// 不把「第一个有文字的回合」当成结果。deps 由桥接提供，这里不碰 Discord 或模型细节。
 export async function runStudioJob(
-	{ acquire, bind, followup, wait, deliveries },
+	{ acquire, bind, followup, wait, deliveries, maxRounds = STUDIO_MAX_ROUNDS },
 	job,
 	signal,
 ) {
 	const agent = await acquire(job);
-	if (signal.aborted) return { delivered: 'none', status: 'cancelled' };
-	bind(agent, job);
-	const prompt = followup(agent, studioPrompt(job), job);
-	const outcome = await wait(agent, prompt, signal);
-	const sent = deliveries(job.messageId) ?? {};
-	// 画室最后一句（只看这次送进去的那则之后）：「不畫」就是它判断不该画。
-	const events =
-		agent.session?.snapshotEvents?.() ?? agent.session?.events ?? [];
-	const said = socialTurnState(events, prompt?.id).text?.trim() ?? '';
-	return {
-		delivered: sent.final ? 'final' : sent.previews ? 'preview' : 'none',
-		status: outcome?.status ?? 'none',
-		declined: /^不[畫画]/.test(said),
-	};
+	if (signal.aborted)
+		return { delivered: 'none', status: 'cancelled', rounds: 0 };
+	for (let round = 1; ; round++) {
+		bind(agent, job);
+		const prompt = followup(
+			agent,
+			round === 1 ? studioPrompt(job) : studioContinuePrompt(round - 1),
+			job,
+		);
+		const outcome = await wait(agent, prompt, signal);
+		const status = outcome?.status ?? 'none';
+		const sent = deliveries(job.messageId) ?? {};
+		const previews = sent.previews ?? 0;
+		if (sent.final) return { delivered: 'final', status, rounds: round };
+		// 画室最后一句（只看这次送进去的那则之后）：「不畫」就是它判断不该画。
+		const events =
+			agent.session?.snapshotEvents?.() ?? agent.session?.events ?? [];
+		const said = socialTurnState(events, prompt?.id).text?.trim() ?? '';
+		if (/^不[畫画]/.test(said))
+			return {
+				delivered: previews ? 'preview' : 'none',
+				status,
+				declined: true,
+				rounds: round,
+			};
+		if (signal.aborted || status === 'lost' || round >= maxRounds)
+			return {
+				delivered: previews ? 'preview' : 'none',
+				status,
+				rounds: round,
+			};
+	}
 }
 
 // 聊天会话用的说明：画图交给画室，自己只回一句。
 export const DRAW_GUIDE =
-	'有人請你畫圖、改圖或照附件畫時，呼叫 draw_request（action=start），brief 寫清楚要畫什麼、構圖、風格、顏色，以及對方原話裡的重點；要改之前的作品就填 source_job，要照對方的圖就填 attachment_ids。交出去之後背景會畫，畫好會自動回覆對方那則訊息；你這輪只照工具結果回一句短話，不要說已經畫好，也不要自己用 krita_batch。對方說不要畫了就用 action=cancel；問畫到哪就用 action=status。';
+	'只有這次叫你的那則訊息明確請你畫圖、改圖或照附件畫時，才呼叫 draw_request（action=start），brief 寫清楚要畫什麼、構圖、風格、顏色，以及對方原話裡的重點；要改之前的作品就填 source_job，要照對方的圖就填 attachment_ids。之前的畫圖請求不管畫成沒有，畫室都已經自己回覆過對方，不要因為上一張沒畫成就再交一次。交出去之後背景會畫，畫好會自動回覆對方那則訊息；你這輪只照工具結果回一句短話，不要說已經畫好，也不要自己用 krita_batch。對方說不要畫了就用 action=cancel；問畫到哪就用 action=status。';
+
+// 这一则是不是明确要她画（或改她画过的图）。聊天模型在画室失败以后会把后面的 @ 都当成画图
+// （2026-11-28：「你畫畫的時候還能聊天嗎」「你最喜歡什麼顏色」都被交给画室），所以不能只靠提示词。
+// 「你畫畫的時候…」「畫得不錯」这类提到画、但没有要她画的，不算。
+const DRAW_ASK =
+	/(?:幫|帮|給|给|替|請|请|來|来|再|也|要|想|可以|能不能|能|快|去|麻煩|麻烦|拜託|拜托|求)[^。！？!?，,]{0,8}[畫画繪绘]|[畫画繪绘](?:一|兩|两|三|幾|几|個|个|張|张|隻|只|幅|下|出|成|點|点|些|我|你|他|她|它|這|这|那|條|条|頭|头|朵|棵|座|份|套)|^[畫画繪绘]|描いて|再(?:來|来)?一(?:張|张|幅)/u;
+const DRAW_ASK_EN = /\b(?:draw|paint|sketch)\b/iu;
+const EDIT_ASK =
+	/改|修|調|调|換|换|加|拿掉|去掉|刪|删|重[畫画]|大一點|大一点|小一點|小一点|顏色|颜色/u;
+const REFERENCE_ASK = /照|參考|参考|這張|这张|這個|这个/u;
+
+export function drawIntent(text, { sourceJob, attachments = 0 } = {}) {
+	const plain = String(text ?? '')
+		.replace(/<@!?\d+>/gu, '')
+		.replace(/\s+/gu, '');
+	if (!plain) return false;
+	if (DRAW_ASK.test(plain) || DRAW_ASK_EN.test(String(text))) return true;
+	if (sourceJob && EDIT_ASK.test(plain)) return true;
+	return attachments > 0 && REFERENCE_ASK.test(plain);
+}
+
+const ref = (messageId) => '#' + String(messageId).slice(-4);
+
+// 聊天会话每轮的说明里附上：这个频道最近画室画完或没画成的几张。没画成的已经由画室回过话了，
+// 聊天这边不要自己补画（2026-11-28 画室失败后她把后面的 @ 都交给画室）。
+export function studioRecentNote(studio, channelId) {
+	const rows = studio?.recentFor?.(channelId) ?? [];
+	if (!rows.length) return '';
+	const lines = rows
+		.slice(-3)
+		.map((row) =>
+			row.outcome === 'delivered'
+				? `${ref(row.messageId)} 那張畫好了，已經回覆給對方。`
+				: row.text
+					? `${ref(row.messageId)} 那張沒畫成，畫室已經回覆對方「${row.text}」。`
+					: `${ref(row.messageId)} 那張停掉了（${row.outcome}）。`,
+		);
+	return (
+		'\n畫室最近的結果（都已經處理完、回報過了）：' +
+		lines.join(' ') +
+		'除非對方在新的訊息裡又明確要你畫，不要自己再交給畫室。'
+	);
+}
 
 const OK = (message) => ({ ok: true, message });
 const NO = (message) => ({ ok: false, message });
@@ -460,6 +563,16 @@ export function drawRequestTool(runtime) {
 						: '這個頻道目前沒有在畫或排隊的圖。',
 				);
 			}
+			// 程式检查：这一则（叫她的那则）要明确要她画，不然不收。
+			if (
+				!drawIntent(source.text, {
+					sourceJob: args.source_job,
+					attachments: source.referenceAttachments?.length ?? 0,
+				})
+			)
+				return NO(
+					'這則訊息沒有要你畫圖，不能交給畫室。之前的畫圖請求畫室都已經自己回覆過對方了，不要補畫；照這則訊息正常回話。',
+				);
 			const result = studio.request({
 				channelId: source.channelId,
 				guildId: source.guildId,
@@ -561,7 +674,13 @@ export function connectStudio({
 			),
 		// 画室有自己的期限（Studio 的 deadlineMs）；这里只听 signal。
 		wait: (agent, prompt, signal) =>
-			awaitSocialTurn(agent, prompt, { signal, deadlineMs: Infinity }),
+			// untilIdle：画室不能拿「第一个有文字的回合」当结果，也不能用聊天回合的
+			// discord-turn-answered 把补救轮停掉（2026-11-28 第 2 轮就是这样被中止的）。
+			awaitSocialTurn(agent, prompt, {
+				signal,
+				deadlineMs: Infinity,
+				untilIdle: true,
+			}),
 		deliveries: (messageId) => deliveries(messageId),
 	};
 	const studio = new Studio({
