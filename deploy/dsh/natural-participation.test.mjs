@@ -1453,6 +1453,66 @@ test('画室已经结束（没画成或请求被删）：不再先说「等我�
 	assert.doesNotMatch(result(logs, gone.id)[0], /draw-ack|fallback/);
 });
 
+// 复验⑤：Discord 慢的时候「等我一下」送了很久，画室先失败了，失败那句不能比「等我一下」先到。
+// 画室结束（finishing）时，还在送的「等我一下」交给画室等（event.wait）。
+test('画室结束时「等我一下」还在送：交给画室等它送完，再送补的那句', async (t) => {
+	const timers = [];
+	const f = await fixture(t);
+	f.participation.timer = (run, ms) => (
+		timers.push({ run, ms }),
+		timers.length
+	);
+	let releasePreface;
+	const prefaceSent = new Promise((resolve) => (releasePreface = resolve));
+	const waited = [];
+	let finished;
+	const { deliver } = bridgeFor(f.participation, {
+		A: {
+			run: async () => {
+				f.participation.drawEvent({
+					type: 'accepted',
+					channelId: 'room',
+					messageId: drawing.id,
+					status: 'started',
+				});
+				// 20 秒到了，开始送「等我一下」（Discord 一直没回）。
+				for (const row of timers) row.run();
+				await Promise.resolve();
+				f.participation.drawEvent({
+					type: 'finishing',
+					channelId: 'room',
+					messageId: drawing.id,
+					outcome: 'failed',
+					wait: (promise) => waited.push(promise),
+				});
+				finished = true;
+				return { chunks: ['(本回合没有文本回复)'] };
+			},
+		},
+	});
+	const controls = [];
+	const drawing = message('<@123> KEY-A 畫貓', { mentions: [{ id: '123' }] });
+	const handled = f.participation.receive(
+		drawing,
+		identity,
+		deliver,
+		async (text) => {
+			controls.push(text);
+			await prefaceSent;
+		},
+	);
+	for (let i = 0; i < 20 && !finished; i++) await new Promise(setImmediate);
+	assert.deepEqual(controls, ['等我一下，我弄一下']);
+	assert.equal(waited.length, 1, '画室要等这句送完');
+	let settled = false;
+	void waited[0].then(() => (settled = true));
+	await new Promise(setImmediate);
+	assert.equal(settled, false, '还没送完');
+	releasePreface({ id: 'p1' });
+	await waited[0];
+	await handled;
+});
+
 // 部署前审查：讯息被撤销（删掉或改掉）时，桥接送答前的核对不会过；这时不能再走一般备援补「卡住了」
 // （回覆对象已经不在，Discord 会把它贴成一般群讯）。桥接回「⏹️ 回合被取消（訊息已撤回）」。
 test('讯息已撤回：桥接的提示不发出去，也不补「卡住了」', async (t) => {

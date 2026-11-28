@@ -270,6 +270,8 @@ export async function runSocialTurn(
 		log = () => {},
 		// 这则讯息进入频道队列的时间（之后来的 /stop 也会停掉它）。
 		queuedAt,
+		// 这则讯息是不是已经被删或改掉（闸道的 revoked）。
+		revoked = () => false,
 	},
 	body,
 ) {
@@ -343,7 +345,19 @@ export async function runSocialTurn(
 			late,
 		]);
 		// 收到 /stop 以后不再送答（runPrompt 已经拿到的答覆也不送）。
-		return shared.stopped ? { chunks: [], files: [], stopped: true } : result;
+		if (shared.stopped) return { chunks: [], files: [], stopped: true };
+		// 讯息在这一轮里被删或改掉了：不管这一轮怎么结束（答完、期限到、被放弃），都只回「訊息已撤回」，
+		// 群聊行为处理不发出去、也不补「卡住了」（复验：删掉以后撞到期限，还会发期限的提示，
+		// 回覆对象不在了就掉成一般群讯）。
+		let gone = false;
+		try {
+			gone = Boolean(revoked());
+		} catch {
+			gone = false;
+		}
+		return gone
+			? { chunks: [TURN_REVOKED_NOTICE], files: [], revoked: true }
+			: result;
 	} finally {
 		offAbort();
 		cancelGrace?.();

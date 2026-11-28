@@ -446,6 +446,8 @@ export class NaturalParticipation {
 			if (call && call.channelId === String(event.channelId)) {
 				call.drawEnded = String(event.outcome ?? 'ended');
 				clearTimeout(call.preface);
+				// 「等我一下」已经在送（Discord 慢）：画室等它送完再送补的那句，顺序才不会反。
+				if (call.prefacing) event.wait?.(call.prefacing);
 			}
 		}
 		if (event?.type === 'end') {
@@ -501,13 +503,19 @@ export class NaturalParticipation {
 		)
 			return;
 		call.prefaced = kind;
+		const sending = Promise.resolve().then(() =>
+			call.controlReply?.(PREFACE[kind]),
+		);
+		call.prefacing = sending.catch(() => {});
 		try {
-			await call.controlReply?.(PREFACE[kind]);
+			await sending;
 			this.log(`直接呼叫 先说一句 #${call.messageId} kind=${kind} status=sent`);
 		} catch {
 			this.log(
 				`直接呼叫 先说一句 #${call.messageId} kind=${kind} status=send-failed`,
 			);
+		} finally {
+			call.prefacing = undefined;
 		}
 	}
 

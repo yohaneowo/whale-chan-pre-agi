@@ -16,7 +16,13 @@
 // 任何一项不符就以代码 1 结束。
 import console from 'node:console';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import {
+	existsSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import process from 'node:process';
@@ -487,7 +493,23 @@ async function play(scene) {
 		},
 		prepare: (current, channelId, messageId) =>
 			runtime.turns.set(current.id, sourceOf(messageId)),
+		// 要不要画的守门员（真的是另问一次模型；这里照情境给的答案，记下它看到了什么）。
+		// 情境没给就当成「是在请她画」。
+		drawGate: async (facts) => {
+			gateSeen.push(facts);
+			const verdict = await (scene.gate ?? (() => true))(facts);
+			return typeof verdict === 'object'
+				? { ms: 0, usage: {}, ...verdict }
+				: {
+						allow: Boolean(verdict),
+						intent: verdict ? 'new' : 'question',
+						ms: 0,
+						usage: {},
+					};
+		},
 	};
+	const gateSeen = [];
+	const historySent = [];
 	const studioAgents = [];
 	let studio;
 	if (studioModule) {
@@ -542,6 +564,8 @@ async function play(scene) {
 		rest.drawTool = studioModule.drawRequestTool(runtime);
 	}
 	const sources = new Map();
+	// 已经被删、但删除事件还没到的讯息：REST 回 404 Unknown Message（Discord 的原样）。
+	const gone = new Set();
 	const scopes = new GatewayScopes({
 		socket: null,
 		bindings: {
@@ -550,7 +574,14 @@ async function play(scene) {
 		},
 		stat: async () => null,
 		inspect: async () => {},
-		request: async (path) => sources.get(path.split('/').at(-1)),
+		request: async (path) => {
+			const event = path.split('/').at(-1);
+			if (gone.has(event))
+				throw new Error(
+					`discord REST GET ${path} failed: 404 {"message": "Unknown Message", "code": 10008}`,
+				);
+			return sources.get(event);
+		},
 		destination: async () => ({ botId: BOT, guildId: GUILD }),
 		principal: async (target, actor) => ({ guildId: GUILD, botId: actor }),
 		bot: () => BOT,
@@ -559,10 +590,14 @@ async function play(scene) {
 	scopes.rpc = async () => 'scope';
 	// 只看租约是不是还是这一则的（不连 Discord 核对来源）。scene.deliverMiss(key) 回传 true 时
 	// 这次核对当成没过（Discord 慢或限流，2026-11-28 第 4 则）。
+	// scene.realCheck：走副本真的 historyCanDeliver（真的向假 Discord 取原讯息）。
+	const realCanDeliver = scopes.historyCanDeliver.bind(scopes);
 	scopes.historyCanDeliver = async (current, event) =>
-		!scene.deliverMiss?.(keyOf(event)) &&
-		!scopes.revoked.has(event) &&
-		scopes.active.get(current)?.row.event === event;
+		scene.realCheck
+			? realCanDeliver(current, event)
+			: !scene.deliverMiss?.(keyOf(event)) &&
+				!scopes.revoked.has(event) &&
+				scopes.active.get(current)?.row.event === event;
 
 	// 桥接：从 index.js 取出的真方法，挂在一个只有必要栏位的物件上。
 	const env = {
@@ -576,7 +611,11 @@ async function play(scene) {
 			runtime.prepare(current, channelId, messageId);
 		},
 		stopSocialStudio: (channelId) => studio?.stopChannel(channelId) ?? 0,
-		historyView: { note() {} },
+		historyView: {
+			note() {},
+			sent: (channel, event, text) =>
+				historySent.push({ channel, event, text }),
+		},
 		fetch: (url, options) => scene.fetch(url, options),
 		mkdir: async () => {},
 		writeFile: async () => {},
@@ -704,6 +743,14 @@ async function play(scene) {
 					guild_id: GUILD,
 				});
 			}, item.deleteAt);
+	for (const item of scene.messages)
+		if (item.goneAt !== undefined)
+			globalThis.setTimeout(() => {
+				const message = messages.get(item.key);
+				if (!message) return;
+				deleted.add(message.id);
+				gone.add(message.id);
+			}, item.goneAt);
 
 	const handlers = [];
 	for (const [index, item] of scene.messages.entries()) {
@@ -768,7 +815,16 @@ async function play(scene) {
 	unsubscribe?.();
 	await participation.saves.catch(() => {});
 	rmSync(directory, { recursive: true });
-	return { logs, posted, typing, messages, agent, studioAgents };
+	return {
+		logs,
+		posted,
+		typing,
+		messages,
+		agent,
+		studioAgents,
+		gateSeen,
+		historySent,
+	};
 }
 
 // ---- 判定 ----
@@ -1397,6 +1453,8 @@ const scenes = [
 			await tools.wait(1_500);
 			tools.say(result.ok ? GO : turn.key === 'B' ? '藍色吧' : '可以啊');
 		},
+		// 守门员（真的是另问一次模型）：只有 A 是在请她画。
+		gate: (facts) => facts.text.includes('可以幫我畫一隻小鯨魚嗎'),
 		async studio(turn, tools) {
 			await tools.wait(10_000);
 			tools.fail();
@@ -1791,6 +1849,26 @@ const scenes = [
 			await tools.wait(1_500);
 			tools.say(result.ok ? GO : '嗯');
 		},
+		// 守门员（真的是另问一次模型，实测见 draw-intent-cases.mjs）：只有 D 是在请她画。
+		gate: (facts) => facts.text.includes('幫我做一張頭像'),
+		check: ({ gateSeen }) => {
+			if (!gateSeen) return [];
+			const problems = [];
+			if (gateSeen.length !== 4)
+				problems.push(`守门员应该看了 4 则，实际 ${gateSeen.length} 则`);
+			if (
+				gateSeen.some((facts) =>
+					JSON.stringify(facts).includes('PRIVATE-BRIEF'),
+				)
+			)
+				problems.push('守门员看到了聊天模型写的 brief（可能已经被带偏）');
+			if (
+				gateSeen.find((facts) => facts.text.includes('描述一下這張圖'))
+					?.images !== 1
+			)
+				problems.push('守门员不知道 C 带了一张图');
+			return problems;
+		},
 		studio: (turn, tools) => studioDraw(turn, tools, 1),
 		typingMax: 30_000,
 		expect: {
@@ -1799,6 +1877,147 @@ const scenes = [
 			C: { never: [GO], noStudio: true, status: 'answered' },
 			D: { posts: [GO], final: 300_000, never: [STUCK] },
 		},
+	},
+	{
+		// 第 4 轮：守门员没回（逾时、出错、回的不是 JSON）就当成不画，不交给画室；她照常回话、不补「卡住了」。
+		name: '要不要画的守门员逾时：不交给画室，照常回话',
+		messages: [{ key: 'A', at: 0, content: `${mention} 畫一隻貓 PRIVATE-A` }],
+		async model(turn, tools) {
+			if (!tools.drawRequest) {
+				await tools.wait(2_000);
+				return tools.say('嗯');
+			}
+			const result = await tools.drawRequest({ brief: '貓 PRIVATE-BRIEF' });
+			await tools.wait(1_500);
+			tools.say(result.ok ? GO : '你再說一次要畫什麼？');
+		},
+		gate: () => ({
+			allow: false,
+			intent: 'error',
+			error: 'timeout',
+			ms: 20_000,
+		}),
+		studio: (turn, tools) => studioDraw(turn, tools, 1),
+		typingMax: 30_000,
+		expect: {
+			A: {
+				posts: ['你再說一次要畫什麼？'],
+				never: [GO, STUCK],
+				noStudio: true,
+				status: 'answered',
+			},
+		},
+	},
+	{
+		// 复验④：讯息在回合中被删，这一轮一直做到期限：不能再发期限的提示（回覆对象不在了，会掉成一般群讯）。
+		name: '讯息被删以后撞到期限：不发期限提示，也不补「卡住了」',
+		messages: [
+			{
+				key: 'A',
+				at: 0,
+				content: `${mention} 晚餐吃什麼 PRIVATE-A`,
+				deleteAt: 3_000,
+			},
+		],
+		async model(turn, tools) {
+			await tools.wait(400_000);
+		},
+		check({ posted }) {
+			return posted.map(
+				(row) => `讯息被删以后还送出「${row.content.slice(0, 12)}」`,
+			);
+		},
+		expect: {
+			A: { never: [STUCK, STEPS], absent: [STUCK, STEPS], status: 'revoked' },
+		},
+	},
+	{
+		// 复验④：讯息已经被删，但删除事件还没到；送答前的核对向 Discord 取原讯息，回 404 Unknown Message。
+		// 这也是撤销：不补「卡住了」，也不掉成一般群讯。
+		name: '删除事件还没到、REST 已经查不到原文：不补「卡住了」',
+		messages: [
+			{
+				key: 'A',
+				at: 0,
+				content: `${mention} 晚餐吃什麼 PRIVATE-A`,
+				goneAt: 3_000,
+			},
+		],
+		realCheck: true,
+		async model(turn, tools) {
+			await tools.wait(5_000);
+			tools.say('吃麵');
+		},
+		check({ posted }) {
+			return posted.map(
+				(row) => `讯息被删以后还送出「${row.content.slice(0, 12)}」`,
+			);
+		},
+		expect: { A: { never: [STUCK], absent: [STUCK], status: 'revoked' } },
+	},
+	{
+		// 复验⑤：Discord 回得慢，「等我一下」20 秒时开始送、90 秒才送达；画室 70 秒就失败了，
+		// 失败那句不能比「等我一下」先到（修正前：失败通知 90 秒先到，「等我一下」110 秒才到）。
+		name: 'Discord 慢：「等我一下」还在送时画室失败了，失败那句等它送完才送',
+		messages: [
+			{ key: 'A', at: 0, content: `${mention} 畫一隻小鯨魚 PRIVATE-A` },
+		],
+		sendDelay: async (content) =>
+			content === '等我一下，我弄一下' && (await delay(90_000)),
+		async model(turn, tools) {
+			if (tools.drawRequest)
+				await tools.drawRequest({ brief: '小鯨魚 PRIVATE-BRIEF' });
+			// 聊天那轮交给画室以后一直没说话（最坏的情况），比画室失败还晚结束。
+			await tools.wait(100_000);
+		},
+		// 画室每轮 17 秒没画成、接着画到第 4 轮：大约 70 秒时整张结束。
+		async studio(turn, tools) {
+			await tools.wait(17_000);
+			tools.fail();
+		},
+		typingMax: 120_000,
+		check({ posted }) {
+			const wait = posted.findIndex(
+				(row) => row.content === '等我一下，我弄一下',
+			);
+			const failed = posted.findIndex((row) => row.content === STUDIO_FAILED);
+			if (wait < 0 || failed < 0)
+				return ['情境本身没有重现「等我一下」与失败那句都送出'];
+			return failed < wait
+				? [
+						`失败那句（${seconds(posted[failed].at)}s）比「等我一下」（${seconds(posted[wait].at)}s）先到`,
+					]
+				: [];
+		},
+		expect: { A: { replies: [STUDIO_FAILED], never: [STUCK, GO] } },
+	},
+	{
+		// 复验②：回放接上的「她当时的回答」要是实际送出的字：群聊送出前会拿掉 [sticker:…] 这种合成字、
+		// 遮掉机密；记成过滤前的，回放会把拿掉的字又接回去。
+		name: '聊天回放记下的是实际送出的字（拿掉的合成字、遮掉的机密都不在）',
+		messages: [{ key: 'A', at: 0, content: `${mention} 早安 PRIVATE-A` }],
+		prepare: (text) => ({
+			text: text
+				.replace(/\[sticker:[^\]]*\]/gu, '')
+				.replace(/PRIVATE-KEY-\d+/gu, '［已遮蔽］')
+				.trim(),
+			files: [],
+		}),
+		async model(turn, tools) {
+			await tools.wait(2_000);
+			tools.say('早安 [sticker:wave] 金鑰是 PRIVATE-KEY-123');
+		},
+		check({ historySent, messages }) {
+			const id = messages.get('A')?.id;
+			const rows = (historySent ?? []).filter((row) => row.event === id);
+			if (!rows.length) return ['回放没有记下她对 A 送出的话'];
+			return rows.some((row) => /\[sticker|PRIVATE-KEY/u.test(row.text))
+				? ['回放记的是过滤前的字（拿掉的合成字或机密又会被接回去）']
+				: rows.some((row) => row.text.includes('［已遮蔽］'))
+					? []
+					: [`回放记的字跟送出的不一样：${rows[0].text.slice(0, 20)}`];
+		},
+		expect: { A: { never: [STUCK], status: 'answered' } },
 	},
 ];
 
@@ -1907,6 +2126,13 @@ async function realRuntime(groupTools) {
 		},
 		engine,
 	);
+	// 要不要画的守门员是另问一次模型；这些检查不连模型，当成「是在请她画」。
+	runtime.drawGate = async () => ({
+		allow: true,
+		intent: 'new',
+		ms: 0,
+		usage: {},
+	});
 	// 照正式宿主的规则登记 release 里的全部工具（跟 index.mjs 的 apply 同一份清单、同样包上送讯来源）：
 	// 少了 output、output schema 用了宿主不支援的关键字、timeoutMs 不对，这里就会丢错。
 	currentHost = contract.hostTools();
@@ -2705,7 +2931,227 @@ async function historyRepliesCheck() {
 	return problems;
 }
 
+// 换气（huanqi）额度 0、模型回空白回合：拿副本真的 dsh-huanqi，接上照宿主规则写的假会话
+// （发布 session/event 的时候不准再写会话，宿主原文：session append cannot reenter while another append is
+// being published；观察者同步丢错、回传的 promise 被拒都只记一行；agent 的 inject／steer／followup 都会写 inbox）。
+// 修正前：熔断那段在 async 的 IIFE 里同步 inject，被宿主拒绝，rejection 没人接，Node 会结束整个程序
+// （2026-11-28 画室沙盒；第 4 轮在 VM 真宿主用 huanqi-sandbox-probe.mjs 也重现了）。
+// 修正后：程序不结束，熔断的提示与「落盘」那句 steer 都在这一轮结束以后补上。
+async function huanqiEmptyTurn() {
+	const file = join(root, 'dsh-huanqi/lib/index.js');
+	if (!existsSync(file))
+		return ['副本里没有 dsh-huanqi（VM 上 web/node_modules/dsh-huanqi）'];
+	const problems = [];
+	const dir = mkdtempSync(join(tmpdir(), 'huanqi-'));
+	const stubs = Symbol.for('typing-hang-repro.huanqi');
+	// schemastery：模组载入时会建 Config，这里只要能一直串下去。
+	const chain = new Proxy(function () {}, {
+		get: (target, key) => (key === 'then' ? undefined : chain),
+		apply: () => chain,
+	});
+	globalThis[stubs] = {
+		Context: class {},
+		z: chain,
+		createUserMessage: ({ content, source }) => ({
+			id: randomUUID(),
+			role: 'user',
+			content,
+			source,
+		}),
+		isAgentLoopRequest: () => true,
+		toolPairingBalancedBefore: () => 0,
+	};
+	let source = readFileSync(file, 'utf8');
+	const imports = [
+		["import { Context } from '@deepseek-ai/cordis';", 'Context'],
+		["import z from '@deepseek-ai/schemastery';", 'z'],
+		[
+			"import { createUserMessage, isAgentLoopRequest } from '@deepseek-ai/dsh-llm';",
+			'createUserMessage, isAgentLoopRequest',
+		],
+		[
+			"import { toolPairingBalancedBefore } from '@deepseek-ai/dsh-compaction';",
+			'toolPairingBalancedBefore',
+		],
+	];
+	for (const [line, names] of imports) {
+		if (!source.includes(line)) return [`dsh-huanqi 的 import 变了：${line}`];
+		source = source.replace(
+			line,
+			`const { ${names} } = globalThis[Symbol.for('typing-hang-repro.huanqi')];`,
+		);
+	}
+	const copy = join(dir, 'huanqi.mjs');
+	writeFileSync(copy, source);
+	const rejections = [];
+	const onRejection = (error) =>
+		rejections.push(String(error?.message ?? error));
+	process.on('unhandledRejection', onRejection);
+	try {
+		const huanqi = await import(pathToFileURL(copy).href);
+		const warnings = [];
+		const handlers = new Map();
+		const agents = new Map();
+		const ctx = {
+			on: (name, handler) => {
+				handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+				return () => {};
+			},
+			get: () => undefined,
+			agents: { get: (id) => agents.get(id) },
+			logger: {
+				warn: (text) => warnings.push(String(text)),
+				info: () => {},
+				debug: () => {},
+			},
+		};
+		// 照宿主：发布事件时上锁，观察者同步丢错／回传的 promise 被拒都只记一行，不往外丢。
+		const session = {
+			id: 'session-huanqi',
+			header: {},
+			events: [],
+			appending: false,
+			append(type, data) {
+				if (this.appending)
+					throw new Error(
+						'session append cannot reenter while another append is being published',
+					);
+				const event = {
+					type,
+					seq: this.events.length + 1,
+					data,
+					time: Date.now(),
+				};
+				this.appending = true;
+				try {
+					this.events.push(event);
+					for (const handler of handlers.get('session/event') ?? [])
+						try {
+							Promise.resolve(handler(this, event)).catch((error) =>
+								warnings.push(`listener rejected: ${String(error?.message)}`),
+							);
+						} catch (error) {
+							warnings.push(`listener threw: ${String(error?.message)}`);
+						}
+				} finally {
+					this.appending = false;
+				}
+				return event;
+			},
+			snapshotEvents() {
+				return [...this.events];
+			},
+		};
+		let finishTurn;
+		const agent = {
+			id: session.id,
+			session,
+			idle: Promise.resolve(),
+			wakes: 0,
+			send(message, target, wake) {
+				session.append('agent/inbox/spliced', { target, inserted: [message] });
+				if (wake) this.wakes++;
+			},
+			inject(message) {
+				this.send(message, 'next-step', false);
+			},
+			steer(message) {
+				this.send(message, 'next-step', true);
+			},
+			followup(message) {
+				this.send(message, 'next-turn', true);
+			},
+			whenIdle() {
+				return this.idle;
+			},
+		};
+		agents.set(agent.id, agent);
+		const state = join(dir, 'state');
+		const ledgerPath = join(dir, 'dsh-huanqi.json');
+		writeFileSync(
+			ledgerPath,
+			JSON.stringify({
+				credit: 0,
+				creditMax: 6,
+				normalTurns: 0,
+				stats: { continuations: 0, circuitBreaks: 0, anomalies: 0 },
+				turnsSinceOutput: 0,
+				lastAnomalyAt: 0,
+			}),
+		);
+		const oldHome = process.env.DSH_HOME;
+		process.env.DSH_HOME = state;
+		try {
+			huanqi.apply(ctx, {
+				// 正式环境的设定（configure_social.py 的 HUANQI_CONFIG）＋预设值。
+				fullCompactOnBreaker: false,
+				regionCompactAfterCuts: 0,
+				postCompactRecallHint: false,
+				emptyTurnContinue: true,
+				maxContinuations: 6,
+				warnAtCredit: 1,
+				normalTurnThreshold: 20,
+				anomalyWindow: 3,
+				subagentPolicy: 'strict',
+				ledgerPath,
+				language: 'zh',
+			});
+		} finally {
+			if (oldHome === undefined) delete process.env.DSH_HOME;
+			else process.env.DSH_HOME = oldHome;
+		}
+		if (!handlers.get('session/event')?.length)
+			return ['dsh-huanqi 没有挂上 session/event'];
+		// 一轮：只有思考、没有正文，正常结束（宿主判 completed）。
+		agent.idle = new Promise((resolve) => (finishTurn = resolve));
+		session.append('turn/start', { turn: 1 });
+		session.append('assistant/message', {
+			message: {
+				role: 'assistant',
+				content: [{ type: 'reasoning', text: '想一想……' }],
+			},
+		});
+		session.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
+		// 这一轮结束（driver 回到 idle）以后，再给 Node 几个 tick 回报没人接的 rejection。
+		await realImmediate();
+		finishTurn();
+		for (let i = 0; i < 5; i++) await realImmediate();
+		const notices = session.events
+			.filter((event) => event.type === 'agent/inbox/spliced')
+			.map((event) => event.data.inserted[0]?.source?.summary ?? '');
+		if (rejections.length)
+			problems.push(
+				`换气丢出没人接的 rejection（正式环境会让整个 dsh 结束）：${rejections[0].slice(0, 80)}`,
+			);
+		if (warnings.some((text) => /listener (threw|rejected)/.test(text)))
+			problems.push('换气在会话事件里同步写会话，被宿主拒绝（提示没有送进去）');
+		if (!notices.includes('huanqi: circuit break (empty turn)'))
+			problems.push('这一轮结束以后没有补上熔断的提示');
+		if (
+			!notices.includes(
+				'huanqi: land your state, then ask the user to compact',
+			) ||
+			agent.wakes !== 1
+		)
+			problems.push('这一轮结束以后没有补上「落盘」那句（steer，只一次）');
+	} catch (error) {
+		problems.push(
+			`检查本身出错：${String(error?.message ?? error).slice(0, 120)}`,
+		);
+	} finally {
+		// 多等一下，让还在路上的 rejection 也算进来，再拿掉监听。
+		await realImmediate();
+		process.off('unhandledRejection', onRejection);
+		rmSync(dir, { recursive: true, force: true });
+	}
+	return problems;
+}
+
 const runtimeChecks = [
+	{
+		name: '换气：额度 0 时模型回空白回合，整个程序不会结束，熔断提示在这一轮结束后补上',
+		run: huanqiEmptyTurn,
+	},
 	{
 		name: '聊天回放：几天前的旧讯息不当成眼前的对话；回放的讯息标日期、说话的人，接上她当时的回答',
 		run: historyReplayCheck,

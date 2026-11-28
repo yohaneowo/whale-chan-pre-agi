@@ -6,8 +6,8 @@ gatewayScopes、history-view、drain、承诺、Krita 对帐。这里只替换�
 
     python deploy/dsh/port_typing_fix.py <release 副本根目录> [--repo <仓库根目录>] [--base a86bd2c]
 
-release 副本根目录底下要有 dsh-plugin-discord/lib/ 与 dsh-social-runtime/（VM 上是
-web/node_modules/ 底下那两个套件）。步骤与验收见 typing-hang-port.md。
+release 副本根目录底下要有 dsh-plugin-discord/lib/、dsh-social-runtime/ 与 dsh-huanqi/（VM 上是
+web/node_modules/ 底下那三个套件）。步骤与验收见 typing-hang-port.md。
 """
 
 import argparse
@@ -80,11 +80,19 @@ socialStudio.on((event) => { if (event.type === "end" && event.noteId && event.t
 # 没送出去的草稿）：桥接每次成功送出文字、补话（等我一下、卡住了、好我去畫）都记到那则讯息名下。
 SENT_REPLY = ("participation.recordReply(message.channel_id, target.text, sent.id, participation.replyPartner(target, message.author.id), target.messageId, index === 0, naturalTicket);\n  await recordSocialCommitment(",
               "participation.recordReply(message.channel_id, target.text, sent.id, participation.replyPartner(target, message.author.id), target.messageId, index === 0, naturalTicket);\n"
-              "  historyView.sent(message.channel_id, message.id, target.text);\n  await recordSocialCommitment(")
+              "  historyView.sent(message.channel_id, message.id, prepared.text);\n  await recordSocialCommitment(")
+# 回放记的是实际送出的字（群聊转繁体、遮机密以后的；复验：记成过滤前的，回放会接上被拿掉的字）。
 SENT_CONTROL = ("const sent = await rest.createMessage(message.channel_id, message.guild_id === void 0 ? redactSecrets(text) : await toGroupText(text), message.id);\n    participation.recordReply(message.channel_id, text, sent.id);",
-                "const sent = await rest.createMessage(message.channel_id, message.guild_id === void 0 ? redactSecrets(text) : await toGroupText(text), message.id);\n    participation.recordReply(message.channel_id, text, sent.id);\n    historyView.sent(message.channel_id, message.id, text);")
+                "const shown = message.guild_id === void 0 ? redactSecrets(text) : await toGroupText(text);\n"
+                "    const sent = await rest.createMessage(message.channel_id, shown, message.id);\n    participation.recordReply(message.channel_id, text, sent.id);\n"
+                "    historyView.sent(message.channel_id, message.id, shown);")
 SENT_EDIT_CONTROL = ("const sent = await rest.createMessage(message.channel_id, await toGroupText(text), message.id);\n    participation.recordReply(message.channel_id, text, sent.id);",
-                     "const sent = await rest.createMessage(message.channel_id, await toGroupText(text), message.id);\n    participation.recordReply(message.channel_id, text, sent.id);\n    historyView.sent(message.channel_id, message.id, text);")
+                     "const shown = await toGroupText(text);\n"
+                     "    const sent = await rest.createMessage(message.channel_id, shown, message.id);\n    participation.recordReply(message.channel_id, text, sent.id);\n"
+                     "    historyView.sent(message.channel_id, message.id, shown);")
+# 讯息被删或改掉（闸道 revoked）：这一轮不管怎么结束都只回「訊息已撤回」（复验：删了以后撞到期限仍发期限提示）。
+REVOKED_TURN = ('queuedAt: socialQueuedAt, log: (line) => this.log("info", line) }',
+                'queuedAt: socialQueuedAt, log: (line) => this.log("info", line), revoked: () => Boolean(this.gatewayScopes?.revoked?.has(messageId)) }')
 # 闸道核验过的聊天请求由 history-view 附上的工具说明：聊天会话改成「交给画室」的说明。
 # 另外附上这个频道画室最近的结果（没画成的已经回报过了，不要自己补画）。
 HISTORY_GUIDE = ("return tools.KRITA_GUIDE+tools.referenceHint(",
@@ -154,6 +162,12 @@ HISTORY_SENT = ("\towns(id) { return authority?.owns(id)===true; },\n",
                 "\t\tif (sentReplies.size>2048) sentReplies.delete(sentReplies.keys().next().value);\n\t},\n")
 HISTORY_PUSH = ("\t\t\tresult.push(retained.message);\n",
                 "\t\t\tresult.push(retained.message);\n\t\t\tif (event.seq<start && replies.has(event.seq)) result.push(replies.get(event.seq));\n")
+# 送答前的核对向 Discord 取原讯息：回 404 Unknown Message（10008）就是被删了，删除事件还没到也一样当成撤销
+# （复验：删除事件还没到、REST 已经查不到时，会掉到「卡住了」的一般备援）。
+SCOPES_GONE = ("\t\t\t\tthis.request('/channels/'+row.channel+'/messages/'+row.event,signal),\n",
+               "\t\t\t\tthis.request('/channels/'+row.channel+'/messages/'+row.event,signal).catch(error=>{\n"
+               "\t\t\t\t\tif (/ 404 [\\s\\S]*\"code\"\\s*:\\s*10008/u.test(String(error?.message))) this.noteRevoked({channel_id:row.channel,id:row.event});\n"
+               "\t\t\t\t\tthrow error;\n\t\t\t\t}),\n")
 SCOPES_SOURCE = ("return row.content.trim() || attachments.length ? {id:event,text:row.content,actor,attachments,images} : null;",
                  "const name=String(row.author.global_name||row.author.username||'').replace(/[\\r\\n［］[\\]←：:]/gu,'').slice(0,40);\n"
                  "\t\t\treturn row.content.trim() || attachments.length ? {id:event,text:row.content,actor,attachments,images,name,at:Date.parse(row.timestamp)} : null;")
@@ -207,8 +221,11 @@ RUNTIME = [
     ('import { kritaTools, kritaGuideFor, reportKritaRoute, observeKritaScope, referenceAttachments } from "./krita-tools.mjs";',
      'import { kritaTools, kritaGuideFor, reportKritaRoute, observeKritaScope, referenceAttachments } from "./krita-tools.mjs";\n'
      'import { referenceHint as kritaReferenceHint } from "./krita-tools.mjs";\n'
-     'import { drawRequestTool, DRAW_GUIDE, studioRecentNote } from "./studio.mjs";\n'
+     'import { drawRequestTool, DRAW_GUIDE, studioRecentNote, quotedOf } from "./studio.mjs";\n'
      'import { socialSendOriginTool, socialRecencyNote } from "./turn-guard.mjs";'),
+    # 群友讯息记下被回覆的那则（谁说的、说了什么、有几张图）：要不要画的守门员要看。
+    ("\t\t\treferenceAttachments: referenceAttachments(message, this.ingress),\n",
+     "\t\t\treferenceAttachments: referenceAttachments(message, this.ingress),\n\t\t\tquoted: quotedOf(message),\n"),
     ('for (const tool of kritaTools(runtime)) ctx.tools.register(tool);',
      'for (const tool of kritaTools(runtime)) ctx.tools.register(tool);\n\tctx.tools.register(drawRequestTool(runtime));'),
     # 画室会话的编号（→ 它服务的聊天会话）；模型请求另外计数，画图时聊天不会被「目前有点忙」挡下。
@@ -284,6 +301,76 @@ export function kritaDeliveries(runtime, messageId) {
 }
 '''
 
+# ---- dsh-huanqi/lib/index.js（换气 1.1.0）：空白回合的熔断不能在会话事件里同步写会话 ----
+# 换气在 turn/end 的 session/event 里补提示（inject／steer）。宿主正在发布那一笔事件，inject／steer 要写 inbox
+# （agent/inbox/spliced），宿主拒绝重入（「session append cannot reenter while another append is being published」）。
+# 熔断那段包在 async 的 IIFE 里、没有 catch：同步丢的错变成没人接的 rejection，Node 直接结束整个 dsh
+# （2026-11-28 沙盒：换气额度 0、画室一轮完全空白）。续跑那段的额度警告也同样被拒（宿主接住、只记一行）。
+# 改法：这些写入都等这一轮整个结束（whenIdle）再做，写失败只记日志；两个 IIFE 都接住错误。
+# 额度、判词、只 steer 一次（landPrompted）这些行为都不变。
+HUANQI_AFTER_TURN = ("""        }).catch((error) => {
+            ctx.logger.warn(`dsh-loop-guard: could not resume after a break: ${String(error)}`);
+        });
+    }
+""", """        }).catch((error) => {
+            ctx.logger.warn(`dsh-loop-guard: could not resume after a break: ${String(error)}`);
+        });
+    }
+    /* 会话事件（turn/end）里不能同步写会话：宿主正在发布这一笔，inject／steer 写 inbox 会被拒绝重入。
+     * 等这一轮整个结束再写；写失败只记日志，不能丢出去（丢到 async 里没人接，整个程序会结束）。 */
+    function afterTurn(agent, write, what) {
+        const run = () => {
+            try {
+                write();
+            }
+            catch (error) {
+                ctx.logger.warn(`dsh-huanqi: ${what} failed: ${String(error)}`);
+            }
+        };
+        const whenIdle = agent.whenIdle;
+        if (typeof whenIdle !== 'function') {
+            setTimeout(run, 0);
+            return;
+        }
+        void Promise.resolve().then(() => whenIdle.call(agent)).then(run, (error) => {
+            ctx.logger.warn(`dsh-huanqi: ${what} skipped: ${String(error)}`);
+        });
+    }
+""")
+HUANQI_CONTINUE = ("""                    scheduleResume(agent, notice, `huanqi: empty-turn continuation, credit ${left}/${ledger.creditMax}`);
+                })();
+                if (left <= config.warnAtCredit) {
+                    agent.inject(message(strings.creditWarning(left, ledger.creditMax, config.normalTurnThreshold), 'notice', `huanqi: credit low (${left}/${ledger.creditMax})`));
+                }
+""", """                    scheduleResume(agent, notice, `huanqi: empty-turn continuation, credit ${left}/${ledger.creditMax}`);
+                })().catch((error) => ctx.logger.warn(`dsh-huanqi: empty-turn continuation failed: ${String(error)}`));
+                if (left <= config.warnAtCredit) {
+                    afterTurn(agent, () => agent.inject(message(strings.creditWarning(left, ledger.creditMax, config.normalTurnThreshold), 'notice', `huanqi: credit low (${left}/${ledger.creditMax})`)), 'credit warning');
+                }
+""")
+HUANQI_BREAK = ("""                    agent.inject(message(fullNote === null ? strings.circuitBreakNotice(ledger.creditMax) : fullNote, 'notice', 'huanqi: circuit break (empty turn)'));
+                })();
+""", """                    afterTurn(agent, () => agent.inject(message(fullNote === null ? strings.circuitBreakNotice(ledger.creditMax) : fullNote, 'notice', 'huanqi: circuit break (empty turn)')), 'circuit-break notice');
+                })().catch((error) => ctx.logger.warn(`dsh-huanqi: circuit break failed: ${String(error)}`));
+""")
+HUANQI_LAND = ("""                    agent.steer(message(strings.circuitBreakNotice(ledger.creditMax), 'notice', 'huanqi: land your state, then ask the user to compact'));
+                }
+            }
+        }));
+""", """                    afterTurn(agent, () => agent.steer(message(strings.circuitBreakNotice(ledger.creditMax), 'notice', 'huanqi: land your state, then ask the user to compact')), 'land-your-state steer');
+                }
+            }
+        }));
+""")
+
+
+def port_huanqi(content):
+    if "function afterTurn(agent, write, what)" in content:
+        raise ValueError("这份 release 的 dsh-huanqi 已经移植过。")
+    for anchor, replacement in (HUANQI_AFTER_TURN, HUANQI_CONTINUE, HUANQI_BREAK, HUANQI_LAND):
+        content = sp.once(content, anchor, replacement)
+    return content
+
 
 def port_index(content):
     once = sp.once
@@ -298,6 +385,7 @@ def port_index(content):
                                 LEASE_DECLARE, LEASE_GUARD, LEASE_TAKE, LEASE_END, STUDIO_STOP, HISTORY_GUIDE, STUDIO_DELETE,
                                 DELIVER_CHECK, SENT_REPLY, SENT_CONTROL, SENT_EDIT_CONTROL):
         content = once(content, anchor, replacement)
+    content = once(content, *REVOKED_TURN)
     content = once(content, SUBSCRIBE_ANCHOR, sp.SUBSCRIBE + STUDIO_WIRING + SUBSCRIBE_ANCHOR)
     content = once(content, OLD_MESSAGE_FAILED, sp.MESSAGE_FAILED)
     content = once(content, OLD_EDIT_FAILED, sp.EDIT_FAILED)
@@ -356,7 +444,7 @@ def port_history(content):
 def port_scopes(content):
     if "at:Date.parse(row.timestamp)" in content:
         raise ValueError("这份 release 的 gateway-scopes.mjs 已经移植过。")
-    return sp.once(content, *SCOPES_SOURCE)
+    return sp.once(sp.once(content, *SCOPES_SOURCE), *SCOPES_GONE)
 
 
 def port_krita(content):
@@ -458,6 +546,7 @@ def main(argv=None, replace=os.replace):
     index_path, np_path = plugin / "index.js", plugin / "natural-participation.mjs"
     history_path, scopes_path = plugin / "history-view.mjs", plugin / "gateway-scopes.mjs"
     bridge_path, runtime_path, krita_path = runtime / "bridge.mjs", runtime / "index.mjs", runtime / "krita-tools.mjs"
+    huanqi_path = args.release / "dsh-huanqi/lib/index.js"
     read = lambda path: path.read_text(encoding="utf-8").replace("\r\n", "\n")
     source = lambda name: (args.repo / name).read_bytes() if args.worktree else git(args.repo, "show", f"{args.rev}:{name}")
     index = port_index(read(index_path))
@@ -467,6 +556,7 @@ def main(argv=None, replace=os.replace):
     krita = port_krita(read(krita_path))
     history = port_history(read(history_path))
     scopes = port_scopes(read(scopes_path))
+    huanqi = port_huanqi(read(huanqi_path))
     # natural-participation.mjs：现行 release = develop + 承诺的几行，把本分支对 develop 的改动逐段套上去
     # （每段的上下文都要在现行 release 里刚好出现一次）。
     patch = git(args.repo, "diff", "-U3", args.base, *([] if args.worktree else [args.rev]), "--", "deploy/dsh/natural-participation.mjs").decode("utf-8")
@@ -481,10 +571,11 @@ def main(argv=None, replace=os.replace):
         (krita_path, encode(krita)),
         (history_path, encode(history)),
         (scopes_path, encode(scopes)),
+        (huanqi_path, encode(huanqi)),
         (runtime / "turn-guard.mjs", source("deploy/social/turn-guard.mjs")),
         (runtime / "studio.mjs", source("deploy/social/studio.mjs")),
     ], replace=replace)
-    print("已移植：index.js、natural-participation.mjs、history-view.mjs、gateway-scopes.mjs、bridge.mjs、index.mjs、krita-tools.mjs，新增 turn-guard.mjs、studio.mjs")
+    print("已移植：index.js、natural-participation.mjs、history-view.mjs、gateway-scopes.mjs、bridge.mjs、index.mjs、krita-tools.mjs、dsh-huanqi/lib/index.js，新增 turn-guard.mjs、studio.mjs")
 
 
 if __name__ == "__main__":

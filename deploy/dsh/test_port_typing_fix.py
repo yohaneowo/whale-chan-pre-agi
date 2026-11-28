@@ -79,9 +79,15 @@ class PortIndexTests(unittest.TestCase):
         self.assertIn("return {chunks:this.gatewayScopes.revoked?.has(messageId) ? [TURN_REVOKED_NOTICE] : [],files:[]};\n"
                       "\t\tsocialLease =", ported)
         # 她实际送出的话（回答、补的那句、画室的那句）记到那则讯息名下，回放只接这些。
-        self.assertIn("naturalTicket);\n  historyView.sent(message.channel_id, message.id, target.text);", ported)
-        self.assertEqual(ported.count("participation.recordReply(message.channel_id, text, sent.id);\n"
-                                      "    historyView.sent(message.channel_id, message.id, text);"), 2)
+        # 复验②：记的是实际送出的字（群聊转繁体、遮机密、拿掉合成字以后的），不是过滤前的。
+        self.assertIn("naturalTicket);\n  historyView.sent(message.channel_id, message.id, prepared.text);", ported)
+        self.assertNotIn("historyView.sent(message.channel_id, message.id, target.text)", ported)
+        self.assertEqual(ported.count("const sent = await rest.createMessage(message.channel_id, shown, message.id);\n"
+                                      "    participation.recordReply(message.channel_id, text, sent.id);\n"
+                                      "    historyView.sent(message.channel_id, message.id, shown);"), 2)
+        self.assertNotIn("historyView.sent(message.channel_id, message.id, text);", ported)
+        # 复验④：讯息被删或改掉，这一轮不管怎么结束都只回「訊息已撤回」。
+        self.assertIn('revoked: () => Boolean(this.gatewayScopes?.revoked?.has(messageId)) }', ported)
         self.assertIn("historyView.sent(event.channelId, event.messageId, event.text)", ported)
 
     def test_round_three_deleted_request_stops_the_studio(self):
@@ -120,8 +126,11 @@ class HistoryViewTests(unittest.TestCase):
             port.port_history(ported)
 
     def test_history_source_carries_name_and_time(self):
-        ported = port.port_scopes(port.SCOPES_SOURCE[0])
+        ported = port.port_scopes(port.SCOPES_SOURCE[0] + "\n" + port.SCOPES_GONE[0])
         self.assertIn("name,at:Date.parse(row.timestamp)}", ported)
+        # 复验④：取原讯息回 404 Unknown Message（删除事件还没到）也记成撤销。
+        self.assertIn("this.noteRevoked({channel_id:row.channel,id:row.event});", ported)
+        self.assertIn("10008", ported)
         with self.assertRaises(ValueError):
             port.port_scopes(ported)
 
@@ -160,6 +169,11 @@ class RuntimeAndKritaTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             port.port_runtime(self.fake_runtime().replace("\tctx.tools.register(other);\n" * 3, ""))
 
+    def test_ingress_keeps_the_quoted_message_for_the_draw_gate(self):
+        ported = port.port_runtime(self.fake_runtime())
+        self.assertIn("quoted: quotedOf(message),", ported)
+        self.assertIn("studioRecentNote, quotedOf } from \"./studio.mjs\";", ported)
+
     def test_krita_works_stay_with_the_chat_session_and_deliveries_are_counted(self):
         fake = "\n".join(anchor for anchor, _ in port.KRITA) + "\n"
         ported = port.port_krita(fake)
@@ -175,6 +189,29 @@ class RuntimeAndKritaTests(unittest.TestCase):
         self.assertIn("works: [...(turn.works ?? [])]", ported)
         with self.assertRaises(ValueError):
             port.port_krita(ported)
+
+
+class HuanqiTests(unittest.TestCase):
+    def fake(self):
+        return "".join(anchor for anchor, _ in (port.HUANQI_AFTER_TURN, port.HUANQI_CONTINUE, port.HUANQI_BREAK,
+                                                 port.HUANQI_LAND))
+
+    def test_empty_turn_writes_wait_for_the_turn_to_end(self):
+        ported = port.port_huanqi(self.fake())
+        self.assertIn("function afterTurn(agent, write, what)", ported)
+        # 熔断与续跑那段的写入都等这一轮结束，两个 IIFE 都接住错误（不然 rejection 没人接，整个程序结束）。
+        self.assertNotIn("\n                    agent.inject(message(fullNote", ported)
+        self.assertNotIn("\n                    agent.steer(message(strings.circuitBreakNotice", ported)
+        self.assertNotIn("\n                    agent.inject(message(strings.creditWarning", ported)
+        self.assertEqual(ported.count("})().catch((error) => ctx.logger.warn("), 2)
+        self.assertEqual(ported.count("afterTurn(agent, () => agent."), 3)
+        self.assertNotIn("                })();\n", ported)
+        with self.assertRaises(ValueError):
+            port.port_huanqi(ported)
+
+    def test_huanqi_drift_is_refused(self):
+        with self.assertRaises(ValueError):
+            port.port_huanqi(self.fake().replace("'huanqi: circuit break (empty turn)'", "'x'"))
 
 
 class WriteAllTests(unittest.TestCase):
@@ -234,7 +271,7 @@ class RealReleaseCopyTests(unittest.TestCase):
                          "dsh-plugin-discord/lib/history-view.mjs", "dsh-plugin-discord/lib/gateway-scopes.mjs",
                          "dsh-social-runtime/bridge.mjs", "dsh-social-runtime/turn-guard.mjs",
                          "dsh-social-runtime/studio.mjs", "dsh-social-runtime/index.mjs",
-                         "dsh-social-runtime/krita-tools.mjs"):
+                         "dsh-social-runtime/krita-tools.mjs", "dsh-huanqi/lib/index.js"):
                 subprocess.run(["node", "--check", str(target / name)], check=True)
             with self.assertRaises(ValueError):
                 port.main([str(target), "--worktree"])

@@ -17,6 +17,8 @@ if [ "$avail" -lt 1600 ]; then echo "可用记忆体只有 ${avail} MiB，不跑
 mkdir -p $SBX; chmod 755 $SBX
 mkdir -p $SBX/state $SBX/home/.dsh/state $SBX/srv/discord $SBX/srv/owner $SBX/drain $SBX/work $SBX/out
 cp "$(dirname "$0")/studio-sandbox-probe.mjs" $SBX/probe.mjs; chmod 644 $SBX/probe.mjs
+# gate 情境（要不要画的守门员）用的正反例；跟探针一样只在沙盒里。
+cp "$(dirname "$0")/draw-intent-cases.mjs" $SBX/cases.mjs; chmod 644 $SBX/cases.mjs
 rm -rf $SBX/new; cp -a $OLD $SBX/new; chmod -R u+w $SBX/new
 (cd $FILES && find . -type f) | while read f; do cp $FILES/$f $SBX/new/web/node_modules/$f; done
 python3 - $SBX <<'PY'
@@ -85,7 +87,7 @@ for i in $(seq 1 50); do [ -S $SBX/kgate/gate.sock ] && break; sleep 0.2; done
 cd $SBX/work
 set +e
 # 金钥只经环境变数往下传（不放进任何指令列参数：systemd 会把 scope 的指令记进日志）。
-export SBX SECS SCENARIOS SBX_EFFORT=${SBX_EFFORT:-off} SBX_INVOCATION=$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+export SBX SECS SCENARIOS SBX_GATE_RUNS=${SBX_GATE_RUNS:-2} SBX_EFFORT=${SBX_EFFORT:-off} SBX_INVOCATION=$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
 systemd-run --scope --quiet --unit=studio-sbx-$$ --description=studio-sandbox -p MemoryMax=1G -p MemorySwapMax=0 -- \
   setpriv --reuid=65534 --regid=65534 --groups=$KRITAIO -- /bin/bash -c '
   exec env -i HOME="$SBX/home" DSH_HOME="$SBX/home/.dsh" PATH=/opt/dsh/node/bin:/usr/bin:/bin \
@@ -93,6 +95,7 @@ systemd-run --scope --quiet --unit=studio-sbx-$$ --description=studio-sandbox -p
     NODE_OPTIONS=--max-old-space-size=768 TZ=Asia/Taipei DSH_HOST_MODULES=/opt/dsh/app/node_modules/@deepseek-ai \
     DSH_DRAIN_CONTROL=/run/dsh-drain DSH_DRAIN_STATUS="$SBX/drain" INVOCATION_ID="$SBX_INVOCATION" \
     SBX_RELEASE="$SBX/new" SBX_GROUP_CWD="$SBX/srv/discord" SBX_OUT="$SBX/out" SBX_SCENARIOS="$SCENARIOS" \
+    SBX_DIR="$SBX" SBX_GATE_RUNS="$SBX_GATE_RUNS" \
     SBX_EFFORT="${SBX_EFFORT:-off}" DISCORD_DRAW_DEADLINE_MS=600000 \
     timeout -s TERM "$SECS" /opt/dsh/node/bin/node "$SBX/new/trusted-entry.mjs"' > $SBX/run.log 2>&1
 echo "exit=$?"

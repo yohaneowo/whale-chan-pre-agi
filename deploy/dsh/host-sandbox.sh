@@ -2,15 +2,27 @@
 # 部署前在 VM 上（root）跑：把现行 release 与「现行 + 新版档案」各复制进沙盒，用 nobody 身分、临时目录、
 # 另一个连接埠、没有 Discord token 与模型金钥、碰不到正式 socket，走真的 trusted-entry 启动链，
 # 再由 host-sandbox-probe.mjs 用真宿主建聊天与画室会话。用法：bash host-sandbox.sh <新版档案目录> [秒数]
-# 新版档案目录里放 dsh-plugin-discord/…、dsh-social-runtime/…（port_typing_fix.py 产生的那 7 个）。
+# PROBE=huanqi-sandbox-probe.mjs HUANQI_CREDIT=0：换气额度 0 时模型回空白回合，看程序会不会整个结束（第 4 轮）。
+# 新版档案目录里放 dsh-plugin-discord/…、dsh-social-runtime/…、dsh-huanqi/…（port_typing_fix.py 产生的那些档）。
 set -euo pipefail
 OLD=$(readlink -f /opt/dsh/heartbeat-trust-db2df/current)
-FILES=$1     # 新版 7 个档的目录
+FILES=$1     # 新版档案的目录
 SECS=${2:-80}
 SBX=$(mktemp -d /tmp/dsh-sbx.XXXXXX); chmod 755 $SBX
 echo "SBX=$SBX"
 mkdir -p $SBX/state $SBX/home/.dsh $SBX/srv/discord $SBX/srv/owner $SBX/drain $SBX/work
-cp "$(dirname "$0")/host-sandbox-probe.mjs" $SBX/probe.mjs; chmod 644 $SBX/probe.mjs
+PROBE=${PROBE:-host-sandbox-probe.mjs}
+case "$PROBE" in host-sandbox-probe.mjs|huanqi-sandbox-probe.mjs) ;; *) echo "不认得的探针 $PROBE"; exit 2;; esac
+cp "$(dirname "$0")/$PROBE" $SBX/probe.mjs; chmod 644 $SBX/probe.mjs
+mkdir -p $SBX/home/.dsh/state
+# 换气额度（帐本在 $DSH_HOME/state/dsh-huanqi.json）：有给就从这个数开始。
+# old、new 各跑之前都重写一次（两次跑的起点一样）。
+[ -z "${HUANQI_CREDIT:-}" ] || [[ "$HUANQI_CREDIT" =~ ^[0-6]$ ]] || { echo "HUANQI_CREDIT 要是 0～6"; exit 2; }
+seed_ledger() {
+  [ -n "${HUANQI_CREDIT:-}" ] || return 0
+  printf '{"credit": %s, "creditMax": 6, "normalTurns": 0, "stats": {"continuations": 0, "circuitBreaks": 0, "anomalies": 0}, "turnsSinceOutput": 0, "lastAnomalyAt": 0}' "$HUANQI_CREDIT" > $SBX/home/.dsh/state/dsh-huanqi.json
+  chown nobody:nogroup $SBX/home/.dsh/state/dsh-huanqi.json
+}
 for which in old new; do
   cp -a $OLD $SBX/$which
   chmod -R u+w $SBX/$which
@@ -45,6 +57,7 @@ done
 chown -R nobody:nogroup $SBX/state $SBX/home $SBX/srv $SBX/drain $SBX/work
 for which in old new; do
   echo "===== $which ====="
+  seed_ledger
   cd $SBX/work
   set +e
   runuser -u nobody -- env -i HOME=$SBX/home DSH_HOME=$SBX/home/.dsh PATH=/opt/dsh/node/bin:/usr/bin:/bin \

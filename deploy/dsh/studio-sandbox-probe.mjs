@@ -4,7 +4,7 @@
 import console from 'node:console';
 import { randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import process from 'node:process';
 import { setTimeout } from 'node:timers';
@@ -448,6 +448,40 @@ export function apply(ctx) {
 					// 她先问要什么样的头像（没交给画室、程式也没挡）时，才再说清楚一次。
 					if (handed) break;
 				}
+			}
+			// 7. 要不要画的守门员（第 4 轮）：正反例逐句走正式的宿主与模型路线（studio.mjs 的 createDrawGate），
+			// 不画图、不碰 Krita。每句的结果一行写进 out/gate.jsonl（cases 是自己写的测试句，不是群友资料）。
+			if (want('gate')) {
+				const { DRAW_GATE_CASES, caseFacts } = await import(
+					pathToFileURL(join(process.env.SBX_DIR ?? '', 'cases.mjs')).href
+				);
+				const gate = studioMod.createDrawGate(ctx);
+				const runs = Number(process.env.SBX_GATE_RUNS || 2);
+				const selection = ctx.get('agentDefaultModel')?.currentSelection?.();
+				say(
+					'gate 模型',
+					JSON.stringify({
+						provider: selection?.provider,
+						model: selection?.model,
+					}),
+				);
+				const file = join(OUT, 'gate.jsonl');
+				writeFileSync(file, '');
+				for (let run = 1; run <= runs; run++)
+					for (const [index, row] of DRAW_GATE_CASES.entries()) {
+						const verdict = await gate(caseFacts(row));
+						const line = { run, index, ...verdict };
+						appendFileSync(file, JSON.stringify(line) + '\n');
+						say(
+							'gate',
+							run,
+							index + 1,
+							verdict.allow === row.want ? 'ok' : 'WRONG',
+							verdict.intent,
+							verdict.error ?? '',
+							Math.round(verdict.ms),
+						);
+					}
 			}
 			// 5. 背景整理记忆（2026-11-25 改走 opencode-go 以后每批都失败）：照 consolidate 的参数直接问一次模型，
 			// 看它回了什么（思考多长、正文多长、怎么结束），再跑一次真的 consolidate。
