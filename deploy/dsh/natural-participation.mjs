@@ -16,13 +16,38 @@ const FOLLOW_THROUGH =
 	'（提醒：你剛才說要去看、去查，但這一輪你沒用任何工具就結束了，說完不會有下一句。現在就用工具把它做完，再把結果講出來；真的做不到就直接說做不到，不要再說「我看看」。）';
 const TOO_LONG =
 	'（提醒：你剛才那一輪輸出太長被截斷了，群裡什麼都沒看到。這次分段做：指令寫短一點、一次做一小步，最後只講重點。）';
-// 回合失败时群里只看到她自己的一句话；原始错误留在桥接日志。
+// 回合失败时群里只看到她自己的一句话（都是固定文字，不转述原始错误）；错误类别留在桥接日志。
 const STUCK = '欸 我剛剛卡住了，你再說一次';
-// 桥接自己发的回合提示：失败、取消、没有文字。群聊不发出去。
+const QUOTA_TEXT = '今天的模型用量先到这里，稍后再聊。';
+const STEPS_TEXT = '這一輪我做了太多步，先停一下；要繼續再叫我。';
+// 桥接自己发的回合提示：失败、取消、没有文字。群聊不发出去，记成这一轮的结果代码。
 const TURN_FAILED = /^⚠️ (?:回合失败|出错了|消息没有进入会话)/;
 const TURN_SILENT = /^(?:⏹️ 回合被取消|\(本回合没有文本回复\)$)/;
-// 用量护栏与「一回合动作太多」的拒绝本来就是写给群友看的，原样说出来。
-const QUOTA = /(?:今天的模型用量|這一輪我做了太多步)[^\n]*/;
+function noticeCode(text) {
+	if (text.startsWith('⏹️')) return 'cancelled';
+	if (text.startsWith('(本回合没有文本回复)')) return 'empty';
+	if (text.startsWith('⚠️ 消息没有进入会话')) return 'lost';
+	if (text.includes('這一輪我做了太多步')) return 'steps';
+	if (text.includes('今天的模型用量')) return 'quota';
+	if (text.includes('max-tokens')) return 'max-tokens';
+	return 'error';
+}
+// 要做比较久的事时先说一句，不让「正在输入」一声不吭亮好几分钟。
+// 依 VM 上 881 轮：超过 30 秒的回合里，动工具前自己先说话的只有 2/38，所以由这里补；
+// 一开始画（Krita start／paint）就说，否则 20 秒还没任何东西送达才说。
+const PREFACE = { drawing: '好，我畫一下', slow: '等我一下，我弄一下' };
+// 只 @ 她、没说别的：像人一样问一句，不去翻旧上下文接着做以前的事
+// （2026-11-28 空 @ 让她重画了半天前的旧图）。
+const BARE_REPLIES = ['怎麼了？', '嗯？怎麼了', '我在，怎麼了？'];
+const BARE_PUNCTUATION = /[\s,，、。.!！?？~～…@]+/g;
+const STOP_COMMANDS = new Set([
+	'stop',
+	'cancel',
+	'new',
+	'use',
+	'switch',
+	'resume',
+]);
 // 她要回覆哪一则：回话最前面的「[回覆 #編號]」；其他位置冒出来的标记一律拿掉，不发出去。
 // 编号后面常顺手带上名字（「[回覆 #4821 小羅]」，学纪录里的写法），一样认得。
 const REPLY_MARK = /^\s*\[(?:回覆|回复|reply)\s*#(\d{3,20})[^\]\n]{0,40}\]\s*/i;
@@ -104,6 +129,8 @@ export function naturalConfig(env = process.env) {
 		// 背景整理记忆：每个频道累积几则（0 = 不整理），或安静几分钟后整理一次。
 		notesBatch: number('NOTES_BATCH', 10, 0, 200),
 		notesQuietMs: number('NOTES_QUIET_MINUTES', 5, 1, 1440) * 60000,
+		// 直接呼叫多久还没任何东西送达，就先说一句「等我一下」。
+		prefaceMs: number('SLOW_TURN_NOTICE_SECONDS', 20, 5, 600) * 1000,
 		names: (env.BOT_NAMES || '')
 			.split(',')
 			.map((name) => name.trim())
@@ -207,6 +234,9 @@ export class NaturalParticipation {
 		this.warn = warn;
 		this.log = log;
 		this.channels = new Map();
+		// 进行中的直接呼叫：Discord 讯息 ID → 这则呼叫的纪录（送达、失败、结果都记在这里）。
+		this.calls = new Map();
+		this.callSeq = 0;
 		this.state = {
 			version: 1,
 			day: '',
@@ -258,9 +288,15 @@ export class NaturalParticipation {
 
 	// recipient 是她这句在跟谁说话（她回覆的人、她 @ 的人，都没有就是叫她的人），
 	// 只在这一轮的第一则或她指定回覆时更新；quotedId 是她用 Discord「回复」挂上的那一则。
-	recordReply(channelId, text, id, recipient, quotedId, first = true) {
+	// ticket 是送出这句的那一轮（deliverRound 交给桥接的），只有它的送达算进那则呼叫；
+	// 控制讯息、先说的那句、补的那句都不带 ticket，不算答覆。
+	recordReply(channelId, text, id, recipient, quotedId, first = true, ticket) {
 		const channel = this.channel(channelId);
-		channel.turns?.[0]?.replies.push(text);
+		const round = ticket?.round;
+		if (round && id) {
+			round.said.push(text);
+			round.call.text++;
+		}
 		channel.lastSpokeAt = this.now();
 		const quoted =
 			quotedId &&
@@ -381,44 +417,101 @@ export class NaturalParticipation {
 		return channel.notesTask;
 	}
 
-	// 桥接送出每一段前先问这里：是回合提示就不发进群里，失败的记下来交给 deliverAndFollow。
-	turnNotice(channelId, chunk) {
+	// 桥接送出每一段前先问这里：是回合提示就不发进群里，结果代码记到送它的那一轮。
+	turnNotice(channelId, chunk, ticket) {
 		const text = String(chunk);
-		const failed = TURN_FAILED.test(text);
-		if (!failed && !TURN_SILENT.test(text)) return false;
-		const turn = this.channel(channelId).turns?.[0];
-		if (turn) turn.notices++;
-		if (failed && turn)
-			turn.failure = text.includes('max-tokens')
-				? 'max-tokens'
-				: (QUOTA.exec(text)?.[0] ?? 'error');
+		if (!TURN_FAILED.test(text) && !TURN_SILENT.test(text)) return false;
+		if (ticket?.round) ticket.round.notice = noticeCode(text);
 		return true;
 	}
 
-	// 每轮各记各的。桥接按频道串行，排在最前面、还没结束的那轮就是桥接正在送的那轮，
-	// 送出的话与回合提示都记到它身上。以前整个频道共用一个栏位，连着叫两次时
-	// 先结束的那轮把它清掉，后结束的那轮读到 undefined 就丢错（2026-11-28 事故）。
-	async deliverTurn(channel, deliver, text, ticket) {
-		const turn = { replies: [], failure: undefined, notices: 0 };
-		(channel.turns ??= []).push(turn);
+	// 桥接把这一轮的附件（reply.files）送出去了。
+	recordFiles(channelId, ticket, sent) {
+		if (ticket?.round && sent !== undefined) ticket.round.call.files++;
+	}
+
+	// 桥接送这一轮的某一段失败了（错误本身由桥接用 errorTrace 记，不经过这里）。
+	sendFailed(channelId, ticket) {
+		if (ticket?.round) ticket.round.call.sendFailures++;
+	}
+
+	// 工具（discord_send_message、Krita 预览／交付）在这一轮里送到频道的讯息，
+	// 由 turn-guard 按「桥接此刻在跑哪一则」记到那则呼叫名下。
+	recordToolMessage(channelId, messageId) {
+		const call = this.calls.get(String(messageId));
+		if (call && call.channelId === String(channelId)) call.tool++;
+	}
+
+	// turn-guard 的进度：这一轮开始画图了，先说一句。
+	turnEvent(event) {
+		if (event?.type !== 'progress' || !event.drawing) return;
+		const call = this.calls.get(String(event.messageId));
+		if (call && call.channelId === String(event.channelId))
+			void this.preface(call, 'drawing');
+	}
+
+	delivered(call) {
+		return call.text + call.files + call.tool;
+	}
+
+	// 先说一句：只说一次，已经有东西送达、已经结束或被指令停掉就不说。不算答覆。
+	async preface(call, kind) {
+		if (call.closed || call.prefaced || call.stopped || this.delivered(call))
+			return;
+		call.prefaced = kind;
 		try {
-			const result = await deliver(text, ticket);
-			return {
-				result,
-				said: turn.replies.join('\n').trim(),
-				failure: turn.failure,
-				notices: turn.notices,
-			};
-		} finally {
-			channel.turns.splice(channel.turns.indexOf(turn), 1);
+			await call.controlReply?.(PREFACE[kind]);
+			this.log(`直接呼叫 先说一句 #${call.messageId} kind=${kind} status=sent`);
+		} catch {
+			this.log(
+				`直接呼叫 先说一句 #${call.messageId} kind=${kind} status=send-failed`,
+			);
 		}
+	}
+
+	openCall(channel, messageId, controlReply) {
+		const call = {
+			messageId: String(messageId),
+			channelId: channel.id,
+			started: this.now(),
+			controlReply,
+			text: 0,
+			files: 0,
+			tool: 0,
+			sendFailures: 0,
+			prefaced: false,
+			stopped: false,
+			closed: false,
+		};
+		this.calls.set(call.messageId, call);
+		call.preface = this.timer(
+			() => void this.preface(call, 'slow'),
+			this.config.prefaceMs,
+		);
+		return call;
+	}
+
+	closeCall(call) {
+		call.closed = true;
+		clearTimeout(call.preface);
+		if (this.calls.get(call.messageId) === call)
+			this.calls.delete(call.messageId);
+	}
+
+	// 一轮：把 ticket（带着这一轮的纪录）交给桥接，桥接送出的每一段都凭它记帐。
+	// 桥接按频道串行 runPrompt，但送讯在串行之外：同频道 A 送得慢、B 先送达也不会记错。
+	async deliverRound(call, deliver, text) {
+		const round = { call, said: [], notice: undefined };
+		const result = await deliver(text, { proactive: false, round });
+		return { result, said: round.said.join('\n').trim(), notice: round.notice };
 	}
 
 	// 她一轮说完就结束，不会有「等一下」。只回一句「我看看／我查一下」就停时，
 	// 自动再给一轮叫她做完；每则消息最多补一次，期间有人再叫她就不补。
-	// 输出太长被截断也再给一轮叫她精简；还是失败就用她自己的口气说一句，不贴原始错误。
-	// 直接呼叫一定有下文：回话、她自己说一句失败，或被更新的呼叫取代。桥接什么都没回
-	// （排队过期被丢掉、回合没进会话）也补一句，不让「正在输入」之后一片沉默。
+	// 输出太长被截断也再给一轮叫她精简。
+	// 直接呼叫一定有下文：这则呼叫实际送达的文字、附件、工具讯息都没有，就补一句固定文字；
+	// 做了太多步（期限到）一定照实说。被 /stop 这类指令停掉的不补。别则呼叫不影响这则。
+	// 结果在 finally 记一次，日志只有讯息 ID、固定代码与数量，不写内文。
 	async deliverAndFollow(
 		channel,
 		deliver,
@@ -428,56 +521,118 @@ export class NaturalParticipation {
 		messageId = '?',
 	) {
 		const epoch = channel.directEpoch;
+		const call = this.openCall(channel, messageId, controlReply);
+		this.log(`直接呼叫 收到 #${call.messageId}`);
+		let status = 'thrown';
+		let turn = 'none';
+		try {
+			let { result, said, notice } = await this.deliverRound(
+				call,
+				deliver,
+				text,
+			);
+			if (notice === 'max-tokens' && epoch === channel.directEpoch)
+				({ result, said, notice } = await this.deliverRound(
+					call,
+					deliver,
+					TOO_LONG,
+				));
+			turn = notice ?? (said ? 'answered' : 'none');
+			const last = (
+				said
+					.split(/[\n。！？!?]/)
+					.map((part) => part.trim())
+					.filter(Boolean)
+					.at(-1) ?? ''
+			).trim();
+			if (
+				!notice &&
+				said &&
+				said.length <= 80 &&
+				PROMISE.test(last) &&
+				epoch === channel.directEpoch
+			) {
+				({ result, notice } = await this.deliverRound(
+					call,
+					deliver,
+					FOLLOW_THROUGH,
+				));
+				if (notice) turn = notice;
+			}
+			status = await this.settleCall(call, turn);
+			return result;
+		} catch (error) {
+			if (!call.stopped && !this.delivered(call))
+				status = 'thrown+' + (await this.settleCall(call, 'thrown'));
+			throw error;
+		} finally {
+			this.closeCall(call);
+			this.log(
+				`直接呼叫 结果 #${call.messageId} status=${status} turn=${turn} text=${call.text} files=${call.files} tool=${call.tool} sendFail=${call.sendFailures} preface=${call.prefaced || 'no'} secs=${Math.round((this.now() - call.started) / 1000)}`,
+			);
+		}
+	}
+
+	// 要不要补一句；回传结果代码（answered／notice-sent／fallback-sent／…-failed／stopped）。
+	async settleCall(call, turn) {
+		if (call.stopped) return 'stopped';
+		let text;
+		if (turn === 'steps') text = STEPS_TEXT;
+		else if (this.delivered(call)) return 'answered';
+		else text = turn === 'quota' ? QUOTA_TEXT : STUCK;
+		const kind = text === STUCK ? 'fallback' : 'notice';
+		try {
+			await call.controlReply?.(text);
+			return kind + '-sent';
+		} catch {
+			return kind + '-failed';
+		}
+	}
+
+	// 只 @ 她、没有别的内容、没回覆别则、没附图，而且同一个人一分钟内没有还没被回的话：
+	// 像人一样问一句，不交给模型（模型会拿旧上下文自己找事做）。只叫名字（「小鯨魚」）照常交给模型。
+	bareCall(message, channel, botUserId) {
+		if (message.guild_id === undefined || message.referenced_message)
+			return false;
+		if (imageNotes(message).length || gifLinkNotes(message).length)
+			return false;
+		const content = String(message.content ?? '');
+		const mention = new RegExp(`<@!?${botUserId}>`, 'g');
+		if (!/^\d+$/.test(String(botUserId)) || !mention.test(content))
+			return false;
+		if (content.replace(mention, '').replace(BARE_PUNCTUATION, '') !== '')
+			return false;
+		const speaker = String(message.author.id);
+		const lines = channel.history.slice(0, -1);
+		const lastMine = lines.findLastIndex((line) => line.role === 'assistant');
+		return !lines
+			.slice(lastMine + 1)
+			.some(
+				(line) =>
+					line.role === 'user' &&
+					line.speaker === speaker &&
+					this.now() - line.at < 60000,
+			);
+	}
+
+	async answerBare(channel, message, controlReply) {
+		const messageId = String(message.id);
 		const started = this.now();
 		this.log(`直接呼叫 收到 #${messageId}`);
-		const finish = (outcome) =>
+		let status = 'bare-sent';
+		try {
+			await controlReply(BARE_REPLIES[this.callSeq++ % BARE_REPLIES.length]);
+			// 她问了「怎麼了」：对方接着说就是对她说。
+			channel.lastReplyTo = String(message.author.id);
+			channel.lastReplyAt = this.now();
+			channel.talkingWith = this.recentSpeakers(channel, message.author.id);
+		} catch {
+			status = 'bare-failed';
+		} finally {
 			this.log(
-				`直接呼叫 结果 #${messageId}：${outcome}，${Math.round((this.now() - started) / 1000)} 秒`,
+				`直接呼叫 结果 #${messageId} status=${status} turn=bare text=0 files=0 tool=0 sendFail=${status === 'bare-failed' ? 1 : 0} preface=no secs=${Math.round((this.now() - started) / 1000)}`,
 			);
-		let { result, said, failure, notices } = await this.deliverTurn(
-			channel,
-			deliver,
-			text,
-			ticket,
-		);
-		if (failure === 'max-tokens' && epoch === channel.directEpoch)
-			({ result, said, failure, notices } = await this.deliverTurn(
-				channel,
-				deliver,
-				TOO_LONG,
-				{ proactive: false },
-			));
-		if (failure || (!said && !notices)) {
-			const what = failure ? `失败（${failure}）` : '没有任何输出';
-			if (said) finish(`${what}，已回过话`);
-			else if (epoch !== channel.directEpoch)
-				finish(`${what}，已被更新的呼叫取代`);
-			else {
-				finish(`${what}，补一句`);
-				await controlReply?.(
-					!failure || failure === 'error' || failure === 'max-tokens'
-						? STUCK
-						: failure,
-				).catch(() => this.warn(`回合失败后的提示没有送出 #${messageId}。`));
-			}
-			return result;
 		}
-		finish(said ? '已回话' : '只有回合提示（没有文字）');
-		const last = (
-			said
-				.split(/[\n。！？!?]/)
-				.map((part) => part.trim())
-				.filter(Boolean)
-				.at(-1) ?? ''
-		).trim();
-		if (
-			!said ||
-			said.length > 80 ||
-			!PROMISE.test(last) ||
-			epoch !== channel.directEpoch
-		)
-			return result;
-		return await deliver(FOLLOW_THROUGH, { proactive: false });
 	}
 
 	// 这个频道所在服务器的群主，十分钟查一次；查不到就不标。
@@ -635,6 +790,10 @@ export class NaturalParticipation {
 		const channel = this.channel(channelId);
 		channel.directEpoch++;
 		channel.abort?.abort();
+		// /stop 之类的指令停掉的那几则呼叫，不再补「卡住了」。
+		if (STOP_COMMANDS.has(commandName))
+			for (const call of this.calls.values())
+				if (call.channelId === channel.id) call.stopped = true;
 		if (['new', 'use', 'switch', 'resume'].includes(commandName)) {
 			channel.history = [];
 			channel.deliveredId = undefined;
@@ -837,6 +996,8 @@ export class NaturalParticipation {
 					direct,
 				);
 			if (command) return await deliver(direct, { proactive: false });
+			if (this.bareCall(message, channel, identity.botUserId))
+				return await this.answerBare(channel, message, controlReply);
 			return await this.deliverAndFollow(
 				channel,
 				deliver,

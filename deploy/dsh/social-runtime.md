@@ -167,12 +167,14 @@ python -m unittest discover -s deploy/pve -p 'test_*.py'
     - 它的面板会直接改 profile 的 `cordis.patch.yml`，跟我们的部署脚本抢写，所以不装。
   - 设定（`configure_social.py --huanqi`，e2e 设定档也写同一组）：`fullCompactOnBreaker: false`、`regionCompactAfterCuts: 0`、`postCompactRecallHint: false`。压缩留给第三步带出处的压缩，我们也没有它那套检索工具；其余照预设，最多连续补救 6 次，额度用完就停。
   - 桥接接补救轮：huanqi 所有的补救都是「等这一轮结束，再追加一则 `source.kind: loop-guard` 的讯息、另开一轮」。原本桥接只取第一轮，补救的回答传不到 Discord。现在 `SessionBridge` 在 `whenIdle` 后会再等 0.3 秒（`settleSocialTurn`），看到补救讯息就等它跑完；取回答时用 `extractSocialReply`，跨过 loop-guard 讯息往下收、取最后一则有文字的，碰到别人的新讯息就停。
-  - 2026-11-28 修正（「@ 了只显示正在输入」事故）：
-    - 等回合改用 `awaitSocialTurn`（取代 `whenIdle`），有上限：预设 240 秒，VM 环境变数 `DISCORD_TURN_DEADLINE_MS` 可调（30 秒～30 分钟）。超过就取消回合、停掉「正在输入」，她在群里说「這一輪我做了太多步，先停一下；要繼續再叫我。」。依 VM 上 626 轮的耗时，p95 45 秒、p99 226 秒，超过 240 秒的 6 轮都是 Krita 多步作画。240 秒也短于闸道 5 分钟的讯息效期，排在后面的那则 @ 轮到时还有效。
-    - 回合已经正常结束且有文字时，不再等后面的补救轮，取回答也不跨过补救讯息：当天回合内被截断的思考排了两轮补救，多跑 2 分钟，还把真正的回答「畫好了」换成不相干的「這個我不畫啦」。
-    - 直接呼叫一定有下文：每轮的回话与提示各记各的（以前整个频道共用一个栏位，连着叫两次就丢 TypeError、错误被吞掉）；桥接完全没输出时她补一句「欸 我剛剛卡住了，你再說一次」。
-    - 日志：每则直接呼叫有「直接呼叫 收到 #编号」与「直接呼叫 结果 #编号：…，N 秒」配对；每轮有「回合结束 #编号：N 秒」；「群聊行为处理未完成」带讯息编号与遮过机密的错误摘要。
-    - 重现：`node deploy/dsh/typing-hang-repro.mjs --participation <群聊行为处理> --gateway <部署版 gateway-scopes.mjs> [--deadline 240000]`，用假时钟跑当天时间线。
+  - 2026-11-28 修正（「@ 了只显示正在输入」事故，第 1 轮审查后重做；程式在 `deploy/social/turn-guard.mjs`）：
+    - 一轮的整段生命周期由 `runSocialTurn` 管：「正在输入」从它亮起、期限从它算，任何情况都熄灯。预设 280 秒（主人决定，让多数作画画得完；Krita 16 轮里 12 轮在 280 秒内），`DISCORD_TURN_DEADLINE_MS` 可调（30 秒～30 分钟），仍短于闸道 5 分钟的讯息效期。附件下载每个 30 秒、flush 与附件都在期限内（`socialBounded`），卡住也不会拖住灯和频道队列。期限到了她说「這一輪我做了太多步，先停一下；要繼續再叫我。」。
+    - 等待与取回答都绑这次送进 inbox 的讯息 id（`socialFollowup`／`socialPromptSeq`），自动续做重用同一个 Discord ID 也不会拿到上一轮。回合已完整回答就不等补救轮，并停掉它（排着的从 inbox 移掉、在跑的取消）；到期限只取消属于自己的那一轮，一律 `keepInbox`，正在跑的是别人的回合（心跳、网页）就不取消，日志照实写 `deadline-cancelled`／`deadline-unsettled`／`deadline-not-owner`。
+    - 每则直接呼叫一笔纪录：桥接送出的每一段凭 `naturalTicket`（这则呼叫的这一轮）记帐，工具（`discord_send_message`、Krita 预览／交付）送到频道的讯息由 `trackSocialSends` 记到「桥接此刻在跑的那则」名下；控制讯息、先说的那句不算答覆。实际送达的文字、附件、工具讯息都没有，就补一句固定文字「欸 我剛剛卡住了，你再說一次」（模型没正文、回合被取消、排队过期都算）；做了太多步一定照实说；用量到顶说固定的「今天的模型用量先到这里，稍后再聊。」；被 `/stop` 这类指令停掉的不补。别则呼叫不会压掉这则的提示。
+    - 只 @ 她、没有别的内容（没回覆别则、没附图，同一个人一分钟内也没有还没被回的话）：不交给模型，直接问一句「怎麼了？」，之后那个人接着说就当成对她说。只叫名字照常交给模型。
+    - 要做比较久的事先说一句：回合一开始画（Krita `start`／`paint`／`paint_plan`／`plan_strokes_from_image`）就说「好，我畫一下」；否则 20 秒（`SLOW_TURN_NOTICE_SECONDS` 可调）还没任何东西送达就说「等我一下，我弄一下」，每则最多一次。依 VM 上 881 轮：超过 30 秒的 40 轮里，动工具前自己先说话的只有 2 轮，所以不靠模型自己说。
+    - 日志只写讯息 ID、固定代码与数量：每则直接呼叫「直接呼叫 收到 #ID」与在 finally 记一次的「直接呼叫 结果 #ID status=… turn=… text=… files=… tool=… sendFail=… preface=… secs=…」；错误只写 `errorTrace`（错误类别、Discord 状态码、堆疊里的函式与行号），不写错误内文。
+    - 移植到 VM 现行 release：见 [typing-hang-port.md](typing-hang-port.md)。验收：`node deploy/dsh/typing-hang-repro.mjs --release <release 副本>` 拿副本里真正的桥接程式码跑 13 个情境，逐则讯息 ID 判定。
   - e2e 新增一项：假模型第一次只回思考、不给正文（完全空白会被 dsh 判成错误，huanqi 不管错误），huanqi 判定 `continue` 并另开一轮，第二次的文字传到 Discord，群里不出现系统提示。26 个回合里它只出手这 1 次，23 个正常回合都判 `skip:had-output`。
   - 每回合动作上限（`turnStepLimit`，预设 40）：dsh 对一回合里的模型调用（工具反复调用）没有上限，huanqi 也不管「一直做」这种情况。runtime 在 `llm/stream` 按 `sessionId` 计数，`session/event` 的 `turn/start` 归零；超过就以 `LOCAL_TURN_STEPS` 结束这一回合，她在群里原样说「這一輪我做了太多步，先停一下；要繼續再叫我。」，并记进 `social-runtime/vital-events.jsonl`。判断、整理这类不带 `sessionId` 的调用不计。
   - 烧钱警报（`spendAlert`，预设每天 5 元、一小时暴增为平常 3 倍且至少 0.5 元）：维持不设每日上限，每 10 分钟读一次 DeepSeek 余额（人民币的充值钱包加赠送钱包）。相邻读数的减少才算花费，余额变多当成充值。今天超过门槛私讯拥有者一次；一小时暴增三小时内最多提醒一次（要有 3 小时以上的读数才判断）。状态存在 `spend-state.json`；`/费用` 也显示今天大约花了多少。

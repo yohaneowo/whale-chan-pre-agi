@@ -7,29 +7,84 @@ def once(content, anchor, replacement):
     return content.replace(anchor, replacement, 1)
 
 
+
+
+# ---- 一轮的期限、取消与归帐（2026-11-28「正在输入」不停）----
+# 这些片段同时给 social_patch（从上游重建）与 port_typing_fix（移植到 VM 现行 release）用，
+# 两边接上的程式码一模一样。
+TURN_IMPORT = 'import { runSocialTurn, awaitSocialTurn, socialFollowup, socialPromptSeq, socialBounded, trackSocialSends, onSocialTurn, errorTrace, TURN_DEADLINE_NOTICE } from "dsh-social-runtime/bridge";\n'
+
+# 「正在输入」从 runSocialTurn 亮起，期限（预设 280 秒）从这里算，任何情况都熄灯；
+# 卡住的附件、flush 不会再拖住灯与频道队列。
+ENQUEUE = ('await this.runPrompt(channelId, messageId, text, beginTyping, attachments)',
+           'await runSocialTurn({ channelId, messageId, beginTyping, log: (line) => this.log("info", line) }, (socialBudget) => this.runPrompt(channelId, messageId, text, socialBudget.beginTyping, attachments, socialBudget))')
+SIGNATURE = ('async runPrompt(channelId, messageId, text, beginTyping, attachments) {',
+             'async runPrompt(channelId, messageId, text, beginTyping, attachments, socialBudget) {')
+SAVE_SIGNATURE = ('async saveIncoming(agentCwd, messageId, attachments) {',
+                  'async saveIncoming(agentCwd, messageId, attachments, incomingSignal) {')
+FETCH = ('const response = await fetch(attachment.url);',
+         'const response = await fetch(attachment.url, { signal: incomingSignal ? AbortSignal.any([incomingSignal, AbortSignal.timeout(3e4)]) : AbortSignal.timeout(3e4) });')
+ATTACH = ('const notes = await this.saveIncoming(agentCwd, messageId, attachments);',
+          'const notes = await socialBounded(this.saveIncoming(agentCwd, messageId, attachments, socialBudget?.signal), socialBudget?.signal, []);')
+# 送进 inbox 的那则讯息留下来：它的 id 是这一轮的识别码（自动续做时 discordMessageId 会重复）。
+FOLLOWUP = ('agent.followup(this.userMessage([{',
+            'if (socialBudget?.signal.aborted) return { chunks: [TURN_DEADLINE_NOTICE], files: [] };\nconst socialPrompt = socialFollowup(agent, this.userMessage([{')
+WAIT = '''const socialWait = await awaitSocialTurn(agent, socialPrompt, { signal: socialBudget?.signal, startedAt: socialBudget?.startedAt });
+this.log("info", `回合结束 #${messageId}：${socialWait.status}，${Math.round(socialWait.elapsedMs / 1000)} 秒`);
+if (socialWait.timedOut) return { chunks: [TURN_DEADLINE_NOTICE], files: [] };'''
+FLUSH = ('if (flushable !== void 0) await flushable.flush(agent.session);',
+         'if (flushable !== void 0) await socialBounded(flushable.flush(agent.session), socialBudget?.signal);')
+PROMPT_SEQ = ('const promptSeq = findPromptSeq(events, messageId);',
+              'const promptSeq = socialPromptSeq(events, socialPrompt);')
+# 日志只写讯息 ID 与 errorTrace（错误类别与堆疊位置），不写错误内文。
+PROMPT_FAILED = ('this.log("warn", `prompt failed: ${String(error)}`);',
+                 'this.log("warn", `prompt failed #${messageId}：${errorTrace(error)}`);')
+# 送讯：每一段凭 naturalTicket（这则呼叫的这一轮）记帐，送出失败也记。
+NOTICE_TICKET = ('participation.turnNotice(message.channel_id, chunk)) continue;',
+                 'participation.turnNotice(message.channel_id, chunk, naturalTicket)) continue;')
+RECORD_TICKET = ('target.messageId, index === 0);', 'target.messageId, index === 0, naturalTicket);')
+SEND_FAILED = ('logger.warn(`discord-bridge: send failed: ${String(error)}`);',
+               'participation.sendFailed(message.channel_id, naturalTicket);\nlogger.warn(`discord-bridge: send failed #${message.id}：${errorTrace(error)}`);')
+FILES = ('await rest.createMessageWithFiles(message.channel_id, "", reply.files);',
+         'participation.recordFiles(message.channel_id, naturalTicket, await rest.createMessageWithFiles(message.channel_id, "", reply.files));')
+FILES_FAILED = ('logger.warn(`discord-bridge: file upload failed: ${String(error)}`);',
+                'participation.sendFailed(message.channel_id, naturalTicket);\nlogger.warn(`discord-bridge: file upload failed #${message.id}：${errorTrace(error)}`);')
+HANDLING_FAILED = ('logger.warn(`discord-bridge: message handling failed: ${String(error)}`);',
+                   'logger.warn(`discord-bridge: message handling failed #${message.id}：${errorTrace(error)}`);')
+# 工具（discord_send_message、Krita）送到频道的讯息记到正在跑的那则呼叫名下。
+TRACKED_REST = ('registerDiscordRest(rest);',
+                'registerDiscordRest(trackSocialSends(rest, (channelId, messageId) => participation.recordToolMessage(channelId, messageId)));')
+# 开始画图时先说一句（turn-guard 的进度事件）。
+SUBSCRIBE = 'onSocialTurn((event) => participation.turnEvent(event));\n'
+MESSAGE_FAILED = '.catch((error) => logger.warn(`群聊行为处理未完成，保持安静 #${message.id}：${errorTrace(error)}`))'
+EDIT_FAILED = '.catch((error) => logger.warn(`编辑讯息处理未完成，保持安静 #${message.id}：${errorTrace(error)}`))'
+# 一轮的整段生命周期（runPrompt 本体与 deliverMessage 送讯）共用的接点，上游与现行 release 都有。
+LIFECYCLE = [ENQUEUE, SIGNATURE, SAVE_SIGNATURE, FETCH, ATTACH, FLUSH, PROMPT_SEQ, PROMPT_FAILED,
+             SEND_FAILED, FILES, FILES_FAILED, HANDLING_FAILED]
+
+
 def social_patch(content):
-    content = 'import { admitSocialMessage, prepareSocialTurn, handleSocialControl, assertGroupSession, isSocialOwner, toGroupText, redactSecrets, registerDiscordRest, socialGuildOwner, socialChannelLabel, socialConsolidate, socialImageNotes, prepareGroupReply, registerDiscordGateway, socialPresence, socialArchive, awaitSocialTurn, TURN_DEADLINE_NOTICE, extractSocialReply } from "dsh-social-runtime/bridge";\n' + content
+    content = 'import { admitSocialMessage, prepareSocialTurn, handleSocialControl, assertGroupSession, isSocialOwner, toGroupText, redactSecrets, registerDiscordRest, socialGuildOwner, socialChannelLabel, socialConsolidate, socialImageNotes, prepareGroupReply, registerDiscordGateway, socialPresence, socialArchive, extractSocialReply } from "dsh-social-runtime/bridge";\n' + TURN_IMPORT + content
     # 群聊：文字照常回覆（繁体、遮机密），[sticker:…] 换成的表情 GIF 另发一则附件；私讯只遮机密。
     # 群聊里桥接自己的回合提示（失败、取消、没有文字）不发出去，交给群聊行为处理（失败时她自己说一句）。
     # 「回复」由她自己选：回话开头写 [回覆 #編號] 才挂到那一则，没写就是一般讯息（以前一律挂在叫她的那则）。
     # 她这句在跟谁说话（之后的续聊对象）也跟着她回覆或 @ 的人走。
-    content = once(content, 'const sent = await rest.createMessage(message.channel_id, chunk, index === 0 ? message.id : void 0);', '''if (message.guild_id !== void 0 && participation.turnNotice(message.channel_id, chunk)) continue;
+    content = once(content, 'const sent = await rest.createMessage(message.channel_id, chunk, index === 0 ? message.id : void 0);', '''if (message.guild_id !== void 0 && participation.turnNotice(message.channel_id, chunk, naturalTicket)) continue;
 const target = message.guild_id === void 0 ? { text: chunk } : participation.replyTarget(message.channel_id, chunk);
 const prepared = message.guild_id === void 0 ? { text: redactSecrets(chunk), files: [] } : await prepareGroupReply(target.text);
 let sent;
 if (prepared.text.trim()) sent = await rest.createMessage(message.channel_id, prepared.text, target.messageId);
 if (prepared.files.length) sent = (await rest.createMessageWithFiles(message.channel_id, "", prepared.files)) ?? sent;
 if (!sent) continue;''')
-    content = once(content, 'participation.recordReply(message.channel_id, chunk, sent.id, message.author.id);', 'participation.recordReply(message.channel_id, target.text, sent.id, participation.replyPartner(target, message.author.id), target.messageId, index === 0);')
+    content = once(content, 'participation.recordReply(message.channel_id, chunk, sent.id, message.author.id);', 'participation.recordReply(message.channel_id, target.text, sent.id, participation.replyPartner(target, message.author.id), target.messageId, index === 0, naturalTicket);')
     content = once(content, 'return allowedUsers.length === 0 || allowedUsers.includes(message.author.id);', 'return true;')
     # 群聊自动开新会话时不发「(已自动新建会话 …)」：那是给管理用的讯息，群友不需要看到。
     content = once(content, 'const preamble = created && title !== void 0 ?', 'const preamble = this.config.preset !== "whale-social" && created && title !== void 0 ?')
-    # huanqi（换气）在回合结束后另开的补救轮：等它跑完，取回答时也算进去，补救的回答才传得到 Discord。
-    # 等回合有上限（预设 240 秒，DISCORD_TURN_DEADLINE_MS 可调）：超过就取消回合、停掉「正在输入」，
-    # 交给群聊行为处理用她的口气说一句。回合已经完整回答就不再等后面的补救轮（2026-11-28 事故）。
-    content = once(content, 'await agent.whenIdle();', '''const socialWait = await awaitSocialTurn(agent, messageId);
-this.log("info", `回合结束 #${messageId}：${Math.round(socialWait.elapsedMs / 1000)} 秒${socialWait.timedOut ? "，超过期限已取消" : ""}`);
-if (socialWait.timedOut) return { chunks: [TURN_DEADLINE_NOTICE], files: [] };''')
+    # 等这一轮（含 huanqi 补救轮）结束：绑这次送进 inbox 的讯息 id；回合已完整回答就不等补救轮、
+    # 顺手停掉它；到期限只取消属于自己的那一轮，回传固定提示，交给群聊行为处理说一句。
+    content = once(content, 'await agent.whenIdle();', WAIT)
+    for anchor, replacement in LIFECYCLE:
+        content = once(content, anchor, replacement)
     content = once(content, 'const reply = extractReply(events, promptSeq);', 'const reply = extractSocialReply(events, promptSeq);')
     # 频道白名单含 "*" 就是所有服务器的所有频道；私讯仍只收拥有者。
     content = once(content, 'if (!allowedChannels.includes(message.channel_id)) return false;', 'if (!allowedChannels.includes("*") && !allowedChannels.includes(message.channel_id)) return false;')
@@ -62,7 +117,7 @@ if (socialWait.timedOut) return { chunks: [TURN_DEADLINE_NOTICE], files: [] };''
     content = once(content, 'onReady: (ready) => {', 'onReady: (ready) => {\nregisterDiscordGateway(gateway);')
     content = once(content, 'intents: INTENTS.GUILDS | INTENTS.GUILD_MESSAGES', 'presence: () => socialPresence(),\n\t\t\t\tintents: INTENTS.GUILDS | INTENTS.GUILD_MESSAGES')
     content = once(content, 'intents: this.intents,', '...(this.options.presence?.() ? { presence: this.options.presence() } : {}),\n\t\t\t\tintents: this.intents,')
-    content = once(content, 'agent.followup(this.userMessage([{', 'prepareSocialTurn(agent, channelId, messageId);\nagent.followup(this.userMessage([{')
+    content = once(content, FOLLOWUP[0], 'prepareSocialTurn(agent, channelId, messageId);\n' + FOLLOWUP[1])
     content = once(content, 'const agent = await this.acquire(rawId);', 'if (this.config.preset === "whale-social") await assertGroupSession(this.ctx, rawId, this.config.cwd);\nconst agent = await this.acquire(rawId);')
     content = once(content, '.filter((header) => boundIds.has(header.id))', '.filter((header) => boundIds.has(header.id) && header.cwd === this.config.cwd)')
     content = once(content, 'const reply = await bridge.handle(command, message.channel_id, message.id,', 'const reply = await (message.guild_id === void 0 ? ownerBridge : bridge).handle(command, message.channel_id, message.id,')
@@ -75,7 +130,8 @@ if (!isSocialOwner(author.id)) {
     content = once(content, 'participation.interrupt(channelId, commandName);', 'if (!admitSocialMessage({ ...admission, id: interaction.id, content: "/" + commandName })) return;\nparticipation.interrupt(channelId, commandName);')
     start = content.index('const participation = new NaturalParticipation({')
     end = content.index('relay = new QuestionRelay({', start)
-    wrapper = '''registerDiscordRest(rest);
+    # 工具送讯记帐：包住交给 runtime 的 REST（桥接自己送讯仍用原本的 rest，另外凭 ticket 记）。
+    wrapper = TRACKED_REST[1] + '''
 const ownerBridge = new SessionBridge({
   ctx, host, store,
   config: { cwd: join(dirname(config.cwd), "owner"), preset: "whale-owner", titlePrefix: "[私人] ", maxChunksPerReply: config.maxChunksPerReply, maxUploadBytes: config.maxUploadBytes, uploadRoots: [], maxIncomingBytes: config.maxIncomingBytes },
@@ -93,7 +149,7 @@ const participation = new NaturalParticipation({
   seenImages: (message) => socialImageNotes(message),
   fetchRecent: (channelId, before) => rest.request("GET", `/channels/${channelId}/messages?limit=20&before=${before}`),
 });
-const onMessage = (message) => {
+''' + SUBSCRIBE + '''const onMessage = (message) => {
   // 原文帐本收全部：群聊、私讯、她自己发的，都在过滤之前记下。
   socialArchive("message", message);
   if (!isAllowed(message, botUserId, config.allowedUsers, config.allowedChannels)) return;
@@ -106,7 +162,7 @@ const onMessage = (message) => {
     if (await handleSocialControl(message, controlReply)) return;
     await participation.receive(message, { botUserId, botName: botLabel },
       (text, ticket) => deliverMessage({ ...message, content: text, attachments: [...(message.attachments ?? []), ...(message.referenced_message?.attachments ?? [])] }, ticket), controlReply);
-  })().catch((error) => logger.warn(`群聊行为处理未完成，保持安静 #${message.id}：${redactSecrets(String(error?.stack ?? error)).slice(0, 600)}`));
+  })()''' + MESSAGE_FAILED + ''';
 };
 const onMessageDelete = (data) => socialArchive("delete", data);
 const onMessageUpdate = (message) => {
@@ -121,7 +177,7 @@ const onMessageUpdate = (message) => {
   // 附件在原讯息时已经收过，编辑时不再下载。
   void participation.receiveEdit(message, { botUserId, botName: botLabel },
     (text, ticket) => deliverMessage({ ...message, content: text, attachments: [] }, ticket), controlReply)
-    .catch((error) => logger.warn(`编辑讯息处理未完成，保持安静 #${message.id}：${redactSecrets(String(error?.stack ?? error)).slice(0, 600)}`));
+    ''' + EDIT_FAILED + ''';
 };
 '''
     return content[:start] + wrapper + content[end:]

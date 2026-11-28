@@ -7,6 +7,7 @@ import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { savedPresence } from './discord-tools.mjs';
 import { currentRuntime } from './index.mjs';
+import { foldSocialReply } from './turn-guard.mjs';
 
 let toTaiwan;
 
@@ -203,120 +204,12 @@ export async function settleSocialTurn(agent, pause = (ms) => delay(ms)) {
 	}
 }
 
-// 一则 Discord 讯息的回合（含补救轮）最多等多久。超过就取消回合、停掉「正在输入」，
-// 由群聊行为处理用她的口气说一句。依 VM 上 626 轮的耗时：p95 45 秒、p99 226 秒，
-// 超过 240 秒的 6 轮都是 Krita 多步作画。240 秒也短于闸道 5 分钟的讯息效期，
-// 排在后面的那则 @ 轮到时还有效（2026-11-28 第二则 @ 就是排队过期被丢掉）。
-const DEFAULT_TURN_DEADLINE_MS = 240_000;
-export const TURN_DEADLINE_NOTICE =
-	'⚠️ 回合失败: 這一輪我做了太多步，先停一下；要繼續再叫我。';
+// 一轮的期限、取消、归帐与取回答在 turn-guard.mjs（桥接从这里一起汇入）。
+export * from './turn-guard.mjs';
 
-export function turnDeadlineMs(env = process.env) {
-	const value = Number(env.DISCORD_TURN_DEADLINE_MS);
-	return Number.isInteger(value) && value >= 30_000 && value <= 1_800_000
-		? value
-		: DEFAULT_TURN_DEADLINE_MS;
-}
-
-// 这则讯息的回合已经完整回答（正常结束且有文字）：后面排着的补救轮不必等，
-// 回答也不会被补救轮盖掉。
-function answeredTurn(events, messageId) {
-	const start = events.findIndex(
-		(event) =>
-			event.type === 'user/message' &&
-			sourceOf(event)?.discordMessageId === messageId,
-	);
-	if (start < 0) return false;
-	let text = '';
-	for (const event of events.slice(start + 1)) {
-		if (event.type === 'assistant/message')
-			text =
-				(event.data.message?.content ?? [])
-					.filter((block) => block.type === 'text')
-					.map((block) => block.text ?? '')
-					.join('') || text;
-		if (event.type === 'turn/end')
-			return event.data.reason?.kind === 'completed' && text.trim() !== '';
-	}
-	return false;
-}
-
-// 取代桥接原本的 `await agent.whenIdle()`：等回合与补救轮结束，但不超过期限。
-// 回合已经完整回答就不等后面的补救轮（whenIdle 要等补救轮也跑完）。
-export async function awaitSocialTurn(
-	agent,
-	messageId,
-	{
-		deadlineMs = turnDeadlineMs(),
-		pause = (ms) => delay(ms),
-		now = () => Date.now(),
-		poll = 500,
-	} = {},
-) {
-	const started = now();
-	let settled = false;
-	const done = Promise.resolve()
-		.then(() => agent.whenIdle())
-		.then(() => settleSocialTurn(agent, pause))
-		.finally(() => {
-			settled = true;
-		});
-	done.catch(() => {});
-	const events = () =>
-		agent.session?.snapshotEvents?.() ?? agent.session?.events ?? [];
-	for (;;) {
-		await Promise.race([done.catch(() => {}), pause(poll)]);
-		if (settled) {
-			await done;
-			return { timedOut: false, elapsedMs: now() - started };
-		}
-		if (answeredTurn(events(), messageId))
-			return { timedOut: false, elapsedMs: now() - started };
-		if (now() - started >= deadlineMs) break;
-	}
-	try {
-		agent.cancel({ kind: 'hook', reason: 'discord-turn-deadline' });
-	} catch {
-		/* 取消不了也照样回传超时，桥接会停掉「正在输入」。 */
-	}
-	// 取消后给一点时间收尾（写入 turn/end），不再无限等。
-	await Promise.race([done.catch(() => {}), pause(5_000)]);
-	return { timedOut: true, elapsedMs: now() - started };
-}
-
-// 与桥接的 extractReply 相同，但回合结束后紧接着是 huanqi 的补救讯息时继续往下收，
-// 取最后一则有文字的回答；碰到别的讯息（下一个人说话）就停。
-// 回合已经正常结束且有文字时不往下收：补救轮是回合内被截断的步骤排出来的，
-// 它的回答会盖掉真正的答案（2026-11-28 「畫好了」被换成不相干的「這個我不畫啦」）。
+// 与桥接的 extractReply 相同，但会把 huanqi 的补救轮算进去（见 foldSocialReply）。
 export function extractSocialReply(events, promptSeq) {
-	let text = '';
-	let reasonKind;
-	let errorMessage;
-	for (const event of events) {
-		if (event.seq < promptSeq) continue;
-		if (event.type === 'user/message' && event.seq > promptSeq) {
-			if (reasonKind === undefined) continue;
-			if (sourceOf(event)?.kind !== RESCUE) break;
-			if (reasonKind === 'completed' && text.trim() !== '') break;
-			reasonKind = undefined;
-			errorMessage = undefined;
-			continue;
-		}
-		if (reasonKind !== undefined) continue;
-		if (event.type === 'assistant/message') {
-			const joined = (event.data.message?.content ?? [])
-				.filter((block) => block.type === 'text')
-				.map((block) => block.text ?? '')
-				.join('');
-			if (joined !== '') text = joined;
-			continue;
-		}
-		if (event.type === 'turn/end') {
-			reasonKind = event.data.reason?.kind;
-			errorMessage = event.data.reason?.error?.message;
-		}
-	}
-	return { text, reasonKind, errorMessage };
+	return foldSocialReply(events, promptSeq);
 }
 
 // 闸道收到的每一则讯息、编辑、删除都进原文帐本（在任何过滤之前）；写不进去也不影响聊天。

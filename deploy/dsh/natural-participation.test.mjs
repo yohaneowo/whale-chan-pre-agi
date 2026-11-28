@@ -511,10 +511,19 @@ test('只回「我看看」就结束会自动再给一轮做完，正常回答�
 	const f = await fixture(t);
 	const replies = ['聽到了\n我看看家裡有沒有能開頻道的東西', '我再看看'];
 	const sent = [];
-	const deliver = async (text) => {
+	// 桥接凭 ticket 记帐：送出的这一段属于哪一则呼叫的哪一轮。
+	const deliver = async (text, ticket) => {
 		sent.push(text);
 		const reply = replies.shift() ?? '開好了';
-		f.participation.recordReply('room', reply, 'r' + sent.length, 'owner');
+		f.participation.recordReply(
+			'room',
+			reply,
+			'r' + sent.length,
+			'owner',
+			undefined,
+			true,
+			ticket,
+		);
 	};
 	await f.participation.receive(
 		message('小肥魚 開一個頻道給我看看'),
@@ -570,11 +579,20 @@ test('桥接的回合提示不发进群里；输出太长再给一轮精简，�
 	const run = async (outcomes) => {
 		const sent = [],
 			said = [];
-		const deliver = async (text) => {
+		const deliver = async (text, ticket) => {
 			sent.push(text);
 			const outcome = outcomes.shift();
-			if (outcome.startsWith('⚠️')) p.turnNotice('room', outcome);
-			else p.recordReply('room', outcome, 'r' + sent.length, 'owner');
+			if (outcome.startsWith('⚠️')) p.turnNotice('room', outcome, ticket);
+			else
+				p.recordReply(
+					'room',
+					outcome,
+					'r' + sent.length,
+					'owner',
+					undefined,
+					true,
+					ticket,
+				);
 		};
 		await p.receive(
 			message('鯨魚娘 把這張動圖每一幀都看'),
@@ -903,108 +921,350 @@ test('新会话清空暂存背景，管理操作使旧主动回复票据失效',
 	assert.equal(f.participation.canSend('room', ticket), false);
 });
 
-// 2026-11-28 事故重现：第一则 @ 的回合跑了七分多钟；第二则 @ 在桥接里按频道排队，
-// 轮到它时已经过期，桥接什么都没回（没有文字、没有提示）。原本两个回合共用
-// channel.turnReplies，先结束的那轮把它清掉，后结束的那轮读它就丢 TypeError，
-// 错误被吞掉，群里也没有任何回覆。
-test('连着 @ 两次：第一轮很久、第二轮被桥接丢掉，两则都不抛错，第二则补一句', async (t) => {
-	const f = await fixture(t);
-	const p = f.participation;
-	const logs = [];
-	p.log = (text) => logs.push(text);
-	const controls = [];
-	const controlReply = async (text) => {
-		controls.push(text);
-	};
-	// 桥接按频道串行：第二轮要等第一轮结束才开始。
+// 2026-11-28 事故与第 1 轮审查：每一则直接呼叫都要有正确的回应。
+// 假桥接照现行 release 的顺序：runPrompt 按频道串行（enqueuePrompt），送讯在串行之外（deliverMessage），
+// 每一段凭 ticket 记帐。turns 是每则讯息的剧本：chunks 是桥接回传的几段，sendDelay 让某段送得慢。
+function bridgeFor(p, turns, { channel = 'room', posted = [] } = {}) {
 	let chain = Promise.resolve();
-	let releaseFirst;
-	const firstGate = new Promise((resolve) => {
-		releaseFirst = resolve;
-	});
-	let calls = 0;
-	const deliver = () => {
-		const call = ++calls;
-		const run = chain.then(async () => {
-			if (call === 1) {
-				await firstGate;
-				p.recordReply('room', '這個我不畫啦', 'r1', 'owner');
-			}
-			// 第二轮：排队过期，桥接回传空结果，没有任何一段送出。
-		});
+	let sent = 0;
+	const deliver = async (text, ticket) => {
+		const key = [...text.matchAll(/KEY-(\w)/g)].at(-1)?.[1] ?? 'follow';
+		const script = turns[key] ?? turns.default;
+		const run = chain.then(() => script.run?.(ticket) ?? script);
 		chain = run.catch(() => {});
-		return run;
+		const reply = await run;
+		for (const [index, chunk] of reply.chunks.entries()) {
+			if (p.turnNotice(channel, chunk, ticket)) continue;
+			await reply.sendDelay?.();
+			posted.push({ key, chunk });
+			p.recordReply(
+				channel,
+				chunk,
+				'r' + ++sent,
+				'owner',
+				undefined,
+				index === 0,
+				ticket,
+			);
+		}
+		if (reply.files) p.recordFiles(channel, ticket, { id: 'f' + ++sent });
 	};
-	const first = p.receive(
-		message('<@123>', { mentions: [{ id: '123' }] }),
-		identity,
-		deliver,
-		controlReply,
-	);
-	const second = p.receive(
-		message('<@123>', { mentions: [{ id: '123' }] }),
-		identity,
-		deliver,
-		controlReply,
-	);
+	return { deliver, posted };
+}
+
+const gate = () => {
+	let open;
+	const promise = new Promise((resolve) => {
+		open = resolve;
+	});
+	return { promise, open };
+};
+
+async function directCalls(f, deliver, contents) {
+	const controls = [];
+	const logs = [];
+	f.participation.log = (text) => logs.push(text);
+	const calls = contents.map((content) => {
+		const input = message(content, { mentions: [{ id: '123' }] });
+		return f.participation
+			.receive(input, identity, deliver, async (text) => {
+				controls.push({ id: input.id, text });
+			})
+			.then(() => input.id);
+	});
+	return { ids: await Promise.all(calls), controls, logs };
+}
+
+const result = (logs, id) =>
+	logs.filter((line) => line.startsWith(`直接呼叫 结果 #${id} `));
+
+test('同频道 A 送讯慢、B 先送达：各记各的，两则都不补', async (t) => {
+	const f = await fixture(t);
+	const slow = gate();
+	const { deliver, posted } = bridgeFor(f.participation, {
+		A: { chunks: ['答覆A'], sendDelay: () => slow.promise },
+		B: { chunks: ['答覆B'] },
+	});
+	const pending = directCalls(f, deliver, [
+		'<@123> KEY-A 問題',
+		'<@123> KEY-B 問題',
+	]);
+	// B 先送达，A 才送出去。
 	await new Promise((resolve) => setImmediate(resolve));
-	releaseFirst();
-	const results = await Promise.allSettled([first, second]);
+	await new Promise((resolve) => setImmediate(resolve));
 	assert.deepEqual(
-		results.map((result) => result.status),
-		['fulfilled', 'fulfilled'],
-		results.map((result) => String(result.reason ?? '')).join(' / '),
+		posted.map((row) => row.chunk),
+		['答覆B'],
 	);
+	slow.open();
+	const { ids, controls, logs } = await pending;
+	assert.deepEqual(controls, [], 'B 的回覆不能被算成 A 的，B 也不能再收到备援');
+	for (const id of ids) {
+		assert.equal(result(logs, id).length, 1, '每则刚好一笔结果');
+		assert.match(result(logs, id)[0], /status=answered .*text=1 /);
+	}
+});
+
+test('单则 @ 模型正常结束但没正文、或回合被取消，都补一句（固定文字）', async (t) => {
+	for (const chunk of [
+		'(本回合没有文本回复)',
+		'⏹️ 回合被取消。',
+		'⚠️ 消息没有进入会话(可能被取消),请重试。',
+	]) {
+		const f = await fixture(t);
+		const { deliver } = bridgeFor(f.participation, {
+			default: { chunks: [chunk] },
+		});
+		const { ids, controls, logs } = await directCalls(f, deliver, [
+			'<@123> 畫一張',
+		]);
+		assert.deepEqual(
+			controls.map((row) => row.text),
+			['欸 我剛剛卡住了，你再說一次'],
+			chunk,
+		);
+		assert.match(result(logs, ids[0])[0], /status=fallback-sent /);
+	}
+});
+
+test('第二次呼叫不能压掉第一则的提示；控制讯息不算答覆', async (t) => {
+	const f = await fixture(t);
+	const first = gate();
+	const { deliver } = bridgeFor(f.participation, {
+		A: {
+			run: async () => (
+				await first.promise,
+				{ chunks: ['⚠️ 出错了: fetch failed'] }
+			),
+		},
+		B: { chunks: ['在'] },
+	});
+	const pending = directCalls(f, deliver, [
+		'<@123> KEY-A 畫一張',
+		'<@123> KEY-B 在嗎',
+	]);
+	await new Promise((resolve) => setImmediate(resolve));
+	// A 还没结束时频道里送了一则控制讯息（例如 /安静 的回覆）：不带 ticket，不算 A 的答覆。
+	f.participation.recordReply('room', '好，接下来 10 分钟不主动插话', 'c1');
+	first.open();
+	const { ids, controls, logs } = await pending;
+	assert.deepEqual(controls, [
+		{ id: ids[0], text: '欸 我剛剛卡住了，你再說一次' },
+	]);
+	assert.match(result(logs, ids[0])[0], /status=fallback-sent turn=error /);
+	assert.match(result(logs, ids[1])[0], /status=answered /);
+});
+
+test('结果在送出后于 finally 记一次：送出失败、处理丢错都有终态，日志不写内文', async (t) => {
+	const f = await fixture(t);
+	const logs = [];
+	f.participation.log = (text) => logs.push(text);
+	const input = message('<@123> 你好 PRIVATE', { mentions: [{ id: '123' }] });
+	// 补的那句送不出去：记 fallback-failed，不是「已补一句」。
+	await f.participation.receive(
+		input,
+		identity,
+		async () => {},
+		async () => {
+			throw new Error('送不出去 PRIVATE');
+		},
+	);
+	assert.match(result(logs, input.id)[0], /status=fallback-failed /);
+	// 桥接处理过程丢错：照样补一句、记终态，错误往上丢给桥接用 errorTrace 记。
+	const second = message('<@123> 再一次 PRIVATE', {
+		mentions: [{ id: '123' }],
+	});
+	const controls = [];
+	await assert.rejects(
+		f.participation.receive(
+			second,
+			identity,
+			async () => {
+				throw new Error('桥接坏了 PRIVATE');
+			},
+			async (text) => controls.push(text),
+		),
+	);
+	assert.deepEqual(controls, ['欸 我剛剛卡住了，你再說一次']);
+	assert.match(result(logs, second.id)[0], /status=thrown\+fallback-sent /);
+	// 用量到顶：回固定文字，日志只记代码。
+	const quota = message('<@123> 再來 PRIVATE', { mentions: [{ id: '123' }] });
+	const { deliver } = bridgeFor(f.participation, {
+		default: {
+			chunks: ['⚠️ 回合失败: 今天的模型用量先到这里 PRIVATE 偷渡的字'],
+		},
+	});
+	const said = [];
+	await f.participation.receive(quota, identity, deliver, async (text) =>
+		said.push(text),
+	);
+	assert.deepEqual(said, ['今天的模型用量先到这里，稍后再聊。']);
+	assert.match(result(logs, quota.id)[0], /status=notice-sent turn=quota /);
+	assert.ok(
+		logs.every((line) => !line.includes('PRIVATE')),
+		logs.join(' | '),
+	);
+	assert.equal(logs.filter((line) => line.includes('收到')).length, 3);
+});
+
+test('只 @ 她、没有内容：像人一样问一句，不交给模型；同一个人刚说了话就照常交给模型', async (t) => {
+	const f = await fixture(t, { decision: { speak: false, reason: '不用' } });
+	const logs = [];
+	f.participation.log = (text) => logs.push(text);
+	await f.receive(message('<@123>', { mentions: [{ id: '123' }] }));
+	assert.equal(
+		f.delivered.length,
+		0,
+		'不叫模型（模型会去翻旧上下文接着做以前的事）',
+	);
+	assert.equal(f.controls.length, 1);
+	assert.match(f.controls[0], /怎麼了/);
+	assert.ok(logs.some((line) => /status=bare-sent turn=bare/.test(line)));
+	// 她问了「怎麼了」：对方接着说就是对她说。
+	await f.receive(message('幫我查天氣'));
+	assert.equal(f.delivered.length, 1);
+	// 同一个人刚问了一句还没被回，接着 @ 她：是在催那句，交给模型。
+	f.advance(10 * 60_000);
+	await f.receive(
+		message('你覺得呢', { author: { id: 'friend', username: '阿明' } }),
+	);
+	await f.receive(
+		message('<@123>', {
+			author: { id: 'friend', username: '阿明' },
+			mentions: [{ id: '123' }],
+		}),
+	);
+	assert.equal(f.delivered.length, 2);
+	assert.ok(f.delivered[1].text.includes('你覺得呢'));
+	// 只叫名字、回覆她的讯息、附图，都照常交给模型。
+	await f.receive(message('小鯨魚'));
+	await f.receive(
+		message('<@123>', {
+			mentions: [{ id: '123' }],
+			attachments: [
+				{
+					filename: 'a.png',
+					content_type: 'image/png',
+					url: 'https://x/a.png',
+				},
+			],
+		}),
+	);
+	assert.equal(f.delivered.length, 4);
+});
+
+test('要做比较久的事：开始画图就先说一句；20 秒没动静也先说；已经有东西送达就不说', async (t) => {
+	const timers = [];
+	const f = await fixture(t);
+	f.participation.timer = (run, ms) => timers.push({ run, ms });
+	const drawing = gate();
+	const { deliver } = bridgeFor(f.participation, {
+		A: { run: async () => (await drawing.promise, { chunks: ['畫好了'] }) },
+		B: { run: async () => (await drawing.promise, { chunks: ['晴天'] }) },
+	});
+	const pending = directCalls(f, deliver, [
+		'<@123> KEY-A 畫貓',
+		'<@123> KEY-B 天氣',
+	]);
+	await new Promise((resolve) => setImmediate(resolve));
+	const [a, b] = [...f.participation.calls.values()];
+	// turn-guard 看到 A 的回合呼叫 Krita start：马上说「好，我畫一下」。
+	f.participation.turnEvent({
+		type: 'progress',
+		channelId: 'room',
+		messageId: a.messageId,
+		drawing: true,
+	});
+	f.participation.turnEvent({
+		type: 'progress',
+		channelId: 'room',
+		messageId: a.messageId,
+		drawing: true,
+	});
+	// B 的 20 秒计时到了：还没任何东西送达，说「等我一下」。
 	assert.deepEqual(
-		controls,
-		['欸 我剛剛卡住了，你再說一次'],
-		'最新那则 @ 没有任何输出时补一句，不能整个沉默',
+		timers.map((row) => row.ms),
+		[20_000, 20_000],
+	);
+	timers[1].run();
+	// 工具已经替 A 送出预览：A 的计时到了也不再说。
+	f.participation.recordToolMessage('room', a.messageId);
+	timers[0].run();
+	drawing.open();
+	const { controls, logs } = await pending;
+	await new Promise((resolve) => setImmediate(resolve));
+	// 先说的那句是控制讯息（不算答覆）；两则都有答覆，所以没有补「卡住了」。
+	assert.deepEqual(
+		controls.map((row) => row.text),
+		['好，我畫一下', '等我一下，我弄一下'],
+	);
+	assert.deepEqual(f.participation.calls.size, 0, '呼叫结束后纪录清掉');
+	assert.ok(
+		logs.some(
+			(line) =>
+				line === `直接呼叫 先说一句 #${a.messageId} kind=drawing status=sent`,
+		),
 	);
 	assert.ok(
-		logs.some((line) => /收到/.test(line)) &&
-			logs.some((line) => /没有任何输出/.test(line)),
-		'每则直接呼叫都留下收到与结果的日志：' + logs.join(' | '),
+		logs.some(
+			(line) =>
+				line === `直接呼叫 先说一句 #${b.messageId} kind=slow status=sent`,
+		),
+	);
+	assert.equal(
+		logs.filter((line) => line.includes('先说一句')).length,
+		2,
+		'每则最多一次',
+	);
+	assert.match(
+		result(logs, a.messageId)[0],
+		/status=answered .*tool=1 sendFail=0 preface=drawing /,
 	);
 });
 
-test('直接呼叫的回合有提示（没有文字、取消）或已经回话就不补；被新呼叫取代的也不补', async (t) => {
+test('工具送出的讯息（Krita 预览、discord_send_message）算这则呼叫的答覆', async (t) => {
 	const f = await fixture(t);
-	const p = f.participation;
-	const controls = [];
-	const controlReply = async (text) => {
-		controls.push(text);
-	};
-	const call = (deliver) =>
-		p.receive(
-			message('<@123> 畫一張', { mentions: [{ id: '123' }] }),
-			identity,
-			deliver,
-			controlReply,
-		);
-	await call(async () => {
-		p.turnNotice('room', '(本回合没有文本回复)');
+	const { deliver } = bridgeFor(f.participation, {
+		default: {
+			run: async (ticket) => {
+				f.participation.recordToolMessage('room', ticket.round.call.messageId);
+				return { chunks: ['(本回合没有文本回复)'] };
+			},
+		},
 	});
-	await call(async () => {
-		p.recordReply('room', '好', 'r1', 'owner');
-	});
-	assert.deepEqual(controls, [], '工具已经贴图（没有文字）或有回话都不补');
-	// 第一轮还没结束就有人再叫她：第一轮什么都没回也不补，由新的那轮回。
-	// 桥接按频道串行，新的那轮等旧的那轮结束才开始。
-	let release;
-	const gate = new Promise((resolve) => {
-		release = resolve;
-	});
-	const olderRun = gate;
-	const older = call(() => olderRun);
-	const newer = call(async () => {
-		await olderRun;
-		await Promise.resolve();
-		p.recordReply('room', '在', 'r2', 'owner');
-	});
-	await new Promise((resolve) => setImmediate(resolve));
-	release();
-	await Promise.all([older, newer]);
+	const { ids, controls, logs } = await directCalls(f, deliver, [
+		'<@123> 畫一張',
+	]);
 	assert.deepEqual(controls, []);
+	assert.match(result(logs, ids[0])[0], /status=answered turn=empty .*tool=1 /);
+});
+
+test('做了太多步（期限到）一定照实说；/stop 停掉的不补', async (t) => {
+	const f = await fixture(t);
+	const { deliver } = bridgeFor(f.participation, {
+		default: {
+			chunks: ['⚠️ 回合失败: 這一輪我做了太多步，先停一下；要繼續再叫我。'],
+		},
+	});
+	let r = await directCalls(f, deliver, ['<@123> 畫大圖']);
+	assert.deepEqual(
+		r.controls.map((row) => row.text),
+		['這一輪我做了太多步，先停一下；要繼續再叫我。'],
+	);
+	assert.match(result(r.logs, r.ids[0])[0], /status=notice-sent turn=steps /);
+	const stopped = gate();
+	const bridge = bridgeFor(f.participation, {
+		default: {
+			run: async () => (await stopped.promise, { chunks: ['⏹️ 回合被取消。'] }),
+		},
+	});
+	const pending = directCalls(f, bridge.deliver, ['<@123> 做很久的事']);
+	await new Promise((resolve) => setImmediate(resolve));
+	f.participation.interrupt('room', 'stop');
+	stopped.open();
+	r = await pending;
+	assert.deepEqual(r.controls, []);
+	assert.match(result(r.logs, r.ids[0])[0], /status=stopped /);
 });
 
 test('私讯的直接呼叫没有任何输出也补一句', async (t) => {

@@ -3188,82 +3188,225 @@ test('回合已经有完整回答时，之后的换气补救轮不能盖掉它',
 	assert.equal(extractSocialReply(events, 1).text, '好啦畫好了，脖子拉短了。');
 });
 
-test('等回合有上限：超过期限就取消、回传超时；有完整回答就不再等补救轮', async () => {
-	const { awaitSocialTurn, TURN_DEADLINE_NOTICE } =
-		await import('./bridge.mjs');
-	const { user, said, end } = turnEvents();
-	let clock = 0;
-	const pause = async (ms) => {
-		clock += ms;
-	};
-	// 一直没结束的回合：到期限取消，取消后才 idle。
-	const live = [user(1, { kind: 'user', discordMessageId: 'm1' })];
-	let cancelled;
-	let idle;
-	const idlePromise = new Promise((resolve) => {
-		idle = resolve;
-	});
-	const stuck = {
-		session: { snapshotEvents: () => live },
-		whenIdle: () => idlePromise,
-		cancel: (cause) => {
-			cancelled = cause;
-			live.push(end(2, 'cancelled'));
-			idle();
-		},
-	};
-	const outcome = await awaitSocialTurn(stuck, 'm1', {
-		deadlineMs: 240_000,
-		pause,
-		now: () => clock,
-	});
-	assert.equal(outcome.timedOut, true);
-	assert.ok(cancelled, '超时要取消回合');
-	assert.ok(clock >= 240_000 && clock < 260_000, `在期限附近取消：${clock}`);
-	assert.match(TURN_DEADLINE_NOTICE, /^⚠️ 回合失败: 這一輪我做了太多步/);
-
-	// 回合已经完整回答，后面还排着补救轮：不必等 whenIdle（它要等补救轮跑完）。
-	clock = 0;
-	const answered = [
-		user(1, { kind: 'user', discordMessageId: 'm2' }),
-		said(2, '好啦畫好了'),
-		end(3),
-		user(4, { kind: 'loop-guard' }),
-	];
-	const busy = {
-		session: { snapshotEvents: () => answered },
-		whenIdle: () => new Promise(() => {}),
-		cancel: () => assert.fail('有回答就不取消'),
-	};
-	const quick = await awaitSocialTurn(busy, 'm2', {
-		deadlineMs: 240_000,
-		pause,
-		now: () => clock,
-	});
-	assert.equal(quick.timedOut, false);
-	assert.ok(clock < 5_000, `有回答就回传：${clock}`);
-
-	// 正常回合：whenIdle 结束就回传，不取消。
-	clock = 0;
-	const normal = [user(1, { kind: 'user', discordMessageId: 'm3' })];
-	const ok = await awaitSocialTurn(
-		{
-			session: { snapshotEvents: () => normal },
-			whenIdle: async () => {
-				normal.push(said(2, ''), end(3));
+// 假会话：events 是事件档，inbox 里是还没开始的讯息；cancel 记下理由与是否保留 inbox。
+const fakeAgent = (events, { idle = new Promise(() => {}), inbox = [] } = {}) => {
+	const agent = {
+		events,
+		cancels: [],
+		session: { snapshotEvents: () => events },
+		whenIdle: () => idle,
+		inbox: {
+			nextTurn: inbox,
+			nextStep: [],
+			remove: (id) => {
+				const index = inbox.findIndex((message) => message.id === id);
+				if (index >= 0) inbox.splice(index, 1);
+				return index >= 0;
 			},
-			cancel: () => assert.fail('正常回合不取消'),
 		},
-		'm3',
-		{ deadlineMs: 240_000, pause, now: () => clock },
-	);
-	assert.equal(ok.timedOut, false);
+		cancel: (cause, options = {}) => agent.cancels.push({ reason: cause.reason, keepInbox: Boolean(options.keepInbox) }),
+	};
+	return agent;
+};
+const prompt = (id, discordMessageId = 'm1') => ({
+	id,
+	source: { kind: 'user', discordMessageId, discordChannelId: 'c1' },
+});
+const asked = (seq, message) => ({ seq, type: 'user/message', data: message });
+const fakeClock = () => {
+	let clock = 0;
+	return {
+		pause: async (ms) => {
+			clock += ms;
+		},
+		now: () => clock,
+		get value() {
+			return clock;
+		},
+	};
+};
+
+test('到期限只取消属于自己的那一轮（保留 inbox）；正在跑的是别人的回合就不取消', async () => {
+	const { awaitSocialTurn } = await import('./bridge.mjs');
+	const { said, end } = turnEvents();
+	const mine = prompt('p1');
+	let clock = fakeClock();
+	const stuck = fakeAgent([{ seq: 1, type: 'turn/start' }, asked(2, mine)], {
+		inbox: [{ id: 'other', source: { kind: 'heartbeat' } }],
+	});
+	let outcome = await awaitSocialTurn(stuck, mine, { deadlineMs: 280_000, ...clock });
+	assert.equal(outcome.timedOut, true);
+	assert.deepEqual(stuck.cancels, [{ reason: 'discord-turn-deadline', keepInbox: true }]);
+	assert.deepEqual(stuck.inbox.nextTurn.map((message) => message.id), ['other'], '别人的 inbox 不动');
+	assert.ok(clock.value >= 280_000 && clock.value < 290_000, `在期限附近取消：${clock.value}`);
+	assert.equal(outcome.status, 'deadline-unsettled', '取消后 5 秒没收尾就照实说');
+
+	// 自己的回合已经结束，现在跑的是心跳（别人）的回合：只把自己还排着的补救讯息拿掉，不取消。
+	clock = fakeClock();
+	const foreign = fakeAgent([
+		asked(1, mine),
+		said(2, ''),
+		end(3, 'error'),
+		{ seq: 4, type: 'turn/start' },
+		asked(5, { id: 'hb', source: { kind: 'heartbeat' } }),
+	]);
+	outcome = await awaitSocialTurn(foreign, mine, { deadlineMs: 280_000, ...clock });
+	assert.equal(outcome.status, 'deadline-not-owner');
+	assert.deepEqual(foreign.cancels, []);
+
+	// 还没轮到自己（排在别人后面）：从 inbox 拿掉自己，不取消别人。
+	clock = fakeClock();
+	const queued = fakeAgent([{ seq: 1, type: 'turn/start' }, asked(2, { id: 'hb', source: { kind: 'heartbeat' } })], {
+		inbox: [mine],
+	});
+	outcome = await awaitSocialTurn(queued, mine, { deadlineMs: 280_000, ...clock });
+	assert.equal(outcome.status, 'deadline-not-entered');
+	assert.deepEqual(queued.cancels, []);
+	assert.deepEqual(queued.inbox.nextTurn, []);
 });
 
-test('回合期限可用环境变数调整，格式不对用预设', async () => {
-	const { turnDeadlineMs } = await import('./bridge.mjs');
-	assert.equal(turnDeadlineMs({}), 240_000);
+test('回合已经完整回答：不等补救轮，并停掉它（排着的移掉、在跑的取消，保留 inbox）', async () => {
+	const { awaitSocialTurn } = await import('./bridge.mjs');
+	const { said, end } = turnEvents();
+	const mine = prompt('p1');
+	const clock = fakeClock();
+	const rescue = { id: 'r2', source: { kind: 'loop-guard' } };
+	const agent = fakeAgent(
+		[
+			asked(1, mine),
+			said(2, '好啦畫好了'),
+			end(3),
+			{ seq: 4, type: 'turn/start' },
+			asked(5, { id: 'r1', source: { kind: 'loop-guard' } }),
+		],
+		{ inbox: [rescue, { id: 'other', source: { kind: 'user' } }] },
+	);
+	const outcome = await awaitSocialTurn(agent, mine, { deadlineMs: 280_000, ...clock });
+	assert.equal(outcome.timedOut, false);
+	assert.equal(outcome.status, 'answered');
+	assert.ok(clock.value < 5_000, `有回答就回传：${clock.value}`);
+	assert.deepEqual(agent.cancels, [{ reason: 'discord-turn-answered', keepInbox: true }]);
+	assert.deepEqual(agent.inbox.nextTurn.map((message) => message.id), ['other']);
+});
+
+test('自动续做重用同一个 Discord ID：等待与取回答都只认这次送进 inbox 的讯息', async () => {
+	const { awaitSocialTurn, socialPromptSeq } = await import('./bridge.mjs');
+	const { said, end } = turnEvents();
+	const first = prompt('p1');
+	const second = prompt('p2');
+	const events = [asked(1, first), said(2, '我查一下'), end(3)];
+	let idle;
+	const agent = fakeAgent(events, { idle: new Promise((resolve) => (idle = resolve)) });
+	const clock = fakeClock();
+	let polls = 0;
+	const waiting = awaitSocialTurn(agent, second, {
+		deadlineMs: 280_000,
+		now: clock.now,
+		pause: async (ms) => {
+			await clock.pause(ms);
+			// 第二轮几秒后才进事件档、再几秒才回答。
+			if (++polls === 6) events.push(asked(4, second));
+			if (polls === 12) {
+				events.push(said(5, '查到了'), end(6));
+				idle();
+			}
+		},
+	});
+	const outcome = await waiting;
+	assert.equal(outcome.status, 'answered');
+	assert.ok(polls >= 12, '上一轮的回答不能让这一轮提早回传');
+	assert.equal(socialPromptSeq(events, second), 4);
+	assert.equal(socialPromptSeq(events, prompt('never')), undefined, '没进会话就是没进，不拿旧的那轮');
+});
+
+test('runSocialTurn：「正在输入」任何情况都熄灯，期限到了不等卡住的 I/O', async () => {
+	const { runSocialTurn, socialBounded, TURN_DEADLINE_NOTICE, activeSocialTurn, trackSocialSends } =
+		await import('./bridge.mjs');
+	const timers = [];
+	const timer = (run, ms) => {
+		const row = { run, ms, cleared: false };
+		timers.push(row);
+		return () => {
+			row.cleared = true;
+		};
+	};
+	let lit = 0;
+	const beginTyping = () => {
+		lit++;
+		return () => lit--;
+	};
+	// 卡住的附件下载：期限一到先熄灯，再给一点时间收尾，还不回来就回传超时提示。
+	let body;
+	const running = runSocialTurn({ channelId: 'c1', messageId: 'm1', beginTyping, deadlineMs: 280_000, timer }, (budget) => {
+		body = budget;
+		budget.beginTyping();
+		budget.beginTyping();
+		return socialBounded(new Promise(() => {}), budget.signal, 'gave-up').then(() => new Promise(() => {}));
+	});
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(lit, 1, '只亮一次');
+	assert.equal(activeSocialTurn('c1'), 'm1');
+	timers[0].run();
+	assert.equal(lit, 0, '期限到就熄灯');
+	assert.equal(body.signal.aborted, true);
+	timers[1].run();
+	const outcome = await running;
+	assert.deepEqual(outcome.chunks, [TURN_DEADLINE_NOTICE]);
+	assert.equal(activeSocialTurn('c1'), undefined);
+
+	// 正常结束：回传本体的结果，计时器清掉，灯熄掉；本体丢错也一样熄灯。
+	timers.length = 0;
+	const ok = await runSocialTurn({ channelId: 'c1', messageId: 'm2', beginTyping, timer }, async (budget) => {
+		budget.beginTyping();
+		return { chunks: ['好'], files: [] };
+	});
+	assert.deepEqual(ok.chunks, ['好']);
+	assert.equal(lit, 0);
+	assert.equal(timers[0].cleared, true);
+	await assert.rejects(
+		runSocialTurn({ channelId: 'c1', messageId: 'm3', beginTyping, timer }, async (budget) => {
+			budget.beginTyping();
+			throw new Error('坏了');
+		}),
+	);
+	assert.equal(lit, 0);
+
+	// 工具送讯记到此刻正在跑的那则讯息名下；别的频道、没在跑的都不记。
+	const sent = [];
+	const rest = trackSocialSends(
+		{ request: async (method, path) => ({ id: path.includes('typing') ? undefined : 's1' }) },
+		(channelId, messageId, id) => sent.push([channelId, messageId, id]),
+	);
+	await runSocialTurn({ channelId: '42', messageId: 'm4', beginTyping, timer }, async () => {
+		await rest.request('POST', '/channels/42/messages', {});
+		await rest.request('POST', '/channels/43/messages', {});
+		await rest.request('POST', '/channels/42/typing');
+		return { chunks: [], files: [] };
+	});
+	await rest.request('POST', '/channels/42/messages', {});
+	assert.deepEqual(sent, [['42', 'm4', 's1']]);
+});
+
+test('errorTrace 只留错误类别、状态码与堆疊位置，不带错误内文', async () => {
+	const { errorTrace } = await import('./bridge.mjs');
+	const error = new Error('私讯内容 PRIVATE 不能进日志');
+	error.stack = 'Error: 私讯内容 PRIVATE\n    at deliver (file:///opt/dsh/lib/index.js:2366:9)\n    at eval (eval at x, <anonymous>:1:1)\n    at async Promise.all (index 0)';
+	assert.equal(errorTrace(error), 'Error | deliver@index.js:2366');
+	assert.equal(
+		errorTrace(new Error('discord REST POST /channels/1/messages failed: 403 {"message":"PRIVATE"}')).split(' | ')[0],
+		'Error 403',
+	);
+	assert.equal(errorTrace('PRIVATE'), 'Error');
+	assert.ok(!errorTrace(Object.assign(new TypeError('x'), { name: 'PRIVATE 名字' })).includes('PRIVATE'));
+});
+
+test('回合期限预设 280 秒，可用环境变数调整，格式不对用预设', async () => {
+	const { turnDeadlineMs, TURN_DEADLINE_NOTICE, TURN_STEPS_TEXT: steps } = await import('./bridge.mjs');
+	assert.equal(turnDeadlineMs({}), 280_000);
 	assert.equal(turnDeadlineMs({ DISCORD_TURN_DEADLINE_MS: '90000' }), 90_000);
-	assert.equal(turnDeadlineMs({ DISCORD_TURN_DEADLINE_MS: 'abc' }), 240_000);
-	assert.equal(turnDeadlineMs({ DISCORD_TURN_DEADLINE_MS: '5' }), 240_000);
+	assert.equal(turnDeadlineMs({ DISCORD_TURN_DEADLINE_MS: 'abc' }), 280_000);
+	assert.equal(turnDeadlineMs({ DISCORD_TURN_DEADLINE_MS: '5' }), 280_000);
+	assert.equal(steps, TURN_STEPS_TEXT, '与 runtime 的「做了太多步」同一句');
+	assert.equal(TURN_DEADLINE_NOTICE, '⚠️ 回合失败: ' + TURN_STEPS_TEXT);
 });

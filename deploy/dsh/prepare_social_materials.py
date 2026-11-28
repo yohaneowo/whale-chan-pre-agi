@@ -39,7 +39,7 @@ def prepare(fish, persona, target, opencc):
     social = target / "social-0.1.50"
     social.mkdir(exist_ok=True)
     source = pathlib.Path(__file__).resolve().parents[1] / "social"
-    for name in ("package.json", "cordis.patch.yml", "index.mjs", "bridge.mjs", "ledger.mjs", "memory.mjs", "discord-tools.mjs", "notes.mjs", "archive.mjs", "spend.mjs", "chat-tools.mjs", "gif-tools.mjs", "image-memory.mjs", "balance-tool.mjs", "meme-library.mjs","compaction.mjs", "compaction-label.mjs", "doctor.mjs", "usage-log.mjs", "feedings.mjs"):
+    for name in ("package.json", "cordis.patch.yml", "index.mjs", "bridge.mjs", "ledger.mjs", "memory.mjs", "discord-tools.mjs", "notes.mjs", "archive.mjs", "spend.mjs", "chat-tools.mjs", "gif-tools.mjs", "image-memory.mjs", "balance-tool.mjs", "meme-library.mjs","compaction.mjs", "compaction-label.mjs", "doctor.mjs", "usage-log.mjs", "feedings.mjs", "turn-guard.mjs"):
         shutil.copyfile(source / name, social / name)
     # 繁简转换只取单一 ESM 档，连同 MIT／Apache-2.0 授权一起放进私人 VM 材料。
     opencc_package = strict_json((opencc / "package.json").read_bytes())
