@@ -39,18 +39,19 @@
 3. **本机验收**：
 
    ```sh
-   node deploy/dsh/typing-hang-repro.mjs --release rel          # 移植后：32 项全部通过，代码 0
-   node deploy/dsh/typing-hang-repro.mjs --release rel-原样副本  # 现行版本：32 项失败，代码 1
+   node deploy/dsh/typing-hang-repro.mjs --release rel          # 移植后：33 项全部通过，代码 0
+   node deploy/dsh/typing-hang-repro.mjs --release rel-原样副本  # 现行版本：32 项失败（宿主规则那项通过），代码 1
    DSH_RELEASE_COPY=rel-原样副本 python -m unittest discover -s deploy/dsh -p test_port_typing_fix.py
    ```
 
    `typing-hang-repro.mjs` 拿副本里真正的 `enqueuePrompt`／`runPrompt`／`saveIncoming`／`commandStop`、`DiscordRest`、`beginTypingFor` 与 `deliverMessage`，接上副本的群聊行为处理、turn-guard 与画室（真的 `Studio`／`connectStudio`／`draw_request`，画室会话是假的），用假 Discord、假模型、假时钟跑，逐则讯息 ID 判定「每一则 @ 都有正确、及时的回应」。情境包括：事故当天的时间线、画图期间同频道另一则 @、第二张排队、画室失败与超时、交给画室后没说话、A 送讯慢 B 先到、A 的工具讯息在 B 那轮才送达、A 被放弃后才收尾、附件卡住／失败／下载中 /stop、flush 卡住、自动续做（含不重新计时）、20 秒先说一句、到期限后排队的 @、答完停掉补救轮、送讯出错、贴图上传失败、/stop、只 @ 的四种误判、typing 被限流；第 3 轮审查加的：画室补的那句一直送不出去、请求讯息被删（用副本真的 `onMessageDelete` 与 `noteSocialStudioDeleted`）、A 的工具跨轮才发出且没挂回复。
 
-   另外 4 项直接用副本真的 social runtime（`index.mjs`）跑：群聊画室不带私讯记忆与拥有者人物卡（合成一段私讯记忆和人物卡上的私下条目，最坏的模型把看到的全部贴出来，上下文与输出都不能有那段字）；请求被删时真的 `krita_batch` 交付与画室补的那句（真的 `DiscordRest`，假 fetch 照 Discord 的 `fail_if_not_exists` 规则）都不掉成一般群讯；画室会话在 `groupTools=chat` 与 `full` 都能用 `krita_batch`、聊天会话都不能；`sendOrigin` 与 apply 里每个工具都包了送讯来源。
+   另外 5 项直接用副本真的 social runtime（`index.mjs`）跑。第一项照正式宿主（dsh-tools、dsh-system-prompt）的规则（`deploy/social/host-contract.mjs`，照宿主的错误讯息自己写的，不含宿主原始码）：release 里全部工具都要能登记（要有 `output { schema, render }`、output schema 只能用 type/oneOf/properties/required/additionalProperties/items/enum/const 加注解、`timeoutMs` 是正数），挂上聊天与画室会话时 `tools.restrict` 只能点名已登记的全域工具、`presentAs` 每个作用域一次、系统提示段落 order 是有限数且同名不重复、没有没登记的 `{{变数}}`，`draw_request` 的回传值要合 output schema。2026-11-28 第一次部署时宿主就是因为 `draw_request` 少了 output 拒绝整个 social runtime（只连得上闸道，不会回话），假宿主没抓到；其余检查也都改用这套规则。其余 4 项：群聊画室不带私讯记忆与拥有者人物卡（合成一段私讯记忆和人物卡上的私下条目，最坏的模型把看到的全部贴出来，上下文与输出都不能有那段字）；请求被删时真的 `krita_batch` 交付与画室补的那句（真的 `DiscordRest`，假 fetch 照 Discord 的 `fail_if_not_exists` 规则）都不掉成一般群讯；画室会话在 `groupTools=chat` 与 `full` 都能用 `krita_batch`、聊天会话都不能；`sendOrigin` 与 apply 里每个工具都包了送讯来源。
 
-4. **部署（要主人同意才做）**：在 VM 上把现行 release 目录复制成新的 release（名字带日期，例如 `…-studio-1128`），用第 2 步的 7 个档案替换／新增到新 release 里对应的位置，`node --check` 这 7 个档案，再把 `current` 指到新 release、重启 `dsh.service`。回滚就是把 `current` 指回原本的 release 再重启。
-5. **设定（可不设）**：`DISCORD_TURN_DEADLINE_MS`（聊天回合，预设 280000，30 秒～30 分钟）；`DISCORD_DRAW_DEADLINE_MS`（一张图，预设 600000，1～60 分钟）；`SLOW_TURN_NOTICE_SECONDS`（预设 20）。
-6. **真频道验收（要主人同意才做）**：在测试频道请她画一张，画的期间另一个人 @ 她聊天，再请第三个人也画一张。`journalctl -u dsh.service | grep -E '直接呼叫|畫室'`：每一则 @ 都要有「收到 #ID」与「结果 #ID status=…」；画图那则 status 是 `answered` 或 `draw-ack-sent`，画室有「畫室 收到／开始／结果 #ID status=delivered」；第二张是 `status=queued`。「正在输入」只在聊天回合那几秒亮。日志里不能出现任何讯息内文。另外请人画到一半把请求那则删掉：群里不能出现那张图或「卡住了」，日志有 `畫室 结果 #ID status=deleted`。正式环境是 `groupTools: full`（2026-11-28 唯读确认），要看画室真的叫得动 `krita_batch`。
+4. **真宿主启动（部署前）**：在 VM 上用 nobody 身分、临时目录、另一个连接埠、没有 Discord token 与模型金钥，把新 release 的副本走真的 `trusted-entry.mjs` 启动一次（设定里所有正式路径与 socket 都换成临时目录），日志不能有 `entry did not activate` 或任何注册错误；再用一个只在沙盒载入的探针外挂，以真宿主的 `agents.create` 建聊天会话、送一则讯息（要走到组系统提示，只因没有金钥而停），并走真的 `connectStudio`／`studio.request` 让宿主建出画室会话。
+5. **部署（要主人同意才做）**：在 VM 上把现行 release 目录复制成新的 release（名字带日期，例如 `…-studio-1128`），用第 2 步的 7 个档案替换／新增到新 release 里对应的位置，`node --check` 这 7 个档案，再把 `current` 指到新 release、重启 `dsh.service`。回滚就是把 `current` 指回原本的 release 再重启。
+6. **设定（可不设）**：`DISCORD_TURN_DEADLINE_MS`（聊天回合，预设 280000，30 秒～30 分钟）；`DISCORD_DRAW_DEADLINE_MS`（一张图，预设 600000，1～60 分钟）；`SLOW_TURN_NOTICE_SECONDS`（预设 20）。
+7. **真频道验收（要主人同意才做）**：在测试频道请她画一张，画的期间另一个人 @ 她聊天，再请第三个人也画一张。`journalctl -u dsh.service | grep -E '直接呼叫|畫室'`：每一则 @ 都要有「收到 #ID」与「结果 #ID status=…」；画图那则 status 是 `answered` 或 `draw-ack-sent`，画室有「畫室 收到／开始／结果 #ID status=delivered」；第二张是 `status=queued`。「正在输入」只在聊天回合那几秒亮。日志里不能出现任何讯息内文。另外请人画到一半把请求那则删掉：群里不能出现那张图或「卡住了」，日志有 `畫室 结果 #ID status=deleted`。正式环境是 `groupTools: full`（2026-11-28 唯读确认），要看画室真的叫得动 `krita_batch`。
 
 ## 版本相依
 

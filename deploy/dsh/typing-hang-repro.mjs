@@ -21,7 +21,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import process from 'node:process';
 import { mock } from 'node:test';
-import { pathToFileURL } from 'node:url';
+import { URL, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
 const { values } = parseArgs({
@@ -155,6 +155,10 @@ if (!patched) {
 }
 const { NaturalParticipation, naturalConfig } = await import(
 	pathToFileURL(join(plugin, 'natural-participation.mjs')).href
+);
+// 照正式 DSH 宿主规则检查工具定义与会话作用域（测试用，不含宿主原始码）。
+const contract = await import(
+	new URL('../social/host-contract.mjs', import.meta.url).href
 );
 const { GatewayScopes } = await import(
 	pathToFileURL(join(plugin, 'gateway-scopes.mjs')).href
@@ -1662,10 +1666,55 @@ async function realRuntime(groupTools) {
 		},
 		engine,
 	);
+	// 照正式宿主的规则登记 release 里的全部工具（跟 index.mjs 的 apply 同一份清单、同样包上送讯来源）：
+	// 少了 output、output schema 用了宿主不支援的关键字、timeoutMs 不对，这里就会丢错。
+	currentHost = contract.hostTools();
+	for (const tool of await releaseTools(runtime))
+		currentHost.register(
+			guard.socialSendOriginTool
+				? guard.socialSendOriginTool(tool, () => undefined)
+				: tool,
+		);
 	return {
 		runtime,
+		host: currentHost,
 		cleanup: () => rmSync(stateRoot, { recursive: true, force: true }),
 	};
+}
+// 照宿主规则检查的工具登记处（realRuntime 建的那一个）；runtimeAgent 的 tools／systemPrompt 从它来。
+let currentHost;
+async function releaseTools(runtime) {
+	const load = (file) => import(pathToFileURL(join(runtimeDir, file)).href);
+	const [
+		{ kritaTools },
+		{ discordTools },
+		{ chatTools },
+		{ gifTools },
+		{ balanceTools },
+	] = await Promise.all(
+		[
+			'krita-tools.mjs',
+			'discord-tools.mjs',
+			'chat-tools.mjs',
+			'gif-tools.mjs',
+			'balance-tool.mjs',
+		].map(load),
+	);
+	return [
+		runtime.rememberTool(),
+		...kritaTools(runtime),
+		...(studioModule?.drawRequestTool
+			? [studioModule.drawRequestTool(runtime)]
+			: []),
+		...discordTools(
+			runtime,
+			async (text) => text,
+			(text) => text,
+		),
+		...chatTools(runtime),
+		...gifTools(runtime),
+		...balanceTools(runtime),
+	];
 }
 // 挂在真 runtime 上的假会话：记下系统提示的每一段、工具清单、inbox 监听；followup 跑 model。
 function runtimeAgent(id, { cwd = '/srv/dsh/discord', model } = {}) {
@@ -1679,16 +1728,6 @@ function runtimeAgent(id, { cwd = '/srv/dsh/discord', model } = {}) {
 		inbox: { nextTurn: [], nextStep: [], remove: () => false },
 		session: { id, header: { cwd }, snapshotEvents: () => agent.events },
 		ctx: {
-			tools: {
-				restrict: ({ allow }) => {
-					agent.allowed = allow;
-				},
-				presentAs: () => {},
-			},
-			systemPrompt: {
-				context: (row) => agent.contexts.push(row),
-				section: (row) => agent.contexts.push(row),
-			},
 			on: (name, listener) => agent.listeners.set(name, listener),
 		},
 		push(type, data) {
@@ -1712,6 +1751,10 @@ function runtimeAgent(id, { cwd = '/srv/dsh/discord', model } = {}) {
 		whenIdle: () => agent.activity,
 		cancel() {},
 	};
+	// 会话作用域：restrict 只能点名已登记的全域工具、presentAs 只能一次、提示段落照宿主规则检查。
+	agent.host = currentHost.scoped(agent);
+	agent.ctx.tools = agent.host.tools;
+	agent.ctx.systemPrompt = agent.host.systemPrompt;
 	return agent;
 }
 const userTurn = (agent, messageId, text = '畫') => {
@@ -2073,7 +2116,78 @@ async function sendOriginCheck() {
 	return problems;
 }
 
+// 5. 照正式宿主的规则：登记全部工具、挂上聊天与画室会话、组出系统提示、跑一次 draw_request，都不能丢错。
+// （2026-11-28 第一次部署时，宿主因为 draw_request 没有 output 拒绝了整个 social runtime；假宿主没抓到。）
+async function hostContractCheck() {
+	const problems = [];
+	for (const mode of ['chat', 'full']) {
+		let built;
+		try {
+			built = await realRuntime(mode);
+		} catch (error) {
+			problems.push(
+				`groupTools=${mode}：照宿主规则登记工具失败：${String(error?.message ?? error).slice(0, 160)}`,
+			);
+			continue;
+		}
+		const { runtime, host, cleanup } = built;
+		try {
+			const chat = runtimeAgent('session-chat');
+			const studioAgent = runtimeAgent('session-studio-host');
+			runtime.studios?.set(studioAgent.id, chat.id);
+			const messageId = admitted(runtime);
+			userTurn(chat, messageId);
+			for (const agent of [chat, studioAgent]) {
+				try {
+					runtime.mount(agent);
+					runtime.mount(agent);
+					runtime.prepare(agent, CHANNEL, messageId);
+					agent.host.systemPrompt.assemble();
+				} catch (error) {
+					problems.push(
+						`groupTools=${mode}：${agent.id} 挂载或组系统提示时宿主会丢错：${String(error?.message ?? error).slice(0, 160)}`,
+					);
+				}
+			}
+			if (patched) {
+				const studioTools = studioAgent.host.tools.visible();
+				if (JSON.stringify(studioTools) !== '["krita_batch"]')
+					problems.push(
+						`groupTools=${mode}：宿主算出来画室会话看得到 ${studioTools.join('、')}`,
+					);
+				if (!chat.host.tools.visible().includes('draw_request'))
+					problems.push(`groupTools=${mode}：聊天会话看不到 draw_request`);
+				const definition = host.tools.get('draw_request');
+				for (const args of [
+					{ action: 'status' },
+					{ action: 'start', brief: '畫一隻貓' },
+				]) {
+					try {
+						contract.checkToolResult(
+							definition,
+							args,
+							await definition.execute(args, { agent: chat }),
+						);
+					} catch (error) {
+						problems.push(
+							`groupTools=${mode}：draw_request ${args.action} 的回传值宿主不收：${String(error?.message ?? error).slice(0, 160)}`,
+						);
+					}
+				}
+			}
+		} finally {
+			runtime.studio?.stop?.();
+			cleanup();
+		}
+	}
+	return problems;
+}
+
 const runtimeChecks = [
+	{
+		name: '照正式宿主规则登记全部工具、挂上聊天与画室会话、组系统提示（不丢错）',
+		run: hostContractCheck,
+	},
 	{
 		name: '群聊画室不带私讯记忆与拥有者人物卡（上下文与输出）',
 		run: studioPrivacy,

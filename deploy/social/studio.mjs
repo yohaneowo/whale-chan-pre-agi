@@ -416,6 +416,16 @@ export function drawRequestTool(runtime) {
 			required: ['action'],
 			additionalProperties: false,
 		},
+		// 宿主规定每个工具都要声明 output（没有就整个外挂启用失败）；回传值照这个 schema 验。
+		output: {
+			schema: {
+				type: 'object',
+				properties: { ok: { type: 'boolean' }, message: { type: 'string' } },
+				required: ['ok'],
+				additionalProperties: false,
+			},
+			render: (_args, result) => [{ type: 'text', text: result.message }],
+		},
 		timeoutMs: 10_000,
 		execute: async (args, exec) => {
 			const agent = exec?.agent;

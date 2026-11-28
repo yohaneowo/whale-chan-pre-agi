@@ -200,7 +200,17 @@ test('draw_request：请求者与要回覆的讯息取自宿主核对过的本�
 		studios: new Map(),
 		studio,
 	};
-	const tool = drawRequestTool(runtime);
+	// 照正式宿主的规则登记（少了 output 会丢错），每次回传值都照 output.schema 验过、render 得出来。
+	const { hostTools, checkToolResult } = await import('./host-contract.mjs');
+	const definition = drawRequestTool(runtime);
+	hostTools().register(definition);
+	const tool = {
+		execute: async (args, exec) => {
+			const value = await definition.execute(args, exec);
+			checkToolResult(definition, args, value);
+			return value;
+		},
+	};
 	const started = await tool.execute(
 		{ action: 'start', brief: '貓', messageId: ids(999) },
 		{ agent },
@@ -240,6 +250,10 @@ test('draw_request：请求者与要回覆的讯息取自宿主核对过的本�
 	runtime.sourceForTurn = () => source;
 	const cancelled = await tool.execute({ action: 'cancel' }, { agent });
 	assert.match(cancelled.message, /已取消 1 張/);
+	assert.match(
+		(await tool.execute({ action: 'status' }, { agent })).message,
+		/這個頻道/,
+	);
 	delete runtime.studio;
 	assert.equal(
 		(await tool.execute({ action: 'start', brief: '貓' }, { agent })).ok,
