@@ -64,7 +64,7 @@ async function runCase(deps, testCase) {
 		let toolWorld;
 		if (testCase.tool) {
 			toolWorld = await buildWorld(deps, structuredClone(testCase.world));
-			tool = await runTool(toolWorld, testCase.tool.view, testCase.tool.calls);
+			tool = await runTool(toolWorld, testCase.tool.view, testCase.tool.calls, testCase.auto);
 			timing.tool = tool.ms;
 		}
 		const aWorld = toolWorld ?? world;

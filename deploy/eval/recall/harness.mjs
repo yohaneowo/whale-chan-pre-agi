@@ -421,6 +421,17 @@ export async function buildWorld(deps, spec, { root } = {}) {
 // 只有「把它们接起来」的几行是照抄的。guardMirror() 会检查 index.mjs 里那几行还在。
 export function guardMirror(socialDir) {
 	const source = readFileSync(join(socialDir, 'index.mjs'), 'utf8');
+	// 移植过翻旧事的规则（deploy/dsh/port_memory_rules.py）的 release：镜像的是新的接线（composeRecall）。
+	if (source.includes("from './recall-rules.mjs'"))
+		return [
+			"scope === GROUP_SCOPE || scope.startsWith('owner-')",
+			'const recall = this.recallFor(',
+			'(record) => this.recordPlace(record, recall)',
+			'this.relatedLines(agent, recall.where ? source : undefined)',
+			'recall.plan.recall ? this.recentSpeakers(source) : []',
+			"where: kind === GROUP_SCOPE ? '群聊' + (from ? ' ' + from : '') : '私讯'",
+			'this.recallNote(recall, memories.length > 0 || related.length > 0)',
+		].filter((needle) => !source.includes(needle));
 	const needles = [
 		"scope === GROUP_SCOPE || scope.startsWith('owner-')",
 		'this.memoryScopes(scope)',
@@ -472,6 +483,7 @@ export function composeAuto(world, view, turn) {
 	};
 	if (view === 'dm') runtime.bindings[agent.id] = 'owner-' + world.ownerId;
 	const scope = runtime.scopeFor(agent);
+	if (typeof runtime.recallFor === 'function') return composeRecall(world, view, { source, agent, scope });
 
 	const started = performance.now();
 	let memories = [];
@@ -542,14 +554,126 @@ export function composeAuto(world, view, turn) {
 	};
 }
 
+// 翻旧事的规则（port_memory_rules.py 移植后的 release）：这一轮的来源要像桥接那样登记（ingress），
+// 群聊频道都当成公开的（题目是照「所有群聊共用一份记忆」出的）。
+function recallTurn(world, view, source, agent) {
+	const { runtime } = world;
+	source.channelId ??= 'dm-' + source.authorId;
+	runtime.ingress.set(source.messageId, source);
+	runtime.recallPlans?.clear();
+	for (const channel of Object.values(world.channels))
+		if (channel.guild)
+			runtime.visibility.channels.set(channel.id, { guildId: channel.guild, name: channel.name, public: true, at: Date.now() });
+	agent.session.snapshotEvents = () => [
+		{ type: 'user/message', data: { message: { source: { kind: 'user', discordMessageId: source.messageId, discordChannelId: source.channelId } } } },
+	];
+	if (view === 'dm') runtime.bindings[agent.id] = 'owner-' + world.ownerId;
+}
+
+// 新的接线（镜像移植后 index.mjs 的 social-memory 那段；guardMirror 检查那几行还在）。
+function composeRecall(world, view, { source, agent, scope }) {
+	const { runtime } = world;
+	recallTurn(world, view, source, agent);
+	const started = performance.now();
+	const recall = runtime.recallFor(source);
+	let memories = [];
+	let error;
+	try {
+		if (recall.plan.recall)
+			memories = runtime.memory.recallAcross(
+				scope === 'group' ? ['group'] : [scope, 'group'],
+				source.text,
+				Date.now(),
+				(record) => runtime.recordPlace(record, recall),
+			);
+	} catch (cause) {
+		error = String(cause?.message ?? cause);
+	}
+	const related = runtime.relatedLines(agent, recall.where ? source : undefined);
+	let notesText = '';
+	let prompt;
+	if (view === 'group') {
+		const people = recall.plan.recall ? runtime.recentSpeakers(source) : [];
+		try {
+			notesText = runtime.notes.context(people, { admit: (line) => runtime.noteLabel(line, recall) });
+		} catch {
+			notesText = '';
+		}
+		prompt = runtime.groupContext(source, memories, people, related, recall);
+	} else
+		prompt = [
+			JSON.stringify({
+				memories: memories.map(({ id, at, authorId, authorName, text, scope: kind, from }) => ({
+					id,
+					at,
+					authorId,
+					authorName,
+					where: kind === 'group' ? '群聊' + (from ? ' ' + from : '') : '私讯',
+					text,
+				})),
+			}),
+			runtime.relatedText(related),
+			runtime.recallNote(recall, memories.length > 0 || related.length > 0),
+		]
+			.filter(Boolean)
+			.join('\n');
+	const ms = performance.now() - started;
+	const sym = (id) => world.symOf(id);
+	const sources = {
+		memory: memories.map((record) => sym(record.messageId)),
+		related: related.map((row) => sym(row.id)),
+		notes: [...notesText.matchAll(/〔原文 (\d+)〕/g)].map((match) => sym(match[1])),
+	};
+	return {
+		view,
+		prompt,
+		plan: recall.plan,
+		memories: memories.map((record) => ({
+			n: world.recordSym(record.id),
+			source: sym(record.messageId),
+			scope: record.scope,
+			author: record.authorName,
+			kind: record.kind,
+			text: record.text,
+		})),
+		related: related.map((row) => ({ source: sym(row.id), scope: row.scope, bot: row.bot, author: row.author, text: row.content })),
+		notesText,
+		sources,
+		all: [...new Set([...sources.memory, ...sources.related, ...sources.notes])].sort(),
+		tokens: estimateTokens([memories.map((record) => record.text).join('\n'), notesText, runtime.relatedText(related)].join('\n')),
+		ms,
+		error,
+	};
+}
+
 // ---------- 她自己翻原文的工具（chat_search／chat_open），照模型会下的参数脚本化 ----------
-export async function runTool(world, view, calls) {
+// turn：这一轮是谁在哪里说了什么（移植后的 release 要靠它判断能不能翻、能翻哪里）；题目没写就当成站长在问以前的事。
+export async function runTool(world, view, calls, turn) {
 	const { runtime } = world;
 	const tools = new Map(world.deps.chatTools(runtime).map((tool) => [tool.name, tool]));
 	const agent = {
 		id: 'agent-' + view,
 		session: { id: 'session-' + view, header: { cwd: view === 'group' ? GROUP_ROOT + '/room' : '/srv/dsh/owner' } },
 	};
+	if (typeof runtime.recallFor === 'function') {
+		const ask = turn ?? { user: world.spec.owner, ch: view === 'group' ? 'c1' : undefined, text: '之前大家說過的事你還記得嗎' };
+		const asker = world.users[ask.user];
+		const channel = ask.ch ? world.channels[ask.ch] : undefined;
+		recallTurn(
+			world,
+			view,
+			{
+				authorId: asker.id,
+				authorName: asker.name,
+				owner: asker.id === world.ownerId,
+				channelId: channel?.id,
+				guildId: view === 'group' ? channel?.guild : undefined,
+				messageId: world.idOf('tool-question'),
+				text: ask.text,
+			},
+			agent,
+		);
+	}
 	const results = [];
 	const started = performance.now();
 	for (const call of calls) {

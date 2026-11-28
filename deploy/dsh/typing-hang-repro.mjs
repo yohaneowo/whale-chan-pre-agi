@@ -2472,29 +2472,26 @@ async function studioPrivacy() {
 	try {
 		const SECRETS = ['DM-CANARY-記憶-7731', 'DM-CANARY-人物卡-7732'];
 		// 合成的私讯资料：拥有者私讯范围的记忆、拥有者人物卡上「私下」的条目。
-		runtime.memory.recallAcross = (scopes) =>
-			scopes.some((scope) => scope.startsWith('owner-'))
-				? [
-						{
-							id: 'm-1',
-							at: new Date().toISOString(),
-							authorId: OWNER,
-							authorName: '站長',
-							text: SECRETS[0],
-							scope: 'owner-' + OWNER,
-						},
-					]
-				: [];
-		runtime.notes.context = (people) =>
-			people.some(({ id }) => id === OWNER)
-				? `你對在場的人知道的事（人物卡）：\n【站長｜${OWNER}】\n- 私下：${SECRETS[1]}`
-				: '';
+		// 翻旧事的规则（port_memory_rules.py）以后，群聊会话本身就拿不到私讯的东西，也只在有线索时才翻记忆；
+		// 这里不管范围都塞给群聊会话（人物卡那段一定带得进去），检查的是「群聊会话有的，画室会话也拿不到」。
+		runtime.memory.recallAcross = () => [
+			{
+				id: 'm-1',
+				at: new Date().toISOString(),
+				authorId: OWNER,
+				authorName: '站長',
+				text: SECRETS[0],
+				scope: 'owner-' + OWNER,
+			},
+		];
+		runtime.notes.context = () =>
+			`你對在場的人知道的事（人物卡）：\n【站長｜${OWNER}】\n- 私下：${SECRETS[1]}`;
 		const messageId = admitted(runtime);
 		const chat = runtimeAgent('session-chat');
 		userTurn(chat, messageId);
 		runtime.prepare(chat, CHANNEL, messageId);
 		const chatPrompt = chat.prompt();
-		if (!SECRETS.every((secret) => chatPrompt.includes(secret)))
+		if (!SECRETS.some((secret) => chatPrompt.includes(secret)))
 			problems.push('合成的私讯资料没进到群聊会话（检查本身无效）');
 		const posted = [];
 		runtime.discordRest = {
