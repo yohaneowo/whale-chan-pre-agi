@@ -1,13 +1,16 @@
-// 重现并验收 2026-11-28「@ 了只显示正在输入、不回话」与第 1 轮审查列出的情境。
-// 直接拿 VM release 副本里真正的桥接程式码来跑：index.js 的 enqueuePrompt／runPrompt／saveIncoming
-// 与 deliverMessage（送讯回圈），接上同一份副本的 natural-participation.mjs 与 turn-guard.mjs。
+// 重现并验收 2026-11-28「@ 了只显示正在输入、不回话」与第 1、2 轮审查列出的情境，
+// 以及背景画室（画图交给另一个会话，聊天不被卡住）。
+// 直接拿 VM release 副本里真正的桥接程式码来跑：index.js 的 enqueuePrompt／runPrompt／saveIncoming／
+// commandStop、DiscordRest 与 deliverMessage（送讯回圈），接上同一份副本的 natural-participation.mjs、
+// turn-guard.mjs 与 studio.mjs（画室：真的 Studio／connectStudio／draw_request，画室会话是假的）。
 // Discord、模型、时钟都是假的，不连网路、不发任何真讯息。公开仓库不收录上游桥接原文，
 // 所以要给一份 release 副本（VM 上 web/node_modules 底下的 dsh-plugin-discord 与 dsh-social-runtime）。
 //
 //   node deploy/dsh/typing-hang-repro.mjs --release <副本根目录> [--only 情境名]
 //
-// 判定是「每一则 @ 都有正确的回应」：逐则讯息 ID 检查送出的内容、补的那句、先说的那句，
-// 每则都要有一组「收到／结果」纪录，「正在输入」一定熄灯且不超过期限，日志不能出现讯息内文。
+// 判定是「每一则 @ 都有正确、及时的回应」：逐则讯息 ID 检查送出的内容、补的那句、先说的那句、
+// 几秒内回应、画好的图回覆到原本那则，每则都要有一组「收到／结果」纪录，「正在输入」一定熄灯、
+// 不超过期限（同一则讯息的每一轮加起来算），日志不能出现讯息内文。
 // 任何一项不符就以代码 1 结束。
 import console from 'node:console';
 import { randomUUID } from 'node:crypto';
@@ -92,7 +95,17 @@ const methods = [
 	'async enqueuePrompt(',
 	'async saveIncoming(',
 	'async runPrompt(',
+	'commandStop(channelId) {',
 ].map((marker) => declaration(indexText, marker));
+const restSource = declaration(indexText, 'var DiscordRest = class {');
+// 「正在输入」的那段：修正前是一整个函式，修正后是一行 socialTyping。
+const typingStart = indexText.indexOf('const beginTypingFor = (channelId) =>');
+const typingSource = indexText.slice(
+	typingStart,
+	indexText[indexText.indexOf('=>', typingStart) + 3] === '{'
+		? blockEnd(indexText, indexText.indexOf('{', typingStart)) + 1
+		: indexText.indexOf('\n', typingStart),
+);
 const helpers = ['function findPromptSeq(', 'function sanitizeFilename('].map(
 	(marker) => declaration(indexText, marker),
 );
@@ -138,23 +151,40 @@ const { NaturalParticipation, naturalConfig } = await import(
 const { GatewayScopes } = await import(
 	pathToFileURL(join(plugin, 'gateway-scopes.mjs')).href
 );
+// 背景画室（修正后才有）。
+let studioModule;
+const studioPath = join(runtimeDir, 'studio.mjs');
+if (existsSync(studioPath))
+	studioModule = await import(pathToFileURL(studioPath).href);
 
 const BOT = '1000000000000000001';
 const OWNER = '1000000000000000002';
+const FRIEND = '1000000000000000005';
 const CHANNEL = '1000000000000000003';
 const GUILD = '1000000000000000004';
 const SESSION = 'session-00000000-0000-0000-0000-000000000000';
 const STUCK = '欸 我剛剛卡住了，你再說一次';
 const STEPS = '這一輪我做了太多步，先停一下；要繼續再叫我。';
+const GO = '好，我去畫';
+const QUEUED = '前面還有一張，畫完就畫你的';
+const FINAL = '畫好了 · 作品';
+const STUDIO_FAILED = '這張我畫到一半卡住了，先停下來；要再畫再叫我。';
+const STUDIO_TIMEOUT = '這張畫太久了，我先停筆；要繼續再叫我。';
 const DEADLINE_MS = 280_000;
-const seconds = (at) => Math.round((at - START) / 100) / 10;
+// 每个情境用自己的一段时间与自己的讯息 ID（真的 Discord ID 不会重复；
+// turn-guard 按讯息 ID 记期限、按频道记 /stop，情境之间不能互相影响）。
+let sceneStart = START;
+let sceneCount = 0;
+let nextId = 2000000000000000000n;
+const seconds = (at) => Math.round((at - sceneStart) / 100) / 10;
 
 // ---- 假的会话（agent loop）：照 inbox 一则一则开回合，回合内容由情境的 model 决定 ----
 class FakeAgent {
-	constructor(scene, rest) {
+	constructor(scene, rest, id = SESSION, model = scene.model) {
 		this.scene = scene;
 		this.rest = rest;
-		this.id = SESSION;
+		this.id = id;
+		this.model = model;
 		this.events = [];
 		this.seq = 0;
 		this.queue = [];
@@ -163,6 +193,7 @@ class FakeAgent {
 		this.activity = Promise.resolve();
 		this.running = undefined;
 		this.session = {
+			id,
 			header: { cwd: '/srv/dsh/discord' },
 			snapshotEvents: () => this.events,
 		};
@@ -235,6 +266,20 @@ class FakeAgent {
 				this.rest.tracked.request('POST', `/channels/${CHANNEL}/messages`, {
 					content,
 				}),
+			// Krita 的预览与交付：回覆原本那则请求。
+			reply: (content, replyTo) =>
+				this.rest.tracked.request('POST', `/channels/${CHANNEL}/messages`, {
+					content,
+					message_reference: { message_id: replyTo, fail_if_not_exists: false },
+				}),
+			// 聊天回合交代画图（修正后才有 draw_request）。
+			drawRequest: this.rest.drawTool
+				? (args) =>
+						this.rest.drawTool.execute(
+							{ action: 'start', brief: '畫圖', ...args },
+							{ agent: this },
+						)
+				: undefined,
 			rescue: (count) => {
 				rescues = count;
 			},
@@ -247,9 +292,10 @@ class FakeAgent {
 		};
 		try {
 			const kind = message.source?.kind === 'loop-guard' ? 'rescue' : 'user';
-			await this.scene.model(
+			await this.model(
 				{
 					key: this.keyOf?.(id),
+					messageId: id,
 					round,
 					kind,
 					text: message.content?.[0]?.text ?? '',
@@ -277,11 +323,11 @@ class FakeAgent {
 
 // ---- 一个情境：假 Discord + 真桥接程式码 + 真群聊行为处理 ----
 async function play(scene) {
-	mock.timers.setTime(START);
+	sceneStart = START + sceneCount++ * 3_600_000;
+	mock.timers.setTime(sceneStart);
 	const logs = [];
 	const posted = [];
 	const typing = [];
-	let nextId = 2000000000000000000n;
 	const id = () => String(nextId++);
 	const logger = {
 		info: (text) => logs.push({ at: Date.now(), level: 'info', text }),
@@ -301,6 +347,7 @@ async function play(scene) {
 			return sent;
 		},
 		async createMessageWithFiles(channelId, content, files) {
+			await scene.filesFail?.();
 			const sent = {
 				id: id(),
 				at: Date.now(),
@@ -312,10 +359,12 @@ async function play(scene) {
 		},
 		async request(method, path, body) {
 			if (method === 'POST' && /\/messages$/.test(path)) {
+				await scene.toolDelay?.(body?.content ?? '');
 				const sent = {
 					id: id(),
 					at: Date.now(),
 					content: body?.content ?? '',
+					replyTo: body?.message_reference?.message_id,
 					via: 'tool',
 				};
 				posted.push(sent);
@@ -357,8 +406,90 @@ async function play(scene) {
 	);
 	const agent = new FakeAgent(scene, rest);
 	const messages = new Map();
-	agent.keyOf = (messageId) =>
+	const keyOf = (messageId) =>
 		[...messages].find(([, message]) => message.id === messageId)?.[0];
+	agent.keyOf = keyOf;
+	// 宿主核对过的本轮来源（runtime.turns／sourceForTurn 的替身）：draw_request 从这里取请求者。
+	const sourceOf = (messageId) => {
+		const message = [...messages.values()].find((row) => row.id === messageId);
+		return (
+			message && {
+				messageId: message.id,
+				channelId: message.channel_id,
+				guildId: message.guild_id,
+				authorId: message.author.id,
+				authorName: message.author.username,
+				owner: message.author.id === OWNER,
+				text: message.content,
+			}
+		);
+	};
+	const runtime = {
+		turns: new Map(),
+		studios: new Map(),
+		sourceForTurn: (current) => {
+			const last = current.events.findLast(
+				(event) =>
+					event.type === 'user/message' && event.data?.source?.kind === 'user',
+			);
+			return sourceOf(last?.data?.source?.discordMessageId);
+		},
+		prepare: (current, channelId, messageId) =>
+			runtime.turns.set(current.id, sourceOf(messageId)),
+	};
+	const studioAgents = [];
+	let studio;
+	if (studioModule) {
+		const fakeBridge = {
+			config: {
+				preset: 'whale-social',
+				cwd: '/srv/dsh/discord',
+				titlePrefix: '',
+			},
+			composeSetup: async () => ({ setup: async () => {} }),
+			sessionId: (raw) => 'session-studio-' + raw,
+			agentOptions: () => ({}),
+			userMessage: (content, source) => ({
+				id: randomUUID(),
+				role: 'user',
+				content,
+				source,
+			}),
+			ctx: {
+				agents: {
+					create: async ({ sessionId }) => {
+						const studioAgent = new FakeAgent(
+							scene,
+							rest,
+							sessionId,
+							scene.studio ?? (async () => {}),
+						);
+						studioAgent.keyOf = keyOf;
+						studioAgents.push(studioAgent);
+						return { agent: studioAgent };
+					},
+				},
+			},
+		};
+		studio = studioModule.connectStudio({
+			runtime,
+			bridges: { group: fakeBridge, owner: fakeBridge },
+			rest,
+			log: logger.info,
+			// Krita 实际回覆了几张：看送到原本那则的「畫好了」与「預覽」。
+			deliveries: (messageId) => ({
+				final: posted.filter(
+					(row) => row.replyTo === messageId && row.content.startsWith(FINAL),
+				).length,
+				previews: posted.filter(
+					(row) => row.replyTo === messageId && row.content.startsWith('預覽'),
+				).length,
+			}),
+			...(scene.drawDeadlineMs ? { deadlineMs: scene.drawDeadlineMs } : {}),
+		});
+		studio.on((event) => participation.drawEvent(event));
+		rest.drawTool = studioModule.drawRequestTool(runtime);
+	}
 	const sources = new Map();
 	const scopes = new GatewayScopes({
 		socket: null,
@@ -370,12 +501,14 @@ async function play(scene) {
 		inspect: async () => {},
 		request: async (path) => sources.get(path.split('/').at(-1)),
 		destination: async () => ({ botId: BOT, guildId: GUILD }),
-		principal: async () => ({ guildId: GUILD, botId: OWNER }),
+		principal: async (target, actor) => ({ guildId: GUILD, botId: actor }),
 		bot: () => BOT,
 		continuity: new Map(),
 	});
 	scopes.rpc = async () => 'scope';
-	scopes.historyCanDeliver = async () => true;
+	// 只看租约是不是还是这一则的（不连 Discord 核对来源）。
+	scopes.historyCanDeliver = async (current, event) =>
+		scopes.active.get(current)?.row.event === event;
 
 	// 桥接：从 index.js 取出的真方法，挂在一个只有必要栏位的物件上。
 	const env = {
@@ -384,7 +517,11 @@ async function play(scene) {
 			? { extractSocialReply: guard.foldSocialReply }
 			: {}),
 		...oldBridge,
-		prepareSocialTurn: async () => {},
+		prepareSocialTurn: async (current, channelId, messageId) => {
+			await scene.prepareDelay?.(keyOf(messageId));
+			runtime.prepare(current, channelId, messageId);
+		},
+		stopSocialStudio: (channelId) => studio?.stopChannel(channelId) ?? 0,
 		historyView: { note() {} },
 		fetch: (url, options) => scene.fetch(url, options),
 		mkdir: async () => {},
@@ -420,8 +557,11 @@ async function play(scene) {
 		ctx: {
 			get: (name) =>
 				name === 'sessions' ? { flush: () => scene.flush?.() } : undefined,
+			agents: { get: () => agent },
 		},
 		gatewayScopes: scopes,
+		store: { get: (channel) => (channel === CHANNEL ? SESSION : undefined) },
+		sessionId: (raw) => raw,
 		ensureChannelAgent: async () => ({ agent, created: false }),
 		injectNoticeOnce() {},
 		userMessage: (content, source) => ({
@@ -432,10 +572,8 @@ async function play(scene) {
 		}),
 		collectUploads: async () => ({ files: [], problems: [] }),
 		async handle(command, channelId, messageId, beginTyping, attachments) {
-			if (command.kind === 'stop') {
-				agent.cancel({ kind: 'user' });
-				return { chunks: ['已停止目前的回合。'], files: [] };
-			}
+			if (command.kind === 'stop')
+				return { chunks: this.commandStop(channelId), files: [] };
 			return await this.enqueuePrompt(
 				channelId,
 				messageId,
@@ -489,9 +627,10 @@ async function play(scene) {
 				id: id(),
 				channel_id: CHANNEL,
 				guild_id: GUILD,
-				author: { id: OWNER, username: '站長' },
+				author: item.author ?? { id: OWNER, username: '站長' },
 				content: item.content,
 				attachments: item.attachments ?? [],
+				...(item.extra ?? {}),
 				timestamp: new Date().toISOString(),
 				mentions: item.content.includes(`<@${BOT}>`) ? [{ id: BOT }] : [],
 			};
@@ -520,14 +659,16 @@ async function play(scene) {
 		}, item.at);
 	}
 	const last = Math.max(...scene.messages.map((item) => item.at));
-	const cap = START + 16 * 60_000;
+	const cap = sceneStart + 16 * 60_000;
 	let quietSince;
 	for (;;) {
 		mock.timers.tick(250);
 		for (let index = 0; index < 6; index++) await realImmediate();
 		const busy =
-			Date.now() < START + last + 1000 ||
+			Date.now() < sceneStart + last + 1000 ||
 			agent.running ||
+			studioAgents.some((row) => row.running) ||
+			Boolean(studio?.running || studio?.waiting.length) ||
 			typing.some((row) => row.off === undefined) ||
 			handlers.length < scene.messages.length;
 		const settled = await Promise.race([
@@ -542,7 +683,7 @@ async function play(scene) {
 	unsubscribe?.();
 	await participation.saves.catch(() => {});
 	rmSync(directory, { recursive: true });
-	return { logs, posted, typing, messages, agent };
+	return { logs, posted, typing, messages, agent, studioAgents };
 }
 
 // ---- 判定 ----
@@ -555,6 +696,16 @@ function judge(scene, result) {
 		else if (row.off - row.on > DEADLINE_MS + 1000)
 			problems.push(
 				`「正在输入」亮了 ${Math.round((row.off - row.on) / 1000)} 秒，超过期限`,
+			);
+	}
+	if (scene.typingMax) {
+		const total = typing.reduce(
+			(sum, row) => sum + ((row.off ?? Date.now()) - row.on),
+			0,
+		);
+		if (total > scene.typingMax)
+			problems.push(
+				`「正在输入」一共亮了 ${Math.round(total / 1000)} 秒（应在 ${scene.typingMax / 1000} 秒内）`,
 			);
 	}
 	for (const line of logs)
@@ -572,6 +723,35 @@ function judge(scene, result) {
 		const replies = posted
 			.filter((row) => row.replyTo === message.id)
 			.map((row) => row.content);
+		if (expect.final) {
+			const final = posted.find(
+				(row) => row.replyTo === message.id && row.content.startsWith(FINAL),
+			);
+			if (!final) problems.push(`#${key} 画好的图没有回覆到原本那则`);
+			else if (final.at - Date.parse(message.timestamp) > expect.final)
+				problems.push(
+					`#${key} 画好的图太晚（${Math.round((final.at - Date.parse(message.timestamp)) / 1000)} 秒）`,
+				);
+			if (expect.finalAfter) {
+				const other = posted.find(
+					(row) =>
+						row.replyTo === messages.get(expect.finalAfter)?.id &&
+						row.content.startsWith(FINAL),
+				);
+				if (!other || !final || final.at < other.at)
+					problems.push(`#${key} 应该排在 #${expect.finalAfter} 后面才画好`);
+			}
+		}
+		if (expect.lastTypingBy) {
+			const lastOff = Math.max(
+				0,
+				...typing.map((row) => row.off ?? Number.POSITIVE_INFINITY),
+			);
+			if (lastOff - Date.parse(message.timestamp) > expect.lastTypingBy)
+				problems.push(
+					`#${key} 的「正在输入」到 ${Math.round((lastOff - Date.parse(message.timestamp)) / 1000)} 秒才熄（同一则讯息的每一轮合起来应在 ${expect.lastTypingBy / 1000} 秒内）`,
+				);
+		}
 		const anyText = posted.map((row) => row.content);
 		for (const text of expect.posts ?? [])
 			if (!anyText.includes(text)) problems.push(`#${key} 没有送出「${text}」`);
@@ -624,17 +804,35 @@ function judge(scene, result) {
 	return problems;
 }
 
-const draw = async (
-	tools,
-	{ tool = 4_000, total = 100_000, preview = 30_000 } = {},
-) => {
-	await tools.wait(tool);
+// 聊天回合要画图：修正后交给画室（draw_request），照工具结果回一句；修正前在聊天回合里自己画
+// （Krita 的预览与交付回覆原本那则），画完才回话。
+const chatDraw = async (tools, turn, { minutes = 3, silent = false } = {}) => {
+	if (tools.drawRequest) {
+		const result = await tools.drawRequest({ brief: '畫一張圖 PRIVATE-BRIEF' });
+		await tools.wait(1_500);
+		if (!silent) tools.say(/前面還有/.test(result.message) ? QUEUED : GO);
+		return;
+	}
+	await tools.wait(4_000);
 	tools.tool('krita_batch', { action: 'start', width: 512, height: 512 });
-	await tools.wait(preview - tool);
-	await tools.post('預覽 · 作品');
-	await tools.wait(total - preview);
+	await tools.wait(30_000);
+	await tools.reply('預覽 · 作品', turn.messageId);
+	await tools.wait(minutes * 60_000 - 34_000);
+	await tools.reply(FINAL, turn.messageId);
+	tools.say('畫好了');
+};
+// 画室会话画一张：实际时间照 VM 上的中位数（约 3 分钟），预览与交付都回覆原本那则。
+const studioDraw = async (turn, tools, minutes = 3) => {
+	await tools.wait(10_000);
+	tools.tool('krita_batch', { action: 'start', width: 512, height: 512 });
+	await tools.wait(30_000);
+	await tools.reply('預覽 · 作品', turn.messageId);
+	await tools.wait(minutes * 60_000 - 40_000);
+	await tools.reply(FINAL, turn.messageId);
+	tools.say('畫好了');
 };
 const mention = `<@${BOT}>`;
+const friend = { id: FRIEND, username: '小羅' };
 const scenes = [
 	{
 		name: '事故：只 @、问「你怎么了」、再 @',
@@ -650,7 +848,9 @@ const scenes = [
 			if (turn.key === 'Q')
 				return (await tools.wait(9_000), tools.say('我沒事啦'));
 			if (turn.key === 'A') {
-				await draw(tools, { total: 320_000 });
+				await tools.wait(4_000);
+				tools.tool('krita_batch', { action: 'start' });
+				await tools.wait(316_000);
 				tools.say('好啦畫好了，脖子拉短了。');
 				return tools.rescue(2);
 			}
@@ -660,7 +860,141 @@ const scenes = [
 		expect: {
 			A: { replies: ['怎麼了？'], within: 5_000, status: 'bare-sent' },
 			Q: { status: 'answered', never: [STUCK] },
-			B: { never: [STUCK] },
+			B: { posts: ['我在啦'], never: [STUCK], within: 30_000 },
+		},
+	},
+	{
+		name: '画图期间同频道另一则 @ 马上回话；画好回覆原本那则；画图时不亮「正在输入」',
+		messages: [
+			{ key: 'A', at: 0, content: `${mention} 畫一隻貓 PRIVATE-A` },
+			{
+				key: 'B',
+				at: 20_000,
+				content: `${mention} 今天星期幾 PRIVATE-B`,
+				author: friend,
+			},
+		],
+		async model(turn, tools) {
+			if (turn.key === 'A') return chatDraw(tools, turn);
+			await tools.wait(3_000);
+			tools.say('今天星期五');
+		},
+		studio: (turn, tools) => studioDraw(turn, tools),
+		typingMax: 30_000,
+		expect: {
+			A: {
+				posts: [GO],
+				within: 10_000,
+				final: 240_000,
+				never: [STUCK],
+				status: 'answered',
+			},
+			B: {
+				posts: ['今天星期五'],
+				within: 15_000,
+				never: [STUCK],
+				status: 'answered',
+			},
+		},
+	},
+	{
+		name: '第二个画图请求排队并告知，前一张画完才画它',
+		messages: [
+			{ key: 'A', at: 0, content: `${mention} 畫一隻貓 PRIVATE-A` },
+			{
+				key: 'C',
+				at: 10_000,
+				content: `${mention} 也幫我畫一隻狗 PRIVATE-C`,
+				author: friend,
+			},
+		],
+		async model(turn, tools) {
+			return chatDraw(tools, turn);
+		},
+		studio: (turn, tools) => studioDraw(turn, tools),
+		typingMax: 30_000,
+		expect: {
+			A: { posts: [GO], within: 10_000, final: 240_000, status: 'answered' },
+			C: {
+				posts: [QUEUED],
+				within: 10_000,
+				final: 480_000,
+				finalAfter: 'A',
+				never: [STUCK],
+				status: 'answered',
+			},
+		},
+	},
+	{
+		name: '交给画室后她没说话：替她说「好，我去畫」',
+		messages: [{ key: 'A', at: 0, content: `${mention} 畫月亮 PRIVATE-A` }],
+		async model(turn, tools) {
+			return chatDraw(tools, turn, { silent: true });
+		},
+		studio: (turn, tools) => studioDraw(turn, tools, 1),
+		typingMax: 30_000,
+		expect: {
+			A: {
+				posts: [GO],
+				within: 10_000,
+				final: 120_000,
+				never: [STUCK],
+				status: 'draw-ack-sent',
+			},
+		},
+	},
+	{
+		name: '背景画图失败：回一句简短说明',
+		messages: [{ key: 'A', at: 0, content: `${mention} 畫一座城堡 PRIVATE-A` }],
+		async model(turn, tools) {
+			if (!tools.drawRequest) {
+				await tools.wait(60_000);
+				return tools.fail();
+			}
+			return chatDraw(tools, turn);
+		},
+		async studio(turn, tools) {
+			await tools.wait(60_000);
+			tools.fail();
+		},
+		typingMax: 30_000,
+		expect: {
+			A: {
+				posts: [GO],
+				replies: [STUDIO_FAILED],
+				within: 10_000,
+				never: [STUCK],
+			},
+		},
+	},
+	{
+		name: '背景画图超时：停笔并说明，画室换下一张',
+		messages: [
+			{ key: 'A', at: 0, content: `${mention} 畫一幅超大的畫 PRIVATE-A` },
+			{
+				key: 'C',
+				at: 5_000,
+				content: `${mention} 畫一顆蘋果 PRIVATE-C`,
+				author: friend,
+			},
+		],
+		drawDeadlineMs: 300_000,
+		async model(turn, tools) {
+			return chatDraw(tools, turn, { minutes: turn.key === 'A' ? 12 : 1 });
+		},
+		async studio(turn, tools) {
+			if (turn.key === 'A') return tools.wait(20 * 60_000);
+			return studioDraw(turn, tools, 1);
+		},
+		typingMax: 30_000,
+		expect: {
+			A: {
+				posts: [GO],
+				replies: [STUDIO_TIMEOUT],
+				within: 10_000,
+				never: [STUCK],
+			},
+			C: { posts: [QUEUED], final: 420_000, never: [STUCK] },
 		},
 	},
 	{
@@ -677,6 +1011,42 @@ const scenes = [
 		expect: {
 			A: { posts: ['答覆A'], never: [STUCK], status: 'answered' },
 			B: { posts: ['答覆B'], never: [STUCK], status: 'answered' },
+		},
+	},
+	{
+		name: 'A 的工具讯息在 B 那轮才送达：不算给 B',
+		messages: [
+			{ key: 'A', at: 0, content: `${mention} 傳個東西 PRIVATE-A` },
+			{ key: 'B', at: 10_000, content: `${mention} 說點什麼 PRIVATE-B` },
+		],
+		toolDelay: async (content) => content === '工具A' && (await delay(20_000)),
+		async model(turn, tools) {
+			if (turn.key === 'A') {
+				await tools.wait(279_000);
+				void tools.post('工具A');
+				return tools.wait(60_000);
+			}
+			await tools.wait(25_000);
+		},
+		expect: {
+			A: { replies: [STEPS], status: 'notice-sent' },
+			B: { replies: [STUCK], status: 'fallback-sent' },
+		},
+	},
+	{
+		name: 'A 被放弃后才收尾：不清掉 B 的闸道验证',
+		messages: [
+			{ key: 'A', at: 0, content: `${mention} 問題A PRIVATE-A` },
+			{ key: 'B', at: 5_000, content: `${mention} 在嗎 PRIVATE-B` },
+		],
+		prepareDelay: async (key) => key === 'A' && (await delay(300_000)),
+		async model(turn, tools) {
+			await tools.wait(turn.key === 'B' ? 20_000 : 1_000);
+			tools.say(turn.key === 'B' ? '在喔' : '答覆A');
+		},
+		expect: {
+			A: { replies: [STEPS], never: ['答覆A'], status: 'notice-sent' },
+			B: { posts: ['在喔'], never: [STUCK], status: 'answered' },
 		},
 	},
 	{
@@ -722,6 +1092,66 @@ const scenes = [
 		expect: { A: { replies: [STEPS], status: 'notice-sent' } },
 	},
 	{
+		name: '附件下载失败：日志不记附件档名与网址',
+		messages: [
+			{
+				key: 'A',
+				at: 0,
+				content: `${mention} 看這份 PRIVATE-A`,
+				attachments: [
+					{
+						id: '1',
+						url: 'https://cdn.example/PRIVATE-FILE.pdf',
+						filename: 'PRIVATE-FILE.pdf',
+						size: 10,
+						content_type: 'application/pdf',
+					},
+				],
+			},
+		],
+		fetch: async (url) => {
+			throw new TypeError(`fetch failed: ${url}`);
+		},
+		async model(turn, tools) {
+			await tools.wait(2_000);
+			tools.say('檔案打不開耶');
+		},
+		expect: { A: { posts: ['檔案打不開耶'], status: 'answered' } },
+	},
+	{
+		name: '附件下载中收到 /stop：不再送进模型、不再送答',
+		messages: [
+			{
+				key: 'A',
+				at: 0,
+				content: `${mention} 看這張 PRIVATE-A`,
+				attachments: [
+					{
+						id: '1',
+						url: 'https://cdn.example/a.png',
+						filename: 'a.png',
+						size: 10,
+						content_type: 'image/png',
+					},
+				],
+			},
+			{ key: 'S', at: 5_000, content: '/stop' },
+		],
+		fetch: async () => {
+			await delay(20_000);
+			return new globalThis.Response(new Uint8Array([1, 2, 3]));
+		},
+		async model(turn, tools) {
+			await tools.wait(2_000);
+			tools.say('看到了');
+		},
+		expect: { A: { never: [STUCK, '看到了'], status: 'stopped' } },
+		check: ({ posted }) =>
+			posted.some((row) => row.content === '看到了')
+				? ['/stop 之后还是送了答覆']
+				: [],
+	},
+	{
 		name: 'flush 卡住',
 		messages: [{ key: 'A', at: 0, content: `${mention} 你好 PRIVATE-A` }],
 		flush: () => new Promise(() => {}),
@@ -745,19 +1175,21 @@ const scenes = [
 		},
 	},
 	{
-		name: '要画图：动手前先说一句',
-		messages: [{ key: 'A', at: 0, content: `${mention} 畫一隻貓 PRIVATE-A` }],
+		name: '自动续做不重新计时：同一则讯息的「正在输入」合起来不超过期限',
+		messages: [{ key: 'A', at: 0, content: `${mention} 幫我找資料 PRIVATE-A` }],
 		async model(turn, tools) {
-			await draw(tools, { total: 100_000 });
-			tools.say('畫好了');
+			if (turn.round === 1)
+				return (await tools.wait(200_000), tools.say('我找一下'));
+			await tools.wait(200_000);
+			tools.say('找到了');
 		},
 		expect: {
 			A: {
-				preface: '好，我畫一下',
-				prefaceBy: 6_000,
-				posts: ['畫好了', '預覽 · 作品'],
-				never: [STUCK],
-				status: 'answered',
+				posts: ['我找一下'],
+				replies: [STEPS],
+				never: ['找到了'],
+				lastTypingBy: DEADLINE_MS + 1_000,
+				status: 'notice-sent',
 			},
 		},
 	},
@@ -778,17 +1210,17 @@ const scenes = [
 		},
 	},
 	{
-		name: '画太久到期限，排在后面的 @ 仍然有回应',
+		name: '做太久到期限，排在后面的 @ 仍然有回应',
 		messages: [
-			{ key: 'A', at: 0, content: `${mention} 畫一張大圖 PRIVATE-A` },
+			{ key: 'A', at: 0, content: `${mention} 整理一大堆資料 PRIVATE-A` },
 			{ key: 'B', at: 36_000, content: `${mention} 在嗎 PRIVATE-B` },
 		],
 		async model(turn, tools) {
 			if (turn.kind === 'rescue')
-				return (await tools.wait(60_000), tools.say('這個我不畫啦'));
+				return (await tools.wait(60_000), tools.say('這個我不做啦'));
 			if (turn.key === 'A') {
-				await draw(tools, { total: 445_000 });
-				tools.say('畫好了');
+				await tools.wait(445_000);
+				tools.say('整理好了');
 				return tools.rescue(2);
 			}
 			await tools.wait(9_000);
@@ -801,23 +1233,18 @@ const scenes = [
 				? []
 				: ['到期限没有取消自己的回合（或没有保留 inbox）'],
 		expect: {
-			A: {
-				preface: '好，我畫一下',
-				prefaceBy: 6_000,
-				replies: [STEPS],
-				status: 'notice-sent',
-			},
+			A: { replies: [STEPS], status: 'notice-sent' },
 			B: { posts: ['在喔'], never: [STUCK], status: 'answered' },
 		},
 	},
 	{
-		name: '画好了，后面排着补救轮：不等它，也停掉它',
-		messages: [{ key: 'A', at: 0, content: `${mention} 畫隻狗 PRIVATE-A` }],
+		name: '答完了，后面排着补救轮：不等它，也停掉它',
+		messages: [{ key: 'A', at: 0, content: `${mention} 講個笑話 PRIVATE-A` }],
 		async model(turn, tools) {
 			if (turn.kind === 'rescue')
-				return (await tools.wait(60_000), tools.say('這個我不畫啦'));
-			await draw(tools, { total: 60_000 });
-			tools.say('畫好了，給你');
+				return (await tools.wait(60_000), tools.say('這個我不講啦'));
+			await tools.wait(20_000);
+			tools.say('好啦講完了');
 			tools.rescue(2);
 		},
 		// 补救讯息还在 inbox 就移掉，已经开跑就取消（keepInbox，别人的讯息不动）；补救轮不能有产出。
@@ -828,13 +1255,13 @@ const scenes = [
 			!agent.events.some(
 				(event) =>
 					event.type === 'assistant/message' &&
-					JSON.stringify(event.data).includes('這個我不畫啦'),
+					JSON.stringify(event.data).includes('這個我不講啦'),
 			) &&
 			agent.queue.length === 0
 				? []
 				: ['补救轮没有被停掉（只该停掉自己的补救轮、保留 inbox）'],
 		expect: {
-			A: { posts: ['畫好了，給你'], never: [STUCK], status: 'answered' },
+			A: { posts: ['好啦講完了'], never: [STUCK], status: 'answered' },
 		},
 	},
 	{
@@ -850,6 +1277,24 @@ const scenes = [
 		expect: { A: { replies: [STUCK], status: 'fallback-sent' } },
 	},
 	{
+		name: '文字送出了、贴图上传失败：不再补「卡住了」',
+		messages: [{ key: 'A', at: 0, content: `${mention} 你好 PRIVATE-A` }],
+		prepare: async (text) => ({
+			text,
+			files: [{ filename: 'sticker.gif', data: new Uint8Array(1) }],
+		}),
+		filesFail: async () => {
+			throw new Error(
+				'discord REST POST /channels/x/messages failed: 500 PRIVATE-UP',
+			);
+		},
+		async model(turn, tools) {
+			await tools.wait(2_000);
+			tools.say('嗨嗨');
+		},
+		expect: { A: { posts: ['嗨嗨'], never: [STUCK], status: 'answered' } },
+	},
+	{
 		name: '/stop 停掉的不补「卡住了」',
 		messages: [
 			{ key: 'A', at: 0, content: `${mention} 做很久的事 PRIVATE-A` },
@@ -861,7 +1306,147 @@ const scenes = [
 		},
 		expect: { A: { never: [STUCK], status: 'stopped' } },
 	},
+	{
+		name: '不算「只 @」：附 PDF、Discord 贴图、引用抓不到、她一分钟内刚说过话',
+		messages: [
+			{
+				key: 'P',
+				at: 0,
+				content: mention,
+				attachments: [
+					{
+						id: '1',
+						url: 'https://cdn.example/a.pdf',
+						filename: 'a.pdf',
+						size: 10,
+						content_type: 'application/pdf',
+					},
+				],
+			},
+			{
+				key: 'K',
+				at: 30_000,
+				content: mention,
+				author: friend,
+				extra: { sticker_items: [{ id: '9', name: 'wave' }] },
+			},
+			{
+				key: 'R',
+				at: 90_000,
+				content: mention,
+				author: { id: '1000000000000000006', username: '阿明' },
+				extra: {
+					message_reference: {
+						message_id: '1999999999999999999',
+						channel_id: CHANNEL,
+					},
+				},
+			},
+			{
+				key: 'N',
+				at: 100_000,
+				content: mention,
+				author: { id: '1000000000000000007', username: '小美' },
+			},
+		],
+		async model(turn, tools) {
+			await tools.wait(2_000);
+			tools.say(`收到 ${turn.key}`);
+		},
+		expect: {
+			P: {
+				posts: ['收到 P'],
+				never: ['怎麼了？', '嗯？怎麼了', '我在，怎麼了？'],
+				status: 'answered',
+			},
+			K: {
+				posts: ['收到 K'],
+				never: ['怎麼了？', '嗯？怎麼了', '我在，怎麼了？'],
+				status: 'answered',
+			},
+			R: {
+				posts: ['收到 R'],
+				never: ['怎麼了？', '嗯？怎麼了', '我在，怎麼了？'],
+				status: 'answered',
+			},
+			N: {
+				posts: ['收到 N'],
+				never: ['怎麼了？', '嗯？怎麼了', '我在，怎麼了？'],
+				status: 'answered',
+			},
+		},
+	},
 ];
+
+// 「正在输入」被限流：拿副本里真正的 DiscordRest 与 beginTypingFor 跑。第一次 typing 回 429（retry_after 1 秒），
+// 0.5 秒时熄灯；熄灯以后不能再送 typing。
+async function typingRateLimited() {
+	sceneStart = START + sceneCount++ * 3_600_000;
+	mock.timers.setTime(sceneStart);
+	const posts = [];
+	const fetch = async (url, options = {}) => {
+		posts.push({ at: Date.now(), url, signal: options.signal });
+		if (posts.length === 1)
+			return new globalThis.Response(JSON.stringify({ retry_after: 1 }), {
+				status: 429,
+			});
+		return new globalThis.Response(null, { status: 204 });
+	};
+	const DiscordRest = new Function(
+		'scope',
+		`with (scope) { return ${restSource.replace(/^var DiscordRest = /, '')} }`,
+	)(
+		new Proxy(
+			{ fetch, API_BASE: 'https://discord.invalid/api/v10' },
+			{
+				has: () => true,
+				get: (target, key) =>
+					key === Symbol.unscopables
+						? undefined
+						: key in target
+							? target[key]
+							: globalThis[key],
+			},
+		),
+	);
+	const rest = new DiscordRest({ token: 'x' });
+	const beginTypingFor = new Function(
+		'scope',
+		`with (scope) { ${typingSource}; return beginTypingFor; }`,
+	)(
+		new Proxy(
+			{ ...guard, rest, config: { typingIntervalMs: 8_000 } },
+			{
+				has: () => true,
+				get: (target, key) =>
+					key === Symbol.unscopables
+						? undefined
+						: key in target
+							? target[key]
+							: globalThis[key],
+			},
+		),
+	);
+	const stop = beginTypingFor(CHANNEL);
+	for (let index = 0; index < 4; index++) {
+		mock.timers.tick(125);
+		for (let round = 0; round < 6; round++) await realImmediate();
+	}
+	stop();
+	const stoppedAt = Date.now();
+	for (let index = 0; index < 120; index++) {
+		mock.timers.tick(250);
+		for (let round = 0; round < 6; round++) await realImmediate();
+	}
+	const after = posts.filter(
+		(row) => row.at > stoppedAt && !row.signal?.aborted,
+	);
+	return after.length
+		? [
+				`熄灯后又送了 ${after.length} 次 typing（第一次在熄灯后 ${Math.round((after[0].at - stoppedAt) / 100) / 10} 秒）`,
+			]
+		: [];
+}
 
 console.log(`release 副本：${patched ? '已移植修正' : '未移植（现行版本）'}`);
 let failed = 0;
@@ -883,6 +1468,13 @@ for (const scene of scenes) {
 	if (process.env.REPRO_DEBUG)
 		for (const line of result.logs)
 			console.log(`    日志 ${seconds(line.at)}s ${line.level}：${line.text}`);
+}
+if (!values.only || '「正在输入」被限流'.includes(values.only)) {
+	const problems = await typingRateLimited();
+	failed += problems.length ? 1 : 0;
+	console.log(`
+${problems.length ? '✖' : '✔'} 「正在输入」被限流：熄灯后不再重送`);
+	for (const problem of problems) console.log(`    问题：${problem}`);
 }
 mock.timers.reset();
 console.log(

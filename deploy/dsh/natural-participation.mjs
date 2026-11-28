@@ -33,9 +33,14 @@ function noticeCode(text) {
 	return 'error';
 }
 // 要做比较久的事时先说一句，不让「正在输入」一声不吭亮好几分钟。
-// 依 VM 上 881 轮：超过 30 秒的回合里，动工具前自己先说话的只有 2/38，所以由这里补；
-// 一开始画（Krita start／paint）就说，否则 20 秒还没任何东西送达才说。
-const PREFACE = { drawing: '好，我畫一下', slow: '等我一下，我弄一下' };
+// 依 VM 上 881 轮：超过 30 秒的回合里，动工具前自己先说话的只有 2/38，所以由这里补：
+// 20 秒还没任何东西送达才说。画图不在聊天回合里做（交给背景画室），不用为画图先说。
+const PREFACE = { slow: '等我一下，我弄一下' };
+// 交给画室以后她这轮却没说话：替她说一句（照画室的回覆：开始画或排队）。
+const DRAW_ACK = {
+	started: '好，我去畫',
+	queued: '前面還有一張，畫完就畫你的',
+};
 // 只 @ 她、没说别的：像人一样问一句，不去翻旧上下文接着做以前的事
 // （2026-11-28 空 @ 让她重画了半天前的旧图）。
 const BARE_REPLIES = ['怎麼了？', '嗯？怎麼了', '我在，怎麼了？'];
@@ -430,6 +435,14 @@ export class NaturalParticipation {
 		if (ticket?.round && sent !== undefined) ticket.round.call.files++;
 	}
 
+	// 画室收下了这则呼叫的画图请求（studio 的 accepted 事件）：开始画或排队。
+	drawEvent(event) {
+		if (event?.type !== 'accepted') return;
+		const call = this.calls.get(String(event.messageId));
+		if (call && call.channelId === String(event.channelId))
+			call.drawing = event.status === 'queued' ? 'queued' : 'started';
+	}
+
 	// 桥接送这一轮的某一段失败了（错误本身由桥接用 errorTrace 记，不经过这里）。
 	sendFailed(channelId, ticket) {
 		if (ticket?.round) ticket.round.call.sendFailures++;
@@ -442,13 +455,8 @@ export class NaturalParticipation {
 		if (call && call.channelId === String(channelId)) call.tool++;
 	}
 
-	// turn-guard 的进度：这一轮开始画图了，先说一句。
-	turnEvent(event) {
-		if (event?.type !== 'progress' || !event.drawing) return;
-		const call = this.calls.get(String(event.messageId));
-		if (call && call.channelId === String(event.channelId))
-			void this.preface(call, 'drawing');
-	}
+	// turn-guard 的事件（开始、结束）目前不需要做什么；保留接点给之后用。
+	turnEvent() {}
 
 	delivered(call) {
 		return call.text + call.files + call.tool;
@@ -479,6 +487,7 @@ export class NaturalParticipation {
 			files: 0,
 			tool: 0,
 			sendFailures: 0,
+			drawing: undefined,
 			prefaced: false,
 			stopped: false,
 			closed: false,
@@ -550,6 +559,7 @@ export class NaturalParticipation {
 				said &&
 				said.length <= 80 &&
 				PROMISE.test(last) &&
+				!call.drawing &&
 				epoch === channel.directEpoch
 			) {
 				({ result, notice } = await this.deliverRound(
@@ -573,14 +583,21 @@ export class NaturalParticipation {
 		}
 	}
 
-	// 要不要补一句；回传结果代码（answered／notice-sent／fallback-sent／…-failed／stopped）。
+	// 要不要补一句；回传结果代码（answered／notice-sent／draw-ack-sent／fallback-sent／…-failed／stopped）。
+	// 交给画室以后这轮没说话：替她说「好，我去畫」或「前面還有一張…」，不说「卡住了」。
 	async settleCall(call, turn) {
 		if (call.stopped) return 'stopped';
 		let text;
 		if (turn === 'steps') text = STEPS_TEXT;
 		else if (this.delivered(call)) return 'answered';
+		else if (call.drawing) text = DRAW_ACK[call.drawing];
 		else text = turn === 'quota' ? QUOTA_TEXT : STUCK;
-		const kind = text === STUCK ? 'fallback' : 'notice';
+		const kind =
+			text === STUCK
+				? 'fallback'
+				: call.drawing && turn !== 'steps'
+					? 'draw-ack'
+					: 'notice';
 		try {
 			await call.controlReply?.(text);
 			return kind + '-sent';
@@ -589,12 +606,31 @@ export class NaturalParticipation {
 		}
 	}
 
-	// 只 @ 她、没有别的内容、没回覆别则、没附图，而且同一个人一分钟内没有还没被回的话：
-	// 像人一样问一句，不交给模型（模型会拿旧上下文自己找事做）。只叫名字（「小鯨魚」）照常交给模型。
+	// 只 @ 她、没有别的内容、没回覆别则、没附任何东西，而且同一个人一分钟内没有还没被回的话、
+	// 她自己一分钟内也没说过话：像人一样问一句，不交给模型（模型会拿旧上下文自己找事做）。
+	// 只叫名字（「小鯨魚」）照常交给模型。
+	// 不算「只 @」的：附件（含 PDF 等非图片）、Discord 贴图、embed、挂了回复（引用抓不到也一样，
+	// 他是在回某一则）、她一分钟内刚说过话（多半是在接她的话）。
 	bareCall(message, channel, botUserId) {
-		if (message.guild_id === undefined || message.referenced_message)
+		if (
+			message.guild_id === undefined ||
+			message.referenced_message ||
+			message.message_reference?.message_id
+		)
 			return false;
-		if (imageNotes(message).length || gifLinkNotes(message).length)
+		if (
+			(Array.isArray(message.attachments) && message.attachments.length) ||
+			(Array.isArray(message.sticker_items) && message.sticker_items.length) ||
+			(Array.isArray(message.stickers) && message.stickers.length) ||
+			(Array.isArray(message.embeds) && message.embeds.length) ||
+			imageNotes(message).length ||
+			gifLinkNotes(message).length
+		)
+			return false;
+		if (
+			channel.lastSpokeAt !== undefined &&
+			this.now() - channel.lastSpokeAt < 60000
+		)
 			return false;
 		const content = String(message.content ?? '');
 		const mention = new RegExp(`<@!?${botUserId}>`, 'g');
@@ -780,7 +816,9 @@ export class NaturalParticipation {
 		}
 	}
 
+	// 送答前问：主动插话过期了，或这则呼叫已经被 /stop 停掉，就不送。
 	canSend(channelId, ticket) {
+		if (ticket?.round?.call?.stopped) return false;
 		return (
 			!ticket?.proactive || ticket.epoch === this.channel(channelId).directEpoch
 		);

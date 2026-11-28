@@ -1153,7 +1153,7 @@ test('只 @ 她、没有内容：像人一样问一句，不交给模型；同�
 	assert.equal(f.delivered.length, 4);
 });
 
-test('要做比较久的事：开始画图就先说一句；20 秒没动静也先说；已经有东西送达就不说', async (t) => {
+test('要做比较久的事：20 秒没动静先说一句；已经有东西送达就不说；画图不在聊天回合里，不为画图先说', async (t) => {
 	const timers = [];
 	const f = await fixture(t);
 	f.participation.timer = (run, ms) => timers.push({ run, ms });
@@ -1168,58 +1168,170 @@ test('要做比较久的事：开始画图就先说一句；20 秒没动静也�
 	]);
 	await new Promise((resolve) => setImmediate(resolve));
 	const [a, b] = [...f.participation.calls.values()];
-	// turn-guard 看到 A 的回合呼叫 Krita start：马上说「好，我畫一下」。
+	// 以前 turn-guard 看到 Krita start 会叫她先说「好，我畫一下」；画图交给画室以后不再有这个事件，
+	// 就算收到旧格式的事件也不说（快速画完时会多插一句话，第 2 轮审查）。
 	f.participation.turnEvent({
 		type: 'progress',
 		channelId: 'room',
 		messageId: a.messageId,
 		drawing: true,
 	});
-	f.participation.turnEvent({
-		type: 'progress',
-		channelId: 'room',
-		messageId: a.messageId,
-		drawing: true,
-	});
-	// B 的 20 秒计时到了：还没任何东西送达，说「等我一下」。
 	assert.deepEqual(
 		timers.map((row) => row.ms),
 		[20_000, 20_000],
 	);
+	// B 的 20 秒计时到了：还没任何东西送达，说「等我一下」。
 	timers[1].run();
-	// 工具已经替 A 送出预览：A 的计时到了也不再说。
+	// 工具已经替 A 送出东西：A 的计时到了也不再说。
 	f.participation.recordToolMessage('room', a.messageId);
 	timers[0].run();
 	drawing.open();
 	const { controls, logs } = await pending;
 	await new Promise((resolve) => setImmediate(resolve));
-	// 先说的那句是控制讯息（不算答覆）；两则都有答覆，所以没有补「卡住了」。
 	assert.deepEqual(
 		controls.map((row) => row.text),
-		['好，我畫一下', '等我一下，我弄一下'],
+		['等我一下，我弄一下'],
 	);
 	assert.deepEqual(f.participation.calls.size, 0, '呼叫结束后纪录清掉');
-	assert.ok(
-		logs.some(
-			(line) =>
-				line === `直接呼叫 先说一句 #${a.messageId} kind=drawing status=sent`,
-		),
-	);
 	assert.ok(
 		logs.some(
 			(line) =>
 				line === `直接呼叫 先说一句 #${b.messageId} kind=slow status=sent`,
 		),
 	);
-	assert.equal(
-		logs.filter((line) => line.includes('先说一句')).length,
-		2,
-		'每则最多一次',
-	);
+	assert.equal(logs.filter((line) => line.includes('先说一句')).length, 1);
 	assert.match(
 		result(logs, a.messageId)[0],
-		/status=answered .*tool=1 sendFail=0 preface=drawing /,
+		/status=answered .*tool=1 sendFail=0 preface=no /,
 	);
+});
+
+test('交给画室：这轮没说话就替她说「好，我去畫」或「前面還有一張…」，不说「卡住了」', async (t) => {
+	const f = await fixture(t);
+	let drawEvents = [];
+	const { deliver } = bridgeFor(f.participation, {
+		A: {
+			run: async () => {
+				for (const event of drawEvents) f.participation.drawEvent(event);
+				return { chunks: ['(本回合没有文本回复)'] };
+			},
+		},
+	});
+	const first = message('<@123> KEY-A 畫貓', { mentions: [{ id: '123' }] });
+	const controls = [];
+	const logs = [];
+	f.participation.log = (text) => logs.push(text);
+	drawEvents = [
+		{
+			type: 'accepted',
+			channelId: 'room',
+			messageId: first.id,
+			status: 'started',
+		},
+	];
+	await f.participation.receive(first, identity, deliver, async (text) =>
+		controls.push(text),
+	);
+	const second = message('<@123> KEY-A 也畫狗', { mentions: [{ id: '123' }] });
+	drawEvents = [
+		{
+			type: 'accepted',
+			channelId: 'room',
+			messageId: second.id,
+			status: 'queued',
+		},
+	];
+	await f.participation.receive(second, identity, deliver, async (text) =>
+		controls.push(text),
+	);
+	assert.deepEqual(controls, ['好，我去畫', '前面還有一張，畫完就畫你的']);
+	assert.match(result(logs, first.id)[0], /status=draw-ack-sent /);
+	assert.match(result(logs, second.id)[0], /status=draw-ack-sent /);
+	// 别的频道或别则讯息的事件不算。
+	f.participation.drawEvent({
+		type: 'accepted',
+		channelId: 'other',
+		messageId: second.id,
+		status: 'started',
+	});
+});
+
+test('「好，我去畫」之后不会被当成「我看看」再自动续做一轮', async (t) => {
+	const f = await fixture(t);
+	let rounds = 0;
+	const input = message('<@123> KEY-A 畫貓', { mentions: [{ id: '123' }] });
+	const { deliver } = bridgeFor(f.participation, {
+		A: {
+			run: async () => {
+				rounds++;
+				f.participation.drawEvent({
+					type: 'accepted',
+					channelId: 'room',
+					messageId: input.id,
+					status: 'started',
+				});
+				return { chunks: ['我去看看怎麼畫'] };
+			},
+		},
+		follow: { run: async () => (rounds++, { chunks: ['續做'] }) },
+	});
+	await f.participation.receive(input, identity, deliver, async () => {});
+	assert.equal(rounds, 1);
+});
+
+test('不算「只 @」：附任何档案、Discord 贴图、embed、挂了回复（引用抓不到也算）、她一分钟内刚说过话', async (t) => {
+	const f = await fixture(t);
+	const asked = [];
+	const { deliver } = bridgeFor(f.participation, {
+		default: { run: async () => (asked.push('model'), { chunks: ['好'] }) },
+	});
+	const bare = (extra) =>
+		message('<@123>', { mentions: [{ id: '123' }], ...extra });
+	const cases = [
+		{
+			attachments: [
+				{
+					id: '1',
+					filename: 'a.pdf',
+					content_type: 'application/pdf',
+					url: 'https://cdn.example/a.pdf',
+				},
+			],
+		},
+		{ sticker_items: [{ id: '9', name: 'wave' }] },
+		{ embeds: [{ type: 'rich' }] },
+		{ message_reference: { message_id: '1999999999999999999' } },
+	];
+	const controls = [];
+	for (const extra of cases) {
+		f.advance?.(5 * 60000);
+		await f.participation.receive(
+			bare(extra),
+			identity,
+			deliver,
+			async (text) => controls.push(text),
+		);
+	}
+	assert.equal(asked.length, 4, '这四种都交给模型');
+	assert.ok(!controls.some((text) => /怎麼了/.test(text)));
+	// 她刚说过话（上一则就在回）：一分钟内的空 @ 多半是在接她的话。
+	f.participation.channel('room').lastSpokeAt = f.participation.now();
+	await f.participation.receive(bare({}), identity, deliver, async (text) =>
+		controls.push(text),
+	);
+	assert.equal(asked.length, 5);
+	assert.ok(!controls.some((text) => /怎麼了/.test(text)));
+});
+
+test('被 /stop 停掉的呼叫：桥接问 canSend 时一律不送', async (t) => {
+	const f = await fixture(t);
+	const channel = f.participation.channel('room');
+	const call = f.participation.openCall(channel, '42', async () => {});
+	const ticket = { proactive: false, round: { call, said: [] } };
+	assert.equal(f.participation.canSend('room', ticket), true);
+	f.participation.interrupt('room', 'stop');
+	assert.equal(f.participation.canSend('room', ticket), false);
+	f.participation.closeCall(call);
 });
 
 test('工具送出的讯息（Krita 预览、discord_send_message）算这则呼叫的答覆', async (t) => {

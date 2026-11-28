@@ -12,12 +12,33 @@ def once(content, anchor, replacement):
 # ---- 一轮的期限、取消与归帐（2026-11-28「正在输入」不停）----
 # 这些片段同时给 social_patch（从上游重建）与 port_typing_fix（移植到 VM 现行 release）用，
 # 两边接上的程式码一模一样。
-TURN_IMPORT = 'import { runSocialTurn, awaitSocialTurn, socialFollowup, socialPromptSeq, socialBounded, trackSocialSends, onSocialTurn, errorTrace, TURN_DEADLINE_NOTICE } from "dsh-social-runtime/bridge";\n'
+TURN_IMPORT = 'import { runSocialTurn, awaitSocialTurn, socialFollowup, socialPromptSeq, socialBounded, trackSocialSends, onSocialTurn, errorTrace, stopSocialTurns, socialTyping, TURN_DEADLINE_NOTICE } from "dsh-social-runtime/bridge";\n'
 
 # 「正在输入」从 runSocialTurn 亮起，期限（预设 280 秒）从这里算，任何情况都熄灯；
 # 卡住的附件、flush 不会再拖住灯与频道队列。
 ENQUEUE = ('await this.runPrompt(channelId, messageId, text, beginTyping, attachments)',
-           'await runSocialTurn({ channelId, messageId, beginTyping, log: (line) => this.log("info", line) }, (socialBudget) => this.runPrompt(channelId, messageId, text, socialBudget.beginTyping, attachments, socialBudget))')
+           'await runSocialTurn({ channelId, messageId, beginTyping, queuedAt: socialQueuedAt, log: (line) => this.log("info", line) }, (socialBudget) => this.runPrompt(channelId, messageId, text, socialBudget.beginTyping, attachments, socialBudget))')
+# 进队列的时间：之后来的 /stop 连排队中的也停掉。
+ENQUEUE_AT = ('async enqueuePrompt(channelId, messageId, text, beginTyping, attachments) {',
+              'async enqueuePrompt(channelId, messageId, text, beginTyping, attachments) {\n\t\tconst socialQueuedAt = Date.now();')
+# /stop：这个频道正在跑与排队中的讯息都停（不再送进模型、不再送答）。
+COMMAND_STOP = ('commandStop(channelId) {', 'commandStop(channelId) {\n\t\tstopSocialTurns(channelId);')
+# 「正在输入」：被限流时不在 REST 里重送，熄灯后连送到一半的也取消。
+TYPING = ('''const beginTypingFor = (channelId) => {
+\t\t\tlet timer;
+\t\t\tconst fire = () => {
+\t\t\t\trest.triggerTyping(channelId).catch(() => {});
+\t\t\t};
+\t\t\tfire();
+\t\t\ttimer = setInterval(fire, Math.max(config.typingIntervalMs, 3e3));
+\t\t\treturn () => {
+\t\t\t\tif (timer !== void 0) clearInterval(timer);
+\t\t\t\ttimer = void 0;
+\t\t\t};
+\t\t};''', 'const beginTypingFor = (channelId) => socialTyping(rest, channelId, config.typingIntervalMs);')
+# 附件下载失败的日志不写错误内文（可能带私讯附件的档名或网址）。
+INCOMING_FAILED = ('this.log("warn", `incoming attachment failed: ${String(error)}`);',
+                   'this.log("warn", `incoming attachment failed #${messageId}：${errorTrace(error)}`);')
 SIGNATURE = ('async runPrompt(channelId, messageId, text, beginTyping, attachments) {',
              'async runPrompt(channelId, messageId, text, beginTyping, attachments, socialBudget) {')
 SAVE_SIGNATURE = ('async saveIncoming(agentCwd, messageId, attachments) {',
@@ -40,6 +61,20 @@ PROMPT_SEQ = ('const promptSeq = findPromptSeq(events, messageId);',
 PROMPT_FAILED = ('this.log("warn", `prompt failed: ${String(error)}`);',
                  'this.log("warn", `prompt failed #${messageId}：${errorTrace(error)}`);')
 # 送讯：每一段凭 naturalTicket（这则呼叫的这一轮）记帐，送出失败也记。
+# 每次成功送出就记一笔：文字送出就算答覆，后面的贴图附件失败只记日志，不再补「卡住了」。
+def group_send(commitment=''):
+    return ('''let sent;
+if (prepared.text.trim()) {
+  sent = await rest.createMessage(message.channel_id, prepared.text, target.messageId);
+  participation.recordReply(message.channel_id, target.text, sent.id, participation.replyPartner(target, message.author.id), target.messageId, index === 0, naturalTicket);
+''' + commitment + '''}
+if (prepared.files.length) try {
+  const withFiles = await rest.createMessageWithFiles(message.channel_id, "", prepared.files);
+  if (!sent && withFiles) participation.recordReply(message.channel_id, target.text, withFiles.id, participation.replyPartner(target, message.author.id), target.messageId, index === 0, naturalTicket);
+} catch (error) {
+  if (!sent) throw error;
+  logger.warn(`discord-bridge: sticker upload failed #${message.id}：${errorTrace(error)}`);
+}''')
 NOTICE_TICKET = ('participation.turnNotice(message.channel_id, chunk)) continue;',
                  'participation.turnNotice(message.channel_id, chunk, naturalTicket)) continue;')
 RECORD_TICKET = ('target.messageId, index === 0);', 'target.messageId, index === 0, naturalTicket);')
@@ -54,13 +89,13 @@ HANDLING_FAILED = ('logger.warn(`discord-bridge: message handling failed: ${Stri
 # 工具（discord_send_message、Krita）送到频道的讯息记到正在跑的那则呼叫名下。
 TRACKED_REST = ('registerDiscordRest(rest);',
                 'registerDiscordRest(trackSocialSends(rest, (channelId, messageId) => participation.recordToolMessage(channelId, messageId)));')
-# 开始画图时先说一句（turn-guard 的进度事件）。
+# turn-guard 的回合事件交给群聊行为处理（目前不做事，保留接点）。
 SUBSCRIBE = 'onSocialTurn((event) => participation.turnEvent(event));\n'
 MESSAGE_FAILED = '.catch((error) => logger.warn(`群聊行为处理未完成，保持安静 #${message.id}：${errorTrace(error)}`))'
 EDIT_FAILED = '.catch((error) => logger.warn(`编辑讯息处理未完成，保持安静 #${message.id}：${errorTrace(error)}`))'
 # 一轮的整段生命周期（runPrompt 本体与 deliverMessage 送讯）共用的接点，上游与现行 release 都有。
-LIFECYCLE = [ENQUEUE, SIGNATURE, SAVE_SIGNATURE, FETCH, ATTACH, FLUSH, PROMPT_SEQ, PROMPT_FAILED,
-             SEND_FAILED, FILES, FILES_FAILED, HANDLING_FAILED]
+LIFECYCLE = [ENQUEUE, ENQUEUE_AT, SIGNATURE, SAVE_SIGNATURE, FETCH, ATTACH, FLUSH, PROMPT_SEQ, PROMPT_FAILED,
+             SEND_FAILED, FILES, FILES_FAILED, HANDLING_FAILED, COMMAND_STOP, TYPING, INCOMING_FAILED]
 
 
 def social_patch(content):
@@ -72,11 +107,8 @@ def social_patch(content):
     content = once(content, 'const sent = await rest.createMessage(message.channel_id, chunk, index === 0 ? message.id : void 0);', '''if (message.guild_id !== void 0 && participation.turnNotice(message.channel_id, chunk, naturalTicket)) continue;
 const target = message.guild_id === void 0 ? { text: chunk } : participation.replyTarget(message.channel_id, chunk);
 const prepared = message.guild_id === void 0 ? { text: redactSecrets(chunk), files: [] } : await prepareGroupReply(target.text);
-let sent;
-if (prepared.text.trim()) sent = await rest.createMessage(message.channel_id, prepared.text, target.messageId);
-if (prepared.files.length) sent = (await rest.createMessageWithFiles(message.channel_id, "", prepared.files)) ?? sent;
-if (!sent) continue;''')
-    content = once(content, 'participation.recordReply(message.channel_id, chunk, sent.id, message.author.id);', 'participation.recordReply(message.channel_id, target.text, sent.id, participation.replyPartner(target, message.author.id), target.messageId, index === 0, naturalTicket);')
+''' + group_send())
+    content = once(content, 'participation.recordReply(message.channel_id, chunk, sent.id, message.author.id);', '')
     content = once(content, 'return allowedUsers.length === 0 || allowedUsers.includes(message.author.id);', 'return true;')
     # 群聊自动开新会话时不发「(已自动新建会话 …)」：那是给管理用的讯息，群友不需要看到。
     content = once(content, 'const preamble = created && title !== void 0 ?', 'const preamble = this.config.preset !== "whale-social" && created && title !== void 0 ?')

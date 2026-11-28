@@ -75,6 +75,18 @@ class SocialPatchTests(unittest.TestCase):
         self.assertIn("log: (text) => logger.info(text),", self.patched)
         self.assertIn("errorTrace", self.patched.splitlines()[1])
 
+    def test_round_two_lifecycle_fixes(self):
+        # 每次成功送出就记一笔：文字送出就算答覆，后面的贴图附件失败不再让她补「卡住了」。
+        self.assertNotIn("if (!sent) continue;", self.patched)
+        self.assertIn("if (!sent) throw error;", self.patched)
+        self.assertIn("discord-bridge: sticker upload failed #${message.id}：${errorTrace(error)}", self.patched)
+        # /stop 连排队中的也停；「正在输入」熄灯后不重送；附件下载失败不写错误内文。
+        self.assertIn("commandStop(channelId) {\n\t\tstopSocialTurns(channelId);", self.patched)
+        self.assertIn("const socialQueuedAt = Date.now();", self.patched)
+        self.assertIn("socialTyping(rest, channelId, config.typingIntervalMs)", self.patched)
+        self.assertNotIn("rest.triggerTyping(channelId)", self.patched)
+        self.assertIn("incoming attachment failed #${messageId}：${errorTrace(error)}", self.patched)
+
     def test_drifted_upstream_is_refused(self):
         for anchor in ("await agent.whenIdle();", "const promptSeq = findPromptSeq(events, messageId);", "const response = await fetch(attachment.url);"):
             with self.assertRaises(ValueError):

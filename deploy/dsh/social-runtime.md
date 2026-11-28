@@ -167,14 +167,16 @@ python -m unittest discover -s deploy/pve -p 'test_*.py'
     - 它的面板会直接改 profile 的 `cordis.patch.yml`，跟我们的部署脚本抢写，所以不装。
   - 设定（`configure_social.py --huanqi`，e2e 设定档也写同一组）：`fullCompactOnBreaker: false`、`regionCompactAfterCuts: 0`、`postCompactRecallHint: false`。压缩留给第三步带出处的压缩，我们也没有它那套检索工具；其余照预设，最多连续补救 6 次，额度用完就停。
   - 桥接接补救轮：huanqi 所有的补救都是「等这一轮结束，再追加一则 `source.kind: loop-guard` 的讯息、另开一轮」。原本桥接只取第一轮，补救的回答传不到 Discord。现在 `SessionBridge` 在 `whenIdle` 后会再等 0.3 秒（`settleSocialTurn`），看到补救讯息就等它跑完；取回答时用 `extractSocialReply`，跨过 loop-guard 讯息往下收、取最后一则有文字的，碰到别人的新讯息就停。
-  - 2026-11-28 修正（「@ 了只显示正在输入」事故，第 1 轮审查后重做；程式在 `deploy/social/turn-guard.mjs`）：
-    - 一轮的整段生命周期由 `runSocialTurn` 管：「正在输入」从它亮起、期限从它算，任何情况都熄灯。预设 280 秒（主人决定，让多数作画画得完；Krita 16 轮里 12 轮在 280 秒内），`DISCORD_TURN_DEADLINE_MS` 可调（30 秒～30 分钟），仍短于闸道 5 分钟的讯息效期。附件下载每个 30 秒、flush 与附件都在期限内（`socialBounded`），卡住也不会拖住灯和频道队列。期限到了她说「這一輪我做了太多步，先停一下；要繼續再叫我。」。
+  - 2026-11-28 修正（「@ 了只显示正在输入」事故，第 1、2 轮审查后重做；程式在 `deploy/social/turn-guard.mjs` 与 `deploy/social/studio.mjs`）：
+    - 画图交给背景画室（`studio.mjs`）：聊天回合只用 `draw_request` 交代要画什么、回一句「好，我去畫」就结束，「正在输入」只亮那几秒；画室在另一个会话里画（只有 `krita_batch`），画好由 Krita 直接回覆原本那则请求，画的时候不亮「正在输入」，同频道再叫她照常聊天。同一时间只画一张（Krita 的批次锁不等待；两张同时画时，用 VM 实测的耗时模拟，第二张 5.3% 的 Krita 呼叫会被拒、66% 的作画至少被拒一次），第二个请求排队并回「前面還有一張，畫完就畫你的」，最多排 3 张。没画成、只画到预览、超时（预设 10 分钟，`DISCORD_DRAW_DEADLINE_MS`；VM 上 25 个作画回合最长 497 秒）、判断不该画，都回一句固定短话；对方取消、改要求、/stop 不补话。画室的模型请求另外计数（上限 1），不占聊天的 2 个名额。
+    - 同一则讯息共用一套期限与停止讯号：自动续做沿用第一轮的期限（不会同一则亮灯 540 秒）；/stop 停掉正在跑与排队中的讯息，之后不再送进模型、不再送答。
+    - 一轮的整段生命周期由 `runSocialTurn` 管：「正在输入」从它亮起、期限从它算，任何情况都熄灯。预设 280 秒（画图搬走后聊天回合应在几十秒内结束，这只是保护上限），`DISCORD_TURN_DEADLINE_MS` 可调（30 秒～30 分钟），仍短于闸道 5 分钟的讯息效期。附件下载每个 30 秒、flush 与附件都在期限内（`socialBounded`），卡住也不会拖住灯和频道队列。期限到了她说「這一輪我做了太多步，先停一下；要繼續再叫我。」。
     - 等待与取回答都绑这次送进 inbox 的讯息 id（`socialFollowup`／`socialPromptSeq`），自动续做重用同一个 Discord ID 也不会拿到上一轮。回合已完整回答就不等补救轮，并停掉它（排着的从 inbox 移掉、在跑的取消）；到期限只取消属于自己的那一轮，一律 `keepInbox`，正在跑的是别人的回合（心跳、网页）就不取消，日志照实写 `deadline-cancelled`／`deadline-unsettled`／`deadline-not-owner`。
-    - 每则直接呼叫一笔纪录：桥接送出的每一段凭 `naturalTicket`（这则呼叫的这一轮）记帐，工具（`discord_send_message`、Krita 预览／交付）送到频道的讯息由 `trackSocialSends` 记到「桥接此刻在跑的那则」名下；控制讯息、先说的那句不算答覆。实际送达的文字、附件、工具讯息都没有，就补一句固定文字「欸 我剛剛卡住了，你再說一次」（模型没正文、回合被取消、排队过期都算）；做了太多步一定照实说；用量到顶说固定的「今天的模型用量先到这里，稍后再聊。」；被 `/stop` 这类指令停掉的不补。别则呼叫不会压掉这则的提示。
-    - 只 @ 她、没有别的内容（没回覆别则、没附图，同一个人一分钟内也没有还没被回的话）：不交给模型，直接问一句「怎麼了？」，之后那个人接着说就当成对她说。只叫名字照常交给模型。
-    - 要做比较久的事先说一句：回合一开始画（Krita `start`／`paint`／`paint_plan`／`plan_strokes_from_image`）就说「好，我畫一下」；否则 20 秒（`SLOW_TURN_NOTICE_SECONDS` 可调）还没任何东西送达就说「等我一下，我弄一下」，每则最多一次。依 VM 上 881 轮：超过 30 秒的 40 轮里，动工具前自己先说话的只有 2 轮，所以不靠模型自己说。
+    - 每则直接呼叫一笔纪录：桥接送出的每一段凭 `naturalTicket`（这则呼叫的这一轮）记帐，工具送到频道的讯息由 `trackSocialSends` 照「是哪则讯息送出的」记帐（挂了回复算被回复的那则；没挂回复时，送出前后桥接都在跑同一则才算，A 晚送达不会算给 B）；桥接每次成功送出文字就记一笔，后面的贴图附件失败只记日志；控制讯息、先说的那句不算答覆。交给画室以后这轮没说话，就替她说「好，我去畫」或排队那句，不说「卡住了」。实际送达的文字、附件、工具讯息都没有，就补一句固定文字「欸 我剛剛卡住了，你再說一次」（模型没正文、回合被取消、排队过期都算）；做了太多步一定照实说；用量到顶说固定的「今天的模型用量先到这里，稍后再聊。」；被 `/stop` 这类指令停掉的不补。别则呼叫不会压掉这则的提示。
+    - 只 @ 她、没有别的内容（没挂回复——引用抓不到也算有挂、没附任何档案或 Discord 贴图或 embed，同一个人一分钟内也没有还没被回的话，她自己一分钟内也没说过话）：不交给模型，直接问一句「怎麼了？」，之后那个人接着说就当成对她说。只叫名字照常交给模型。
+    - 要做比较久的事先说一句：20 秒（`SLOW_TURN_NOTICE_SECONDS` 可调）还没任何东西送达就说「等我一下，我弄一下」，每则最多一次。依 VM 上 881 轮：超过 30 秒的 40 轮里，动工具前自己先说话的只有 2 轮，所以不靠模型自己说。
     - 日志只写讯息 ID、固定代码与数量：每则直接呼叫「直接呼叫 收到 #ID」与在 finally 记一次的「直接呼叫 结果 #ID status=… turn=… text=… files=… tool=… sendFail=… preface=… secs=…」；错误只写 `errorTrace`（错误类别、Discord 状态码、堆疊里的函式与行号），不写错误内文。
-    - 移植到 VM 现行 release：见 [typing-hang-port.md](typing-hang-port.md)。验收：`node deploy/dsh/typing-hang-repro.mjs --release <release 副本>` 拿副本里真正的桥接程式码跑 13 个情境，逐则讯息 ID 判定。
+    - 移植到 VM 现行 release：见 [typing-hang-port.md](typing-hang-port.md)。验收：`node deploy/dsh/typing-hang-repro.mjs --release <release 副本>` 拿副本里真正的桥接程式码跑 25 个情境，逐则讯息 ID 判定「每一则 @ 都有正确、及时的回应」。
   - e2e 新增一项：假模型第一次只回思考、不给正文（完全空白会被 dsh 判成错误，huanqi 不管错误），huanqi 判定 `continue` 并另开一轮，第二次的文字传到 Discord，群里不出现系统提示。26 个回合里它只出手这 1 次，23 个正常回合都判 `skip:had-output`。
   - 每回合动作上限（`turnStepLimit`，预设 40）：dsh 对一回合里的模型调用（工具反复调用）没有上限，huanqi 也不管「一直做」这种情况。runtime 在 `llm/stream` 按 `sessionId` 计数，`session/event` 的 `turn/start` 归零；超过就以 `LOCAL_TURN_STEPS` 结束这一回合，她在群里原样说「這一輪我做了太多步，先停一下；要繼續再叫我。」，并记进 `social-runtime/vital-events.jsonl`。判断、整理这类不带 `sessionId` 的调用不计。
   - 烧钱警报（`spendAlert`，预设每天 5 元、一小时暴增为平常 3 倍且至少 0.5 元）：维持不设每日上限，每 10 分钟读一次 DeepSeek 余额（人民币的充值钱包加赠送钱包）。相邻读数的减少才算花费，余额变多当成充值。今天超过门槛私讯拥有者一次；一小时暴增三小时内最多提醒一次（要有 3 小时以上的读数才判断）。状态存在 `spend-state.json`；`/费用` 也显示今天大约花了多少。

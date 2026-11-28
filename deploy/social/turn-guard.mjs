@@ -1,14 +1,21 @@
 // 一则 Discord 讯息在桥接里的那一轮：期限、取消、归帐，都绑在这一轮自己的识别码上。
 // 桥接按频道串行 runPrompt，但送讯在串行之外；这里不靠「最早还没结束的那轮」这类顺序假设。
+// 同一则讯息自动续做（「我看看」之后再给一轮）时，期限与停止讯号沿用第一轮的，不重新计时。
+// 画图不在这里：聊天回合只交代给背景画室（studio.mjs），几秒就结束。
 import process from 'node:process';
-import { clearTimeout, setTimeout } from 'node:timers';
+import {
+	clearInterval,
+	clearTimeout,
+	setInterval,
+	setTimeout,
+} from 'node:timers';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const { AbortController } = globalThis;
 
-// 一轮（含 huanqi 补救轮、附件、flush）最多多久。依 VM 上 881 轮的耗时：p95 28 秒；
-// Krita 作画 16 轮里 12 轮在 280 秒内画完。仍短于闸道 5 分钟的讯息效期，
-// 排在后面的那则 @ 轮到时还有效。DISCORD_TURN_DEADLINE_MS 可调。
+// 一则讯息（含自动续做、huanqi 补救轮、附件、flush）最多多久。依 VM 上 881 轮的耗时：p95 28 秒；
+// 画图搬到背景画室以后，聊天回合应该在几十秒内结束，这只是保护上限。
+// 仍短于闸道 5 分钟的讯息效期，排在后面的那则 @ 轮到时还有效。DISCORD_TURN_DEADLINE_MS 可调。
 export const DEFAULT_TURN_DEADLINE_MS = 280_000;
 export const TURN_STEPS_TEXT = '這一輪我做了太多步，先停一下；要繼續再叫我。';
 export const TURN_DEADLINE_NOTICE = '⚠️ 回合失败: ' + TURN_STEPS_TEXT;
@@ -49,10 +56,74 @@ export function errorTrace(error) {
 	return [name + (status ? ' ' + status : ''), ...frames].join(' | ');
 }
 
-// ---- 每一轮的事件：开始、进度（开始画图）、结束 ----
+// ---- 每一轮的事件：开始、结束 ----
 const listeners = new Set();
 // 频道 → 桥接此刻正在跑的那则讯息 ID（runPrompt 期间）。
 const active = new Map();
+// 「频道:讯息 ID」→ 这则讯息的期限与停止讯号（同一则讯息的每一轮共用）。
+const budgets = new Map();
+// 频道 → 最近一次 /stop 的时间：之前就排进队列、还没轮到的讯息也不再跑。
+const stops = new Map();
+const budgetKey = (channelId, messageId) => `${channelId}:${messageId}`;
+
+// 这则讯息的期限与停止讯号；第一次用到时开始计时，之后的每一轮（自动续做）都沿用。
+function budgetFor(channelId, messageId, deadlineMs, now, queuedAt) {
+	const key = budgetKey(channelId, messageId);
+	let budget = budgets.get(key);
+	// 很久以前的同一则（例如被编辑后再叫她）重新计时。
+	if (
+		budget &&
+		now() - budget.startedAt > budget.deadlineMs + GRACE_MS + 60_000
+	) {
+		budgets.delete(key);
+		budget = undefined;
+	}
+	if (!budget) {
+		budget = {
+			channelId,
+			messageId,
+			startedAt: now(),
+			deadlineMs,
+			controller: new AbortController(),
+			stopped: false,
+		};
+		budgets.set(key, budget);
+		if (budgets.size > 256) budgets.delete(budgets.keys().next().value);
+	}
+	const stoppedAt = stops.get(channelId);
+	if (
+		stoppedAt !== undefined &&
+		queuedAt !== undefined &&
+		queuedAt <= stoppedAt
+	)
+		stopBudget(budget);
+	return budget;
+}
+
+function stopBudget(budget) {
+	budget.stopped = true;
+	budget.controller.abort();
+}
+
+// /stop：这个频道正在跑与已经排队的讯息都停掉（不再送进模型、不再送答）。回传停了几则。
+export function stopSocialTurns(channelId, now = () => Date.now()) {
+	const channel = String(channelId);
+	stops.set(channel, now());
+	let count = 0;
+	for (const budget of budgets.values())
+		if (budget.channelId === channel && !budget.stopped) {
+			stopBudget(budget);
+			count++;
+		}
+	return count;
+}
+
+// 这则讯息是不是被 /stop 停掉了（桥接送答前问）。
+export function socialTurnStopped(channelId, messageId) {
+	return Boolean(
+		budgets.get(budgetKey(String(channelId), String(messageId)))?.stopped,
+	);
+}
 
 export function onSocialTurn(listener) {
 	listeners.add(listener);
@@ -72,19 +143,39 @@ export function activeSocialTurn(channelId) {
 	return active.get(String(channelId));
 }
 
-// 工具（discord_send_message、Krita 的预览与交付）用的 REST：送到某频道成功时，
-// 记到那个频道此刻正在跑的那则讯息名下。桥接自己的送讯不经过这里，另外记帐。
+// 送讯挂的「回复」是哪一则（JSON 或附件表单的 payload_json）。
+function referenceOf(body, form) {
+	let payload = body;
+	try {
+		if (form && typeof form.get === 'function')
+			payload = JSON.parse(String(form.get('payload_json') ?? '{}'));
+	} catch {
+		return undefined;
+	}
+	const id = payload?.message_reference?.message_id;
+	return /^\d{16,22}$/.test(String(id ?? '')) ? String(id) : undefined;
+}
+
+// 工具（discord_send_message、Krita 的预览与交付）用的 REST：送到某频道成功时记帐。
+// 归给谁看「是哪则讯息送出的」：挂了回复就是被回复的那则；没挂回复时，只有送出前后
+// 桥接都在跑同一则才算它的（A 的工具晚送达、那时已经轮到 B，不会算给 B）。
+// 桥接自己的送讯不经过这里，另外凭 ticket 记帐。
 export function trackSocialSends(rest, onSent) {
 	return new Proxy(rest, {
 		get(target, key, receiver) {
 			if (key !== 'request') return Reflect.get(target, key, receiver);
-			return async (method, path, ...rest) => {
-				const result = await target.request(method, path, ...rest);
+			return async (method, path, body, form, ...rest) => {
 				const channelId =
 					method === 'POST' &&
 					/^\/channels\/(\d+)\/messages$/.exec(String(path))?.[1];
-				const messageId = channelId && active.get(channelId);
-				if (messageId && result?.id)
+				const before = channelId && active.get(channelId);
+				const result = await target.request(method, path, body, form, ...rest);
+				if (!channelId || !result?.id) return result;
+				const after = active.get(channelId);
+				const messageId =
+					referenceOf(body, form) ??
+					(before && before === after ? before : undefined);
+				if (messageId)
 					try {
 						onSent(channelId, messageId, String(result.id));
 					} catch {
@@ -94,6 +185,40 @@ export function trackSocialSends(rest, onSent) {
 			};
 		},
 	});
+}
+
+// 「正在输入」：每隔几秒送一次 typing。被限流（429）时不在 REST 里等着重送（onceOnly），
+// 熄灯后连送到一半的那次也取消，不会熄灯后又亮。
+export function socialTyping(
+	rest,
+	channelId,
+	intervalMs = 8_000,
+	{ every = setInterval, clear = clearInterval } = {},
+) {
+	const controller = new AbortController();
+	let stopped = false;
+	const fire = () => {
+		if (stopped) return;
+		Promise.resolve()
+			.then(() =>
+				rest.request(
+					'POST',
+					`/channels/${channelId}/typing`,
+					undefined,
+					undefined,
+					controller.signal,
+				),
+			)
+			.catch(() => {});
+	};
+	fire();
+	const handle = every(fire, Math.max(intervalMs, 3_000));
+	return () => {
+		if (stopped) return;
+		stopped = true;
+		clear(handle);
+		controller.abort();
+	};
 }
 
 // 包住桥接的 runPrompt：「正在输入」从这里亮起，期限从这里算，任何情况都会熄灯。
@@ -112,10 +237,19 @@ export async function runSocialTurn(
 			return () => clearTimeout(handle);
 		},
 		log = () => {},
+		// 这则讯息进入频道队列的时间（之后来的 /stop 也会停掉它）。
+		queuedAt,
 	},
 	body,
 ) {
-	const controller = new AbortController();
+	const shared = budgetFor(
+		String(channelId),
+		String(messageId),
+		deadlineMs,
+		now,
+		queuedAt,
+	);
+	const controller = shared.controller;
 	let stopTyping;
 	let lit = false;
 	const stop = () => {
@@ -130,9 +264,13 @@ export async function runSocialTurn(
 	const budget = {
 		channelId: String(channelId),
 		messageId: String(messageId),
-		startedAt: now(),
-		deadlineMs,
+		// 期限从这则讯息第一轮开始算（自动续做不重新计时）。
+		startedAt: shared.startedAt,
+		deadlineMs: shared.deadlineMs,
 		signal: controller.signal,
+		get stopped() {
+			return shared.stopped;
+		},
 		// 原本的 runPrompt 自己会叫 beginTyping；只亮一次，熄灯交给这里。
 		beginTyping: () => {
 			if (!lit && !controller.signal.aborted) {
@@ -149,28 +287,34 @@ export async function runSocialTurn(
 		messageId: budget.messageId,
 	});
 	let cancelGrace;
+	const ended = () =>
+		shared.stopped
+			? { chunks: [], files: [], stopped: true }
+			: { chunks: [TURN_DEADLINE_NOTICE], files: [], deadline: 'abandoned' };
+	let offAbort = () => {};
 	const late = new Promise((resolve) => {
-		cancelGrace = timer(() => {
-			controller.abort();
+		// 期限到或 /stop：先熄灯、发出取消信号，再给它一点时间自己收尾，还不回来就不等。
+		const onAbort = () => {
+			cancelGrace?.();
 			stop();
-			log(`回合到期 #${budget.messageId}：已熄灯，等收尾`);
-			cancelGrace = timer(
-				() =>
-					resolve({
-						chunks: [TURN_DEADLINE_NOTICE],
-						files: [],
-						deadline: 'abandoned',
-					}),
-				graceMs,
-			);
-		}, deadlineMs);
+			if (!shared.stopped) log(`回合到期 #${budget.messageId}：已熄灯，等收尾`);
+			cancelGrace = timer(() => resolve(ended()), graceMs);
+		};
+		if (controller.signal.aborted) return onAbort();
+		controller.signal.addEventListener('abort', onAbort, { once: true });
+		offAbort = () => controller.signal.removeEventListener('abort', onAbort);
+		const remaining = shared.startedAt + shared.deadlineMs - now();
+		cancelGrace = timer(() => controller.abort(), Math.max(0, remaining));
 	});
 	try {
-		return await Promise.race([
+		const result = await Promise.race([
 			Promise.resolve().then(() => body(budget)),
 			late,
 		]);
+		// 收到 /stop 以后不再送答（runPrompt 已经拿到的答覆也不送）。
+		return shared.stopped ? { chunks: [], files: [], stopped: true } : result;
 	} finally {
+		offAbort();
 		cancelGrace?.();
 		stop();
 		if (active.get(budget.channelId) === budget.messageId)
@@ -212,12 +356,6 @@ const INTERNAL = new Set([
 	'plugin:dsh-plugin-discord',
 	'maintenance-probe',
 ]);
-const DRAW_ACTIONS = new Set([
-	'start',
-	'paint',
-	'paint_plan',
-	'plan_strokes_from_image',
-]);
 const messageOf = (event) => event?.data?.message ?? event?.data;
 const sourceOf = (event) => messageOf(event)?.source;
 const eventsOf = (agent) =>
@@ -228,18 +366,6 @@ function textOf(event) {
 		.filter((block) => block.type === 'text')
 		.map((block) => block.text ?? '')
 		.join('');
-}
-
-function drawingCall(event) {
-	if (event.type !== 'tool/call' || event.data?.name !== 'krita_batch')
-		return false;
-	let args = event.data.arguments;
-	try {
-		if (typeof args === 'string') args = JSON.parse(args);
-	} catch {
-		return false;
-	}
-	return DRAW_ACTIONS.has(args?.action);
 }
 
 // 这一轮在事件档里的样子。promptId 是桥接这次送进 inbox 的那则讯息的 id（每次都不同），
@@ -256,7 +382,6 @@ export function socialTurnState(events, promptId) {
 		ended: false,
 		completed: false,
 		text: '',
-		drawing: false,
 		foreign: false,
 		rescueRunning: false,
 	};
@@ -277,7 +402,6 @@ export function socialTurnState(events, promptId) {
 			const text = textOf(event);
 			if (text !== '') state.text = text;
 		}
-		if (drawingCall(event)) state.drawing = true;
 		if (event.type === 'turn/end') {
 			state.ended = true;
 			state.completed = event.data?.reason?.kind === 'completed';
@@ -331,7 +455,6 @@ export async function awaitSocialTurn(
 ) {
 	const started = startedAt ?? now();
 	const promptId = typeof prompt === 'string' ? prompt : prompt?.id;
-	const source = typeof prompt === 'string' ? {} : (prompt?.source ?? {});
 	let settled = false;
 	const done = Promise.resolve()
 		.then(() => agent.whenIdle())
@@ -340,21 +463,10 @@ export async function awaitSocialTurn(
 			settled = true;
 		});
 	done.catch(() => {});
-	let drawingSent = false;
 	const elapsed = () => now() - started;
 	for (;;) {
 		await Promise.race([done.catch(() => {}), pause(poll)]);
 		const state = socialTurnState(eventsOf(agent), promptId);
-		if (state.drawing && !drawingSent) {
-			drawingSent = true;
-			emit({
-				type: 'progress',
-				channelId: String(source.discordChannelId ?? ''),
-				messageId: String(source.discordMessageId ?? ''),
-				drawing: true,
-				elapsedMs: elapsed(),
-			});
-		}
 		if (state.answered) {
 			const stopped =
 				state.rescueRunning ||

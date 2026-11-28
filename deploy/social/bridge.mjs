@@ -206,6 +206,8 @@ export async function settleSocialTurn(agent, pause = (ms) => delay(ms)) {
 
 // 一轮的期限、取消、归帐与取回答在 turn-guard.mjs（桥接从这里一起汇入）。
 export * from './turn-guard.mjs';
+// 背景画室：画图不在聊天回合里做（studio.mjs）。
+export * from './studio.mjs';
 
 // 与桥接的 extractReply 相同，但会把 huanqi 的补救轮算进去（见 foldSocialReply）。
 export function extractSocialReply(events, promptSeq) {
