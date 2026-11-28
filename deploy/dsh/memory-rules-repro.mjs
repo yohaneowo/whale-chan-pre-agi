@@ -20,6 +20,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import process from 'node:process';
+import { setTimeout } from 'node:timers';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
@@ -56,13 +57,85 @@ const ROOM_B = '1200000000000000003';
 const SECRET_ROOM = '1200000000000000004';
 const DM = '1200000000000000005';
 const VIEW = 1n << 10n;
+const HISTORY = 1n << 16n;
+const ROLE = '1300000000000000001';
+const ROLE_ROOM = '1200000000000000006';
+const MEMBER_ROOM = '1200000000000000007';
+const FORUM = '1200000000000000008';
+const FORUM_POST = '1200000000000000009';
+// 频道与权限（每个世界各一份，情境里可以改：收紧权限、论坛改成不公开）。
 const CHANNELS = [
 	{ id: GENERAL, name: 'general' },
 	{ id: ROOM_A, name: 'a-room' },
 	{ id: ROOM_B, name: 'b-room' },
 	// 不公开的频道：@everyone 看不到。
 	{ id: SECRET_ROOM, name: 'secret-room', hidden: true },
+	// @everyone 看得到，但有一个角色被拒绝检视（那个角色的人看不到）：不算公开。
+	{
+		id: ROLE_ROOM,
+		name: 'role-room',
+		overwrites: [{ id: ROLE, type: 0, allow: '0', deny: String(VIEW) }],
+	},
+	// @everyone 看得到，但有一个人被拒绝检视：不算公开。
+	{
+		id: MEMBER_ROOM,
+		name: 'member-room',
+		overwrites: [{ id: FRIEND2, type: 1, allow: '0', deny: String(VIEW) }],
+	},
+	// 论坛（公开），底下一则贴文（讨论串，跟着论坛）。
+	{ id: FORUM, name: 'forum-x', type: 15 },
 ];
+// 回忆守门员（假的，照题目回答；真模型的准确度另外用 recall-gate 实测）：目标原文 → 判断。
+const GATE = {
+	真的是玩壞了這個肥魚: { recall: false },
+	今天好熱喔: { recall: false },
+	早安: { recall: false },
+	'上次說的暗號是什麼？': { recall: true, explicit: true, queries: ['暗號'] },
+	'b-room 那邊說的暗號是什麼？': {
+		recall: true,
+		explicit: true,
+		queries: ['暗號'],
+	},
+	'上次 a-room 說的暗號是什麼？': {
+		recall: true,
+		explicit: true,
+		queries: ['暗號'],
+	},
+	'上次那個包裹到了嗎？': { recall: true, explicit: true, queries: ['包裹'] },
+	'上次說的潛水課你還記得嗎？': {
+		recall: true,
+		explicit: true,
+		queries: ['潛水課'],
+	},
+	'那次潛水看到海龜是在哪裡？': {
+		recall: true,
+		explicit: true,
+		queries: ['海龜'],
+	},
+	'潛水看到海龜那次是在哪裡？': {
+		recall: true,
+		explicit: true,
+		queries: ['海龜'],
+	},
+	'早安 @某人': { recall: false },
+	'那個搞定了沒？': { recall: true, explicit: true, queries: ['重灌'] },
+	'role-room 那邊說的暗號是什麼？': {
+		recall: true,
+		explicit: true,
+		queries: ['暗號'],
+	},
+	'member-room 那邊說的暗號是什麼？': {
+		recall: true,
+		explicit: true,
+		queries: ['暗號'],
+	},
+	'論壇那篇說的暗號是什麼？': {
+		recall: true,
+		explicit: true,
+		queries: ['暗號'],
+	},
+	'上次說的口令是什麼？': { recall: true, explicit: true, queries: ['口令'] },
+};
 const NAMES = {
 	[OWNER]: '站長',
 	[FRIEND]: '群友甲',
@@ -106,17 +179,30 @@ function world() {
 		engine,
 	);
 	runtime.archive = new ArchiveStore(join(stateRoot, 'archive'));
+	const channels = CHANNELS.map((row) => ({ ...row }));
+	const api = { down: false };
 	const channel = (id) => {
-		const row = CHANNELS.find((entry) => entry.id === id);
+		const row = channels.find((entry) => entry.id === id);
+		if (id === FORUM_POST)
+			return {
+				id,
+				guild_id: GUILD,
+				type: 11,
+				parent_id: FORUM,
+				name: 'forum-post',
+			};
 		return row
 			? {
 					id,
 					guild_id: GUILD,
-					type: 0,
+					type: row.type ?? 0,
 					name: row.name,
-					permission_overwrites: row.hidden
-						? [{ id: GUILD, type: 0, allow: '0', deny: String(VIEW) }]
-						: [],
+					permission_overwrites: [
+						...(row.hidden
+							? [{ id: GUILD, type: 0, allow: '0', deny: String(VIEW) }]
+							: []),
+						...(row.overwrites ?? []),
+					],
 				}
 			: id === DM
 				? { id, type: 1 }
@@ -124,14 +210,18 @@ function world() {
 	};
 	runtime.discordRest = {
 		request: async (method, path) => {
+			if (api.down) throw new Error('Discord API 500');
 			if (path === `/guilds/${GUILD}`)
 				return {
 					id: GUILD,
 					owner_id: OWNER,
-					roles: [{ id: GUILD, permissions: String(VIEW | (1n << 11n)) }],
+					roles: [
+						{ id: GUILD, permissions: String(VIEW | HISTORY | (1n << 11n)) },
+						{ id: ROLE, permissions: '0' },
+					],
 				};
 			if (path === `/guilds/${GUILD}/channels`)
-				return CHANNELS.map((row) => channel(row.id));
+				return channels.map((row) => channel(row.id));
 			let match = /^\/channels\/(\d+)\/messages\/(\d+)$/.exec(path);
 			if (match) {
 				const row = messages.get(match[2]);
@@ -156,6 +246,49 @@ function world() {
 		messages.set(message.id, message);
 		runtime.archive.record('message', message);
 		return message;
+	};
+	// 模型：回忆守门员照 GATE 回答（记下被问过的原文）；背景整理交给情境给的 consolidator。
+	const gateAsked = [];
+	const llmCalls = [];
+	const model = { consolidator: undefined };
+	services.agentDefaultModel = {
+		currentSelection: () => ({
+			provider: 'opencode-go',
+			model: 'deepseek-v4.1-flash',
+		}),
+	};
+	services.llm = {
+		async *stream(options) {
+			llmCalls.push(options);
+			const prompt = options.messages?.[0]?.content?.[0]?.text ?? '';
+			if (String(options.system).includes('回憶守門員')) {
+				const target =
+					/<untrusted_target_[0-9a-f]+>\n([\s\S]*?)\n<\/untrusted_target/.exec(
+						prompt,
+					)?.[1] ?? '';
+				gateAsked.push({ target, prompt });
+				const verdict = GATE[target.replace(/^\d{1,2}月/, '')] ?? {
+					recall: false,
+					unknown: true,
+				};
+				yield {
+					type: 'text-delta',
+					text: JSON.stringify({
+						reason: '假的',
+						explicit: false,
+						queries: [],
+						...verdict,
+					}),
+				};
+				yield { type: 'finish', reason: { kind: 'stop' } };
+				return;
+			}
+			if (!model.consolidator)
+				throw new Error('这个情境没有设定背景整理的模型');
+			const text = await model.consolidator(options);
+			yield { type: 'text-delta', text };
+			yield { type: 'finish', reason: { kind: 'stop' } };
+		},
 	};
 	// 平常的群聊（几百则）：让「多常见」的权重跟正式帐本差不多（门槛是照正式帐本定的）。
 	const subjects = [
@@ -206,6 +339,11 @@ function world() {
 		warns,
 		services,
 		say,
+		channels,
+		api,
+		gateAsked,
+		llmCalls,
+		model,
 		cleanup: () => rmSync(stateRoot, { recursive: true, force: true }),
 	};
 }
@@ -267,7 +405,8 @@ async function turn(w, { channelId, author, text, probes = [], openIds = [] }) {
 			},
 		},
 	});
-	w.runtime.prepare(agent, channelId, message.id);
+	// prepare 可能要等回忆守门员（新版回传 promise）。
+	await w.runtime.prepare(agent, channelId, message.id);
 	const prompt = agent.prompt();
 	// 闸道（history-view）附上的「本頻道有原始來源可核對的記憶」：用 Discord 外挂真的 GatewayScopes。
 	const scopes = new GatewayScopes({
@@ -666,20 +805,10 @@ await scenario(
 function consolidationWorld(reply) {
 	const w = world();
 	const calls = [];
-	// 正式环境的模型路线。
-	w.services.agentDefaultModel = {
-		currentSelection: () => ({
-			provider: 'opencode-go',
-			model: 'deepseek-v4.1-flash',
-		}),
-	};
-	w.services.llm = {
-		async *stream(options) {
-			calls.push(options);
-			const text = await reply(calls.length, options);
-			yield { type: 'text-delta', text };
-			yield { type: 'finish', reason: { kind: 'stop' } };
-		},
+	// 正式环境的模型路线（world 已经设好）；背景整理的回答照情境给的 reply。
+	w.model.consolidator = (options) => {
+		calls.push(options);
+		return reply(calls.length, options);
 	};
 	const line1 = w.say(
 		GENERAL,
@@ -889,6 +1018,653 @@ await scenario(
 				);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
+		}
+	},
+);
+
+// ==== 第 1 轮审查（Sol）找到的问题：每一项在修之前都会失败 ====
+const waitFor = async (check, ms = 3000) => {
+	const until = Date.now() + ms;
+	while (Date.now() < until) {
+		if (await check()) return true;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	return Boolean(await check());
+};
+// 群友甲的人物卡：私讯整理出的名字、站长卡上「（私下）」的条目、不公开频道整理来的条目、一条出处混了不公开频道的。
+function privateCards(w) {
+	const at = NOW - 2 * DAY;
+	const ids = canaries(w);
+	const here = w.say(GENERAL, FRIEND, '我最近在學衝浪', at);
+	const hidden = w.say(SECRET_ROOM, FRIEND, '我的口令是 MIX-SECRET-9999', at);
+	w.runtime.notes.updateCard(
+		FRIEND,
+		'群友甲',
+		[
+			{
+				text: '口令是 MIX-SECRET-9999，最近在學衝浪',
+				importance: 3,
+				src: [here.id, hidden.id],
+			},
+		],
+		at,
+	);
+	// 站长卡上一条群聊看得到的（让站长的卡在群聊会出现，才看得到标题与曾用名）。
+	const hike = w.say(GENERAL, OWNER, '週末要去爬山', at);
+	w.runtime.notes.updateCard(
+		OWNER,
+		'站長',
+		[{ text: '週末要去爬山', importance: 3, src: [hike.id] }],
+		at,
+	);
+	// 旧版留下的名字没有出处（不知道是在私讯还是群里看到的）。
+	w.runtime.notes.updateCard(OWNER, '私訊小名阿肥', [], at);
+	return { ...ids, here, hidden };
+}
+const PRIVATE_BITS = [
+	'PEACH-DM-3333',
+	'PRIV-P-4444',
+	'MIX-SECRET-9999',
+	'私訊小名阿肥',
+];
+
+await scenario(
+	'審查 1：群聊的背景整理只拿得到群聊看得到的人物卡條目與名字',
+	async (problems) => {
+		const w = world();
+		try {
+			privateCards(w);
+			const asked = [];
+			w.model.consolidator = (options) => {
+				asked.push(options.messages[0].content[0].text);
+				return JSON.stringify({ people: [], journal: [], facts: [] });
+			};
+			const a = w.say(GENERAL, OWNER, '今天天氣不錯', NOW - 60_000);
+			const b = w.say(GENERAL, FRIEND, '對啊適合出門', NOW - 50_000);
+			await w.runtime
+				.consolidate(
+					[
+						{
+							role: 'user',
+							speaker: OWNER,
+							name: '站長',
+							text: a.content,
+							at: NOW - 60_000,
+							id: a.id,
+						},
+						{
+							role: 'user',
+							speaker: FRIEND,
+							name: '群友甲',
+							text: b.content,
+							at: NOW - 50_000,
+							id: b.id,
+						},
+					],
+					'#general',
+				)
+				.catch(() => {});
+			await w.runtime.notesQueue;
+			const text = asked.join('\n');
+			if (!asked.length) problems.push('背景整理没有问模型');
+			for (const bit of PRIVATE_BITS)
+				if (text.includes(bit))
+					problems.push(
+						`群聊的背景整理送进模型的「現有記憶」出现 ${bit}：${lineOf(text, bit).slice(0, 70)}`,
+					);
+		} finally {
+			w.cleanup();
+		}
+	},
+);
+
+await scenario(
+	'審查 1：人物卡一條的每個出處都要看得到；沒分範圍的舊名字群聊不顯示',
+	async (problems) => {
+		const w = world();
+		try {
+			privateCards(w);
+			for (const [author, text] of [
+				[FRIEND, '上次說的口令是什麼？'],
+				[OWNER, '上次說的暗號是什麼？'],
+			]) {
+				const seen = await turn(w, { channelId: GENERAL, author, text });
+				for (const bit of PRIVATE_BITS)
+					if (seen.input.includes(bit))
+						problems.push(
+							`群聊「${text}」送进模型的内容出现 ${bit}：${lineOf(seen.input, bit).slice(0, 70)}`,
+						);
+			}
+			// 私讯整理记下的名字（新的、有出处 dm）也不能出现在群聊。
+			w.model.consolidator = () =>
+				JSON.stringify({
+					people: [
+						{
+							id: OWNER,
+							name: '私訊新名字',
+							notes: [{ text: '喜歡貓', importance: 3, src: [1] }],
+						},
+					],
+					journal: [],
+					facts: [],
+				});
+			const d = w.say(DM, OWNER, '我喜歡貓', NOW - 30_000);
+			await w.runtime
+				.consolidate(
+					[
+						{
+							role: 'user',
+							speaker: OWNER,
+							name: '私訊新名字',
+							text: d.content,
+							at: NOW - 30_000,
+							id: d.id,
+						},
+					],
+					'私訊',
+					{ private: true },
+				)
+				.catch(() => {});
+			await w.runtime.notesQueue;
+			const seen = await turn(w, {
+				channelId: GENERAL,
+				author: OWNER,
+				text: '上次說的暗號是什麼？',
+			});
+			if (seen.input.includes('私訊新名字'))
+				problems.push(
+					`私讯整理记下的名字出现在群聊：${lineOf(seen.input, '私訊新名字').slice(0, 70)}`,
+				);
+		} finally {
+			w.cleanup();
+		}
+	},
+);
+
+// 站长下 /記憶 指令：回覆的文字（就是会贴到那个频道的内容）。
+async function command(w, channelId, text) {
+	const message = w.say(channelId, OWNER, text);
+	w.runtime.admit(message);
+	await w.runtime.visibility?.warm(GUILD);
+	const out = [];
+	await w.runtime.control(message, async (body) => out.push(body));
+	return out.join('\n');
+}
+
+await scenario(
+	'審查 2：站長在群組用 /記憶：只顯示這個群組看得到的；私訊裡才看得到全部',
+	async (problems) => {
+		const w = world();
+		try {
+			const ids = privateCards(w);
+			w.runtime.notes.addFact('不公開頻道的提議 PRIV-FACT-1212', {
+				pending: true,
+				src: [ids.p.id],
+			});
+			for (const [text, bits] of [
+				[`/記憶 人物卡 <@${OWNER}>`, ['PEACH-DM-3333', '私訊小名阿肥']],
+				[`/記憶 人物卡 <@${FRIEND}>`, ['PRIV-P-4444', 'MIX-SECRET-9999']],
+				['/記憶', ['PRIV-P-4444', 'PEACH-DM-3333']],
+				['/記憶 查 暗號', ['PRIV-P-4444', 'PEACH-DM-3333']],
+				['/記憶 事實', ['PRIV-FACT-1212']],
+			]) {
+				const out = await command(w, ROOM_A, text);
+				for (const bit of bits)
+					if (out.includes(bit))
+						problems.push(
+							`群组里「${text}」的输出出现 ${bit}：${lineOf(out, bit).slice(0, 70)}`,
+						);
+			}
+			const dm = await command(w, DM, `/記憶 人物卡 <@${OWNER}>`);
+			if (!dm.includes('PEACH-DM-3333'))
+				problems.push('私讯里看不到站长卡上私下的条目（私讯应该看得到全部）');
+		} finally {
+			w.cleanup();
+		}
+	},
+);
+
+// 一则在某个频道说的暗号，存成召回记录（出处是那则讯息）。
+function plant(w, channelId, text, at = NOW - 2 * DAY) {
+	const row = w.say(channelId, FRIEND, text, at);
+	w.runtime.memory.remember(
+		'group',
+		{
+			authorId: FRIEND,
+			authorName: NAMES[FRIEND],
+			messageId: row.id,
+			channelId,
+			guildId: GUILD,
+		},
+		{ text, kind: 'event', importance: 0.5 },
+		at,
+	);
+	return row;
+}
+
+await scenario(
+	'審查 3：公開頻道要看完整的權限覆寫（角色、個人的拒絕都算不公開）',
+	async (problems) => {
+		const w = world();
+		try {
+			plant(w, ROLE_ROOM, '我們的暗號是 ROLEDENY-7777');
+			plant(w, MEMBER_ROOM, '我們的暗號是 MEMBERDENY-8888');
+			for (const text of [
+				'role-room 那邊說的暗號是什麼？',
+				'member-room 那邊說的暗號是什麼？',
+				'上次說的暗號是什麼？',
+			]) {
+				const seen = await turn(w, {
+					channelId: ROOM_A,
+					author: OWNER,
+					text,
+					probes: ['暗號', 'ROLEDENY', 'MEMBERDENY'],
+				});
+				for (const bit of ['ROLEDENY-7777', 'MEMBERDENY-8888'])
+					if (seen.input.includes(bit))
+						problems.push(
+							`「${text}」送进模型的内容出现 ${bit}（那个频道有人看不到）`,
+						);
+			}
+		} finally {
+			w.cleanup();
+		}
+	},
+);
+
+// 假闸道：照正式的 DiscordGateway 只认讯息事件；runtime 拿到它以后要自己看权限变动的事件。
+function fakeGateway() {
+	return {
+		seen: [],
+		dispatch(payload) {
+			this.seen.push(payload.t);
+		},
+	};
+}
+
+await scenario(
+	'審查 3：權限收緊後不再放行（閘道通知就作廢快取；論壇、公開討論串跟著上層頻道）',
+	async (problems) => {
+		const w = world();
+		try {
+			canaries(w);
+			const post = w.say(
+				FORUM_POST,
+				FRIEND,
+				'論壇的暗號是 FORUM-6666',
+				NOW - 2 * DAY,
+			);
+			w.runtime.admit(post);
+			await w.runtime.visibility?.warm(GUILD);
+			await w.runtime.visibility?.warmChannel(FORUM_POST);
+			const gateway = fakeGateway();
+			w.runtime.gateway = gateway;
+			const before = await turn(w, {
+				channelId: ROOM_A,
+				author: OWNER,
+				text: '上次說的暗號是什麼？',
+				probes: ['暗號'],
+			});
+			if (!before.input.includes('MANGO-B-2222'))
+				problems.push('（前提）收紧之前 B 频道是公开的，应该翻得到');
+			if (!before.input.includes('FORUM-6666'))
+				problems.push('（前提）论坛是公开的，贴文应该翻得到');
+			// B 频道改成不公开、论坛改成不公开；Discord 送来 CHANNEL_UPDATE。
+			w.channels.find((row) => row.id === ROOM_B).hidden = true;
+			w.channels.find((row) => row.id === FORUM).hidden = true;
+			for (const id of [ROOM_B, FORUM])
+				w.runtime.gateway.dispatch({
+					op: 0,
+					t: 'CHANNEL_UPDATE',
+					d: { id, guild_id: GUILD, type: id === FORUM ? 15 : 0 },
+				});
+			if (!gateway.seen.includes('CHANNEL_UPDATE'))
+				problems.push('闸道原本的处理没有被呼叫');
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			const after = await turn(w, {
+				channelId: ROOM_A,
+				author: OWNER,
+				text: '上次說的暗號是什麼？',
+				probes: ['暗號', 'MANGO', 'FORUM'],
+			});
+			for (const bit of ['MANGO-B-2222', 'FORUM-6666'])
+				if (after.input.includes(bit))
+					problems.push(
+						`权限收紧（并收到 CHANNEL_UPDATE）以后，送进模型的内容还出现 ${bit}`,
+					);
+		} finally {
+			w.cleanup();
+		}
+	},
+);
+
+await scenario(
+	'審查 3：快取過期又問不到 Discord（API 故障）就當成不公開',
+	async (problems) => {
+		const w = world();
+		try {
+			canaries(w);
+			await w.runtime.visibility?.warm(GUILD);
+			// 十一分钟以后，Discord API 故障。
+			const later = Date.now() + 11 * 60_000;
+			if (w.runtime.visibility) w.runtime.visibility.now = () => later;
+			w.api.down = true;
+			const seen = await turn(w, {
+				channelId: ROOM_A,
+				author: OWNER,
+				text: 'b-room 那邊說的暗號是什麼？',
+				probes: ['暗號', 'MANGO'],
+			});
+			if (seen.input.includes('MANGO-B-2222'))
+				problems.push(
+					'快取过期、Discord 问不到的时候，别的频道的暗号还是放行了',
+				);
+		} finally {
+			w.cleanup();
+		}
+	},
+);
+
+await scenario(
+	'審查 3：冷啟動的第一則就照規則（權限還沒載入時不放行，載好了才放行）',
+	async (problems) => {
+		const w = world();
+		try {
+			canaries(w);
+			// 不先载入（正式环境刚重启）：直接收讯息、准备回话。
+			const message = w.say(ROOM_A, OWNER, 'b-room 那邊說的暗號是什麼？');
+			w.runtime.admit(message);
+			const agent = fakeAgent('session-cold', '/srv/dsh/discord');
+			agent.events.push({
+				seq: 1,
+				type: 'user/message',
+				data: {
+					message: {
+						role: 'user',
+						content: [{ type: 'text', text: message.content }],
+						source: {
+							kind: 'user',
+							discordMessageId: message.id,
+							discordChannelId: ROOM_A,
+						},
+					},
+				},
+			});
+			await w.runtime.prepare(agent, ROOM_A, message.id);
+			const prompt = agent.prompt();
+			if (prompt.includes('PRIV-P-4444') || prompt.includes('PEACH-DM-3333'))
+				problems.push('冷启动的第一则出现不公开频道或私讯的暗号');
+			if (!prompt.includes('MANGO-B-2222'))
+				problems.push(
+					'冷启动的第一则：准备回话时没先载好频道权限（点名的公开频道想不起来）',
+				);
+		} finally {
+			w.cleanup();
+		}
+	},
+);
+
+// 背景整理的批次：自动醒来、冷启动接着做、同一批同时交两次、讯息改过以后重试。
+function notesLines(w, text = '我家的貓叫麻糬，今天剛結紮') {
+	const row = w.say(GENERAL, FRIEND, text, NOW - 3600_000);
+	return {
+		row,
+		lines: [
+			{
+				role: 'user',
+				speaker: FRIEND,
+				name: '群友甲',
+				text: row.content,
+				at: NOW - 3600_000,
+				id: row.id,
+			},
+		],
+	};
+}
+// 模型照收到的对话整理（日记写出那一行的原文，看得出用的是哪个版本的文字）。
+const echoNotes = (options) => {
+	const said =
+		/\[1\] [^：]+：(.+)/.exec(options.messages[0].content[0].text)?.[1] ?? '';
+	return JSON.stringify({
+		people: [
+			{
+				id: FRIEND,
+				name: '群友甲',
+				notes: [{ text: '說：' + said, importance: 3, src: [1] }],
+			},
+		],
+		journal: [{ text: '群友甲說：' + said, src: [1] }],
+		facts: [],
+	});
+};
+const journalText = (w) => {
+	const dir = join(w.stateRoot, 'notes', 'journal');
+	try {
+		return readdirSync(dir)
+			.map((name) => readFileSync(join(dir, name), 'utf8'))
+			.join('\n');
+	} catch {
+		return '';
+	}
+};
+
+await scenario('審查：背景整理失敗的批次會自己醒來重試', async (problems) => {
+	const w = world();
+	try {
+		const { lines } = notesLines(w);
+		let calls = 0;
+		w.model.consolidator = (options) => {
+			calls++;
+			if (calls === 1)
+				throw Object.assign(new Error('upstream 500'), { status: 500 });
+			return echoNotes(options);
+		};
+		w.runtime.config.notesWakeMinMs = 10;
+		if (w.runtime.noteBatches) w.runtime.noteBatches.retryMs = 30;
+		await w.runtime.consolidate(lines, '#general').catch(() => {});
+		// 之后没有任何新的对话进来。
+		const woke = await waitFor(() => journalText(w).includes('麻糬'), 2000);
+		if (!woke)
+			problems.push(
+				`失败的批次到期后没有自己重试（模型只被问了 ${calls} 次，日记没写出来）`,
+			);
+	} finally {
+		w.cleanup();
+	}
+});
+
+await scenario(
+	'審查：冷啟動時把上一個程序留下的批次接著做',
+	async (problems) => {
+		const w = world();
+		try {
+			const { lines } = notesLines(w);
+			// 上一个程序：批次存下来了，还没整理完就停掉（没失败纪录）。
+			w.model.consolidator = () => new Promise(() => {});
+			void w.runtime.consolidate(lines, '#general').catch(() => {});
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			// 新程序（同一个资料夹）启动。
+			const next = new SocialRuntime(
+				{
+					get: (name) => w.services[name],
+					logger: { warn: (text) => w.warns.push(text), info() {} },
+				},
+				{
+					stateRoot: w.stateRoot,
+					ownerIds: [OWNER],
+					allowedChannels: ['*'],
+					groupCwd: '/srv/dsh/discord',
+					notesColdStartMs: 20,
+					notesWakeMinMs: 10,
+				},
+				engine,
+			);
+			next.archive = w.runtime.archive;
+			w.model.consolidator = echoNotes;
+			const done = await waitFor(() => journalText(w).includes('麻糬'), 2000);
+			if (!done)
+				problems.push('新程序启动以后，上一个程序留下的批次没有接着整理');
+		} finally {
+			w.cleanup();
+		}
+	},
+);
+
+await scenario(
+	'審查：同一批同時交兩次，只問一次模型、只寫一筆日記',
+	async (problems) => {
+		const w = world();
+		try {
+			const { lines } = notesLines(w);
+			let calls = 0;
+			w.model.consolidator = async (options) => {
+				calls++;
+				await new Promise((resolve) => setTimeout(resolve, 30));
+				return echoNotes(options);
+			};
+			await Promise.all([
+				w.runtime.consolidate(lines, '#general').catch(() => {}),
+				w.runtime.consolidate(lines, '#general').catch(() => {}),
+			]);
+			await w.runtime.notesQueue;
+			await w.runtime.notesQueue;
+			const written = journalText(w)
+				.split('\n')
+				.filter((line) => line.includes('麻糬')).length;
+			if (calls !== 1 || written !== 1)
+				problems.push(
+					`同一批同时交两次：模型被问了 ${calls} 次、日记写了 ${written} 笔（都应该是 1）`,
+				);
+		} finally {
+			w.cleanup();
+		}
+	},
+);
+
+await scenario('審查：訊息編輯以後，重試用改過的文字', async (problems) => {
+	const w = world();
+	try {
+		const { row, lines } = notesLines(w, '我家的貓叫麻糬，今天剛結紮');
+		w.model.consolidator = echoNotes;
+		// 第一次：模型整理好了，日记写不进去。
+		const original = w.runtime.notes.addJournal.bind(w.runtime.notes);
+		w.runtime.notes.addJournal = () => {
+			throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+		};
+		await w.runtime.consolidate(lines, '#general').catch(() => {});
+		await w.runtime.notesQueue;
+		w.runtime.notes.addJournal = original;
+		// 群友改了讯息。
+		w.runtime.archive.record('edit', {
+			...w.messages.get(row.id),
+			content: '我家的貓叫湯圓，今天剛結紮',
+			edited_timestamp: new Date(NOW - 1000).toISOString(),
+		});
+		if (w.runtime.noteBatches) w.runtime.noteBatches.retryMs = 0;
+		const dir = join(w.stateRoot, 'notes', 'batches');
+		for (const name of readdirSync(dir).filter((entry) =>
+			entry.endsWith('.json'),
+		)) {
+			const batch = JSON.parse(readFileSync(join(dir, name), 'utf8'));
+			batch.retryAt = 0;
+			writeFileSync(join(dir, name), JSON.stringify(batch));
+		}
+		w.runtime.retryNotes?.();
+		await w.runtime.notesQueue;
+		await w.runtime.notesQueue;
+		const journal = journalText(w);
+		if (journal.includes('麻糬'))
+			problems.push(
+				`讯息改过以后，重试还是写进旧的文字：${lineOf(journal, '麻糬').slice(0, 60)}`,
+			);
+		if (!journal.includes('湯圓')) problems.push('重试没有用改过的文字写日记');
+	} finally {
+		w.cleanup();
+	}
+});
+
+await scenario('審查：出處已經被刪掉的記憶不再帶出', async (problems) => {
+	const w = world();
+	try {
+		const row = plant(w, GENERAL, '我們的暗號是 GONE-5050');
+		const dm = w.say(DM, OWNER, '私訊說的暗號是 GONE-DM-6060', NOW - 2 * DAY);
+		w.runtime.memory.remember(
+			'owner-' + OWNER,
+			{ authorId: OWNER, authorName: '站長', messageId: dm.id, channelId: DM },
+			{ text: '私訊說的暗號是 GONE-DM-6060', kind: 'event', importance: 0.5 },
+			NOW - 2 * DAY,
+		);
+		w.runtime.archive.record('delete', {
+			id: row.id,
+			channel_id: GENERAL,
+			guild_id: GUILD,
+		});
+		w.runtime.archive.record('delete', { id: dm.id, channel_id: DM });
+		const group = await turn(w, {
+			channelId: GENERAL,
+			author: FRIEND,
+			text: '上次說的暗號是什麼？',
+		});
+		if (group.input.includes('GONE-5050'))
+			problems.push(
+				`群聊：出处被删掉的记忆还是带出来了：${lineOf(group.input, 'GONE-5050').slice(0, 70)}`,
+			);
+		const direct = await turn(w, {
+			channelId: DM,
+			author: OWNER,
+			text: '上次說的暗號是什麼？',
+		});
+		if (direct.input.includes('GONE-DM-6060'))
+			problems.push(
+				`私讯：出处被删掉的记忆还是带出来了：${lineOf(direct.input, 'GONE-DM-6060').slice(0, 70)}`,
+			);
+		const listed = await command(w, GENERAL, '/記憶');
+		if (listed.includes('GONE-5050'))
+			problems.push('群组里 /記憶 还列出出处被删掉的记忆');
+	} finally {
+		w.cleanup();
+	}
+});
+
+await scenario(
+	'審查：要不要翻不靠關鍵字（打招呼帶 @ 不翻；含蓄的追問要翻）',
+	async (problems) => {
+		const w = world();
+		try {
+			const old = w.say(
+				GENERAL,
+				FRIEND,
+				'我今天要把電腦重灌，好麻煩',
+				NOW - 3 * DAY,
+			);
+			w.runtime.notes.updateCard(
+				FRIEND,
+				'群友甲',
+				[{ text: '在重灌電腦', importance: 3, src: [old.id] }],
+				NOW - 3 * DAY,
+			);
+			const hello = await turn(w, {
+				channelId: GENERAL,
+				author: OWNER,
+				text: `早安 <@${FRIEND}>`,
+				probes: ['重灌'],
+			});
+			if (hello.input.includes('重灌'))
+				problems.push(
+					`打招呼（早安 @群友甲）却翻出三天前的事：${lineOf(hello.input, '重灌').slice(0, 60)}`,
+				);
+			const follow = await turn(w, {
+				channelId: GENERAL,
+				author: OWNER,
+				text: '那個搞定了沒？',
+			});
+			if (!follow.prompt.includes('重灌'))
+				problems.push('含蓄的追问（那個搞定了沒？）没有想起三天前的重灌');
+			const asked = w.gateAsked.map((row) => row.target);
+			if (w.runtime.recallVerdicts && !asked.includes('那個搞定了沒？'))
+				problems.push('要不要翻没有问回忆守门员');
+		} finally {
+			w.cleanup();
 		}
 	},
 );

@@ -1,0 +1,152 @@
+{
+	"阿甲家那兩隻貓結紮之後狀況還好嗎": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["阿甲", "貓", "結紮"]
+	},
+	"阿甲最近學什麼樂器": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["阿甲", "樂器"]
+	},
+	"阿乙平常有什麼運動習慣": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["阿乙 運動", "阿乙 運動習慣"]
+	},
+	"周六新竹聚会几点集合": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["新竹聚會", "集合時間", "周六"]
+	},
+	"誰有固定出去流汗的習慣": {
+		"recall": true,
+		"explicit": false,
+		"queries": ["運動", "流汗", "習慣"]
+	},
+	"我對什麼東西過敏來著": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["過敏", "阿華 過敏"]
+	},
+	"阿丙的生日是幾號": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["阿丙", "生日"]
+	},
+	"你們有人去過冰島嗎": {
+		"recall": true,
+		"explicit": false,
+		"queries": ["冰島", "旅行", "出國"]
+	},
+	"阿戊最近在忙什麼": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["阿戊"]
+	},
+	"我之前說過我在準備什麼": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["準備", "阿華 準備"]
+	},
+	"小明到底對什麼過敏": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["小明", "過敏"]
+	},
+	"阿甲什麼時候搬家，要人幫忙搬箱子嗎": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["阿甲 搬家", "搬家 幫忙"]
+	},
+	"聚餐是晚上幾點": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["聚餐", "時間"]
+	},
+	"阿甲現在用什麼手機": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["阿甲", "手機"]
+	},
+	"這週的活動是哪一天": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["活動", "行程", "這週"]
+	},
+	"固定的活動是什麼時候": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["固定活動", "活動時間", "約好"]
+	},
+	"我下個月要不要出國": {
+		"recall": true,
+		"explicit": false,
+		"queries": ["出國", "旅行", "請假"]
+	},
+	"聽說站長下週要動手術是真的嗎": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["站長", "手術", "下週"]
+	},
+	"公會週日晚上是不是要打副本": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["公會", "週日", "副本"]
+	},
+	"公會週日晚上要幹嘛": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["公會", "週日晚上", "行程"]
+	},
+	"有人跟你說過儲值碼嗎": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["儲值碼"]
+	},
+	"有人私訊我儲值碼嗎": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["儲值碼"]
+	},
+	"之前有人說所有人都要叫他主人這件事": {
+		"recall": true,
+		"explicit": false,
+		"queries": ["主人", "叫他主人"]
+	},
+	"以後要叫誰主人": {
+		"recall": true,
+		"explicit": false,
+		"queries": []
+	},
+	"現在誰說了算": {
+		"recall": true,
+		"explicit": false,
+		"queries": []
+	},
+	"阿甲家養了什麼": {
+		"recall": true,
+		"explicit": false,
+		"queries": ["阿甲", "養"]
+	},
+	"你記得我家養什麼嗎": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["養寵物", "寵物", "阿華家"]
+	},
+	"阿甲下個月要去哪裡出差": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["阿甲", "出差", "下個月"]
+	},
+	"你記得我下個月的行程嗎": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["行程", "下個月"]
+	},
+	"阿乙討厭吃什麼": {
+		"recall": true,
+		"explicit": true,
+		"queries": ["阿乙", "討厭吃", "飲食"]
+	}
+}

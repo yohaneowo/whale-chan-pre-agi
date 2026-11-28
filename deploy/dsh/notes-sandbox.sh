@@ -5,6 +5,8 @@
 # 用法：OPENCODE_GO_API_KEY 由呼叫的人放在环境变数里（不写进任何档案），
 #   bash notes-sandbox.sh <old|new> <新版档案目录> <沙盒目录> [秒数]
 # 一次只跑一个（old 跑完再跑 new）；可用记忆体不到 1.6G 就不跑。
+# 换别的探针：PROBE=<探针档> PROBE_FILES=<资料夹，复制成沙盒的 extra/> SBX_ROUNDS=<轮数>（回忆守门员实测用
+# recall-gate-sandbox-probe.mjs，资料是 deploy/eval/recall-gate/input.mjs 产生的 gate-input.json）。
 set -euo pipefail
 WHICH=$1
 FILES=$2
@@ -17,7 +19,10 @@ avail=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
 if [ "$avail" -lt 1600 ]; then echo "可用记忆体只有 ${avail} MiB，不跑"; exit 3; fi
 rm -rf $SBX; mkdir -p $SBX; chmod 755 $SBX
 mkdir -p $SBX/state $SBX/home/.dsh/state $SBX/srv/discord $SBX/srv/owner $SBX/drain $SBX/work
-cp "$(dirname "$0")/notes-sandbox-probe.mjs" $SBX/probe.mjs; chmod 644 $SBX/probe.mjs
+cp "${PROBE:-$(dirname "$0")/notes-sandbox-probe.mjs}" $SBX/probe.mjs; chmod 644 $SBX/probe.mjs
+mkdir -p $SBX/extra
+if [ -n "${PROBE_FILES:-}" ]; then cp -r "$PROBE_FILES"/. $SBX/extra/; fi
+chmod -R a+rX $SBX/extra
 cp -a $OLD $SBX/rel; chmod -R u+w $SBX/rel
 if [ $WHICH = new ]; then
   (cd $FILES && find . -type f) | while read f; do cp $FILES/$f $SBX/rel/web/node_modules/$f; done
@@ -50,14 +55,14 @@ chown -R nobody:nogroup $SBX/state $SBX/home $SBX/srv $SBX/drain $SBX/work
 cd $SBX/work
 set +e
 # 金钥只经环境变数往下传（不放进任何指令列参数：systemd 会把 scope 的指令记进日志）。
-export SBX SECS SBX_INVOCATION=$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+export SBX SECS SBX_ROUNDS="${SBX_ROUNDS:-2}" SBX_CHAT="${SBX_CHAT:-1}" SBX_INVOCATION=$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
 systemd-run --scope --quiet --unit=notes-sbx-$$ --description=notes-sandbox -p MemoryMax=1G -p MemorySwapMax=0 -- \
   setpriv --reuid=65534 --regid=65534 --clear-groups -- /bin/bash -c '
   exec env -i HOME="$SBX/home" DSH_HOME="$SBX/home/.dsh" PATH=/opt/dsh/node/bin:/usr/bin:/bin \
     OPENCODE_GO_API_KEY="$OPENCODE_GO_API_KEY" \
     NODE_OPTIONS=--max-old-space-size=768 TZ=Asia/Taipei DSH_HOST_MODULES=/opt/dsh/app/node_modules/@deepseek-ai \
     DSH_DRAIN_CONTROL=/run/dsh-drain DSH_DRAIN_STATUS="$SBX/drain" INVOCATION_ID="$SBX_INVOCATION" \
-    SBX_RELEASE="$SBX/rel" SBX_GROUP_CWD="$SBX/srv/discord" \
+    SBX_RELEASE="$SBX/rel" SBX_GROUP_CWD="$SBX/srv/discord" SBX_EXTRA="$SBX/extra" SBX_ROUNDS="$SBX_ROUNDS" SBX_CHAT="$SBX_CHAT" \
     timeout -s TERM "$SECS" /opt/dsh/node/bin/node "$SBX/rel/trusted-entry.mjs"' > $SBX/run.log 2>&1
 echo "exit=$?"
 set -e

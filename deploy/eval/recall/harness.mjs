@@ -431,6 +431,10 @@ export function guardMirror(socialDir) {
 			'recall.plan.recall ? this.recentSpeakers(source) : []',
 			"where: kind === GROUP_SCOPE ? '群聊' + (from ? ' ' + from : '') : '私讯'",
 			'this.recallNote(recall, memories.length > 0 || related.length > 0)',
+			// 第 1 轮审查以后：要不要翻问回忆守门员、守门员给的搜寻词一起找、人物卡的名字分范围。
+			...(source.includes('awaitRecall(')
+				? ['recall.query || query', 'names: this.namesVisible(recall.where)']
+				: []),
 		].filter((needle) => !source.includes(needle));
 	const needles = [
 		"scope === GROUP_SCOPE || scope.startsWith('owner-')",
@@ -556,14 +560,34 @@ export function composeAuto(world, view, turn) {
 
 // 翻旧事的规则（port_memory_rules.py 移植后的 release）：这一轮的来源要像桥接那样登记（ingress），
 // 群聊频道都当成公开的（题目是照「所有群聊共用一份记忆」出的）。
+// 第 1 轮审查以后要不要翻由回忆守门员（模型）判断。题库不呼叫模型：用真模型对这些问题录下来的判断
+// （gate-verdicts.json，deploy/eval/recall-gate 在 VM 沙盒实测产生）；没录到的（工具题的默认问句）当成「要翻、明确在问」。
+const GATE_VERDICTS = (() => {
+	try {
+		return JSON.parse(
+			readFileSync(new globalThis.URL('./gate-verdicts.json', import.meta.url), 'utf8'),
+		);
+	} catch {
+		return {};
+	}
+})();
 function recallTurn(world, view, source, agent) {
 	const { runtime } = world;
 	source.channelId ??= 'dm-' + source.authorId;
 	runtime.ingress.set(source.messageId, source);
 	runtime.recallPlans?.clear();
+	runtime.recallVerdicts?.set(source.messageId, {
+		verdict: GATE_VERDICTS[source.text] ?? {
+			recall: true,
+			explicit: true,
+			queries: [],
+		},
+	});
 	for (const channel of Object.values(world.channels))
-		if (channel.guild)
+		if (channel.guild) {
 			runtime.visibility.channels.set(channel.id, { guildId: channel.guild, name: channel.name, public: true, at: Date.now() });
+			runtime.visibility.guilds?.set(channel.guild, Date.now());
+		}
 	agent.session.snapshotEvents = () => [
 		{ type: 'user/message', data: { message: { source: { kind: 'user', discordMessageId: source.messageId, discordChannelId: source.channelId } } } },
 	];
@@ -582,7 +606,7 @@ function composeRecall(world, view, { source, agent, scope }) {
 		if (recall.plan.recall)
 			memories = runtime.memory.recallAcross(
 				scope === 'group' ? ['group'] : [scope, 'group'],
-				source.text,
+				recall.query || source.text,
 				Date.now(),
 				(record) => runtime.recordPlace(record, recall),
 			);
@@ -595,7 +619,10 @@ function composeRecall(world, view, { source, agent, scope }) {
 	if (view === 'group') {
 		const people = recall.plan.recall ? runtime.recentSpeakers(source) : [];
 		try {
-			notesText = runtime.notes.context(people, { admit: (line) => runtime.noteLabel(line, recall) });
+			notesText = runtime.notes.context(people, {
+				admit: (line) => runtime.noteLabel(line, recall),
+				...(runtime.namesVisible ? { names: runtime.namesVisible(recall.where) } : {}),
+			});
 		} catch {
 			notesText = '';
 		}

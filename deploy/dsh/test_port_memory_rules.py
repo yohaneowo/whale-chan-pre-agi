@@ -20,7 +20,9 @@ def fake_runtime():
     consolidate = port.OLD_CONSOLIDATE_START + "\n".join(port.OLD_CONSOLIDATE_MARKS) + "\n"
     anchors = [port.CRYPTO[0], port.IMPORTS[0], port.CTOR[0], port.ADMIT_WARM[0], port.OLD_RELATED, port.OLD_PLACE, port.OLD_CONTEXT,
                port.OLD_DM_MEMORIES, port.OLD_DM_LINE, port.OLD_ROLE_DM, port.MANNERS[0], port.OLD_GROUP_SIGNATURE,
-               port.OLD_GROUP_MEMORIES, consolidate + port.OLD_CONSOLIDATE_END, "drawRequestTool", "this.studios.has(agent.id)"]
+               port.OLD_GROUP_MEMORIES, port.OLD_PREPARE[0], port.OLD_INBOX[0], port.OLD_SPEAKERS[0], port.OLD_CONTROL_PERSON,
+               port.OLD_CONTROL_FACTS, port.OLD_CONTROL_LIST, consolidate + port.OLD_CONSOLIDATE_END, "drawRequestTool",
+               "this.studios.has(agent.id)"]
     return JOIN.join(anchors) + "\n"
 
 
@@ -28,12 +30,13 @@ def fake_release(root):
     contents = {
         "dsh-social-runtime/index.mjs": fake_runtime(),
         "dsh-social-runtime/memory.mjs": JOIN.join([port.MEMORY_SIGNATURE[0], port.MEMORY_CATEGORY[0]]),
-        "dsh-social-runtime/notes.mjs": JOIN.join([port.OLD_NOTES_CONTEXT, port.OLD_NOTES_CARDS]),
+        "dsh-social-runtime/notes.mjs": JOIN.join([port.OLD_NOTES_CONTEXT, port.OLD_NOTES_CARDS, port.OLD_NOTES_UPDATE,
+                                                   port.OLD_NOTES_HEADER]),
         "dsh-social-runtime/archive.mjs": JOIN.join([port.ARCHIVE_RELATED_OPT[0], port.ARCHIVE_RELATED_ROWS[0],
                                                      port.ARCHIVE_SEARCH_OPT[0], port.ARCHIVE_SEARCH_ROWS[0],
                                                      port.ARCHIVE_AROUND[0]]),
         "dsh-social-runtime/chat-tools.mjs": JOIN.join([port.TOOLS_IMPORT[0], port.OLD_TOOLS_EXECUTE, port.OLD_TOOLS_SEARCH,
-                                                        port.OLD_TOOLS_OPEN]),
+                                                        port.OLD_TOOLS_OPEN, port.OLD_TOOLS_RENDER[0]]),
         "dsh-plugin-discord/lib/gateway-scopes.mjs": port.OLD_SCOPES_MEMORIES,
         "dsh-plugin-discord/lib/natural-participation.mjs": port.NP_WARN[0],
         "dsh-fish-memory/lib/index.js": port.OLD_FISH_CFG,
@@ -56,6 +59,13 @@ class PortTests(unittest.TestCase):
         self.assertNotIn("（私下跟你說的，群裡別提）", ported)
         self.assertIn("name: 'social-memory-manners'", ported)
         self.assertIn("this.recallFor(", ported)
+        # 第 1 轮审查：要不要翻问回忆守门员；/記憶 的输出照范围；闸道的权限变动事件让快取作废；批次自己醒来。
+        self.assertIn("return this.studios.has(agent.id) ? undefined : this.awaitRecall(source, agent);", ported)
+        self.assertIn("this.scopeView(this.whereOf(this.ingress.get(message.id)))", ported)
+        self.assertIn("if (this.visibility.observe(payload)) this.recallPlans.clear();", ported)
+        self.assertIn("if (!failure.gaveUp) this.scheduleNotes();", ported)
+        self.assertIn("return this.noteTasks.get(batch.id) ?? this.queueNoteBatch(batch.id);", ported)
+        self.assertNotIn("this.cachedFetch(path)", ported.split("this.visibility = new ChannelVisibility")[1][:200])
         with self.assertRaises(ValueError):
             port.port_runtime(ported)
 

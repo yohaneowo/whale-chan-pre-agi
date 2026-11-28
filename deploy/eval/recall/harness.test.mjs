@@ -57,14 +57,18 @@ test('可重复：同样的输入跑两次，结果完全相同', async () => {
 });
 
 test('反证：想起旧话被关掉，c1-1 要翻成失败，不相干的 c2-1 仍然通过', async () => {
+	// 移植后的 release 想起旧话有两条路：整句比对（related）与回忆守门员给的搜寻词（search），两条都关掉。
 	const real = deps.ArchiveStore.prototype.related;
+	const search = deps.ArchiveStore.prototype.search;
 	deps.ArchiveStore.prototype.related = () => [];
+	deps.ArchiveStore.prototype.search = () => [];
 	try {
 		const run = verdicts(await runAll(deps, { only: ['c1-1', 'c2-1'] }));
 		assert.equal(run['c1-1'], 'FAIL');
 		assert.equal(run['c2-1'], 'PASS');
 	} finally {
 		deps.ArchiveStore.prototype.related = real;
+		deps.ArchiveStore.prototype.search = search;
 	}
 });
 
@@ -95,8 +99,13 @@ test('反证：忘掉不生效，c4-3 与 c9-4 要翻成失败', async () => {
 
 test('反证：群聊会话的搜索把私讯也算进去，c6-2 要翻成失败', async () => {
 	const real = deps.ArchiveStore.prototype.search;
+	// 移植后的 release 另外有一道范围过滤（filter）也会挡私讯：两道都拿掉。
 	deps.ArchiveStore.prototype.search = function (options) {
-		return real.call(this, { ...options, scopes: ['group', 'dm'] });
+		return real.call(this, {
+			...options,
+			scopes: ['group', 'dm'],
+			filter: undefined,
+		});
 	};
 	try {
 		assert.equal(verdicts(await runAll(deps, { only: ['c6-2'] }))['c6-2'], 'FAIL');

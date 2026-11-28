@@ -1,6 +1,7 @@
 // 背景整理记忆的批次帐：一批对话交给模型整理以前先存下来，成功才收掉；失败留下「在哪一步、什么原因」
 // （原因只记类别，不记内文：错误讯息可能带金钥或聊天内容），之后有限次重试。
 // 每一步做完就记一笔（模型的结果、哪几个人的卡写好了、日记、事实），重试时做过的不再做，不会重复写入。
+// 上一个程序跑到一半就停掉的批次（还没失败过），新程序启动后也算到期（冷启动接着做）。
 import { createHash } from 'node:crypto';
 import {
 	mkdirSync,
@@ -43,6 +44,7 @@ export class NoteBatches {
 		for (const folder of ['', 'failed'])
 			mkdirSync(join(root, folder), { recursive: true, mode: 0o700 });
 		this.donePath = join(root, 'done.txt');
+		this.bootAt = now();
 	}
 
 	path(id, folder = '') {
@@ -130,20 +132,45 @@ export class NoteBatches {
 		}
 	}
 
-	// 到了可以重试的批次（失败过、还没放弃、时间到了）。
-	due() {
-		const out = [];
+	// 还留着的批次什么时候可以再跑：失败过的看 retryAt；上一个程序留下、还没失败过的现在就可以。
+	// 这个程序自己刚开、还在排队的（attempts 0、在启动之后建的）不算。
+	retryTime(batch) {
+		if (batch?.attempts) return batch.retryAt ?? 0;
+		return batch && batch.created < this.bootAt ? batch.created : undefined;
+	}
+
+	pending() {
 		let names;
 		try {
 			names = readdirSync(this.root).filter((name) => NAME.test(name));
 		} catch {
-			return out;
+			return [];
 		}
-		for (const name of names) {
-			const batch = this.read(name.slice(0, -5));
-			if (batch?.attempts && (batch.retryAt ?? 0) <= this.now())
-				out.push(batch);
-		}
-		return out.sort((a, b) => a.created - b.created);
+		return names
+			.map((name) => this.read(name.slice(0, -5)))
+			.filter((batch) => batch && this.retryTime(batch) !== undefined);
 	}
+
+	// 到了可以重试的批次（时间到了、还没放弃）。
+	due() {
+		return this.pending()
+			.filter((batch) => this.retryTime(batch) <= this.now())
+			.sort((a, b) => a.created - b.created);
+	}
+
+	// 下一批什么时候到期（没有就回 undefined），给自动唤醒用。
+	nextDue() {
+		const times = this.pending().map((batch) => this.retryTime(batch));
+		return times.length ? Math.min(...times) : undefined;
+	}
+}
+
+// 一批对话的「内容指纹」：讯息 id 与文字。重试前核对过删改，指纹变了，之前模型整理的结果就不能再用。
+export function linesBasis(lines) {
+	return createHash('sha256')
+		.update(
+			JSON.stringify(lines.map((line) => [String(line.id ?? ''), line.text])),
+		)
+		.digest('hex')
+		.slice(0, 24);
 }
