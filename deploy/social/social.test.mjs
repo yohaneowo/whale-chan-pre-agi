@@ -3149,3 +3149,121 @@ test('Rin 窄审：检索和打分对所有记录进行，合并只在最后输�
 	assert.equal(listed.length, 1);
 	assert.equal(runtime.memory.visible(['group']).length, 2, 'visible 本身不合并');
 });
+
+// 2026-11-28 事故：一则只有 @ 的讯息让她续画半天前的旧图，回合跑了 5 分多钟；
+// 回合内被换气截断的思考又排了两轮补救，「正在输入」总共亮了 7 分 24 秒。
+const turnEvents = () => {
+	const user = (seq, source) => ({
+		seq,
+		type: 'user/message',
+		data: { content: [], source },
+	});
+	const said = (seq, text) => ({
+		seq,
+		type: 'assistant/message',
+		data: { message: { content: text ? [{ type: 'text', text }] : [] } },
+	});
+	const end = (seq, kind = 'completed') => ({
+		seq,
+		type: 'turn/end',
+		data: { reason: { kind } },
+	});
+	return { user, said, end };
+};
+
+test('回合已经有完整回答时，之后的换气补救轮不能盖掉它', async () => {
+	const { extractSocialReply } = await import('./bridge.mjs');
+	const { user, said, end } = turnEvents();
+	const events = [
+		user(1, { kind: 'user', discordMessageId: 'm1' }),
+		said(2, '好啦畫好了，脖子拉短了。'),
+		end(3),
+		user(4, { kind: 'loop-guard', form: 'notice' }),
+		said(5, '畫不了啦'),
+		end(6),
+		user(7, { kind: 'loop-guard', form: 'notice' }),
+		said(8, '這個我不畫啦'),
+		end(9),
+	];
+	assert.equal(extractSocialReply(events, 1).text, '好啦畫好了，脖子拉短了。');
+});
+
+test('等回合有上限：超过期限就取消、回传超时；有完整回答就不再等补救轮', async () => {
+	const { awaitSocialTurn, TURN_DEADLINE_NOTICE } =
+		await import('./bridge.mjs');
+	const { user, said, end } = turnEvents();
+	let clock = 0;
+	const pause = async (ms) => {
+		clock += ms;
+	};
+	// 一直没结束的回合：到期限取消，取消后才 idle。
+	const live = [user(1, { kind: 'user', discordMessageId: 'm1' })];
+	let cancelled;
+	let idle;
+	const idlePromise = new Promise((resolve) => {
+		idle = resolve;
+	});
+	const stuck = {
+		session: { snapshotEvents: () => live },
+		whenIdle: () => idlePromise,
+		cancel: (cause) => {
+			cancelled = cause;
+			live.push(end(2, 'cancelled'));
+			idle();
+		},
+	};
+	const outcome = await awaitSocialTurn(stuck, 'm1', {
+		deadlineMs: 240_000,
+		pause,
+		now: () => clock,
+	});
+	assert.equal(outcome.timedOut, true);
+	assert.ok(cancelled, '超时要取消回合');
+	assert.ok(clock >= 240_000 && clock < 260_000, `在期限附近取消：${clock}`);
+	assert.match(TURN_DEADLINE_NOTICE, /^⚠️ 回合失败: 這一輪我做了太多步/);
+
+	// 回合已经完整回答，后面还排着补救轮：不必等 whenIdle（它要等补救轮跑完）。
+	clock = 0;
+	const answered = [
+		user(1, { kind: 'user', discordMessageId: 'm2' }),
+		said(2, '好啦畫好了'),
+		end(3),
+		user(4, { kind: 'loop-guard' }),
+	];
+	const busy = {
+		session: { snapshotEvents: () => answered },
+		whenIdle: () => new Promise(() => {}),
+		cancel: () => assert.fail('有回答就不取消'),
+	};
+	const quick = await awaitSocialTurn(busy, 'm2', {
+		deadlineMs: 240_000,
+		pause,
+		now: () => clock,
+	});
+	assert.equal(quick.timedOut, false);
+	assert.ok(clock < 5_000, `有回答就回传：${clock}`);
+
+	// 正常回合：whenIdle 结束就回传，不取消。
+	clock = 0;
+	const normal = [user(1, { kind: 'user', discordMessageId: 'm3' })];
+	const ok = await awaitSocialTurn(
+		{
+			session: { snapshotEvents: () => normal },
+			whenIdle: async () => {
+				normal.push(said(2, ''), end(3));
+			},
+			cancel: () => assert.fail('正常回合不取消'),
+		},
+		'm3',
+		{ deadlineMs: 240_000, pause, now: () => clock },
+	);
+	assert.equal(ok.timedOut, false);
+});
+
+test('回合期限可用环境变数调整，格式不对用预设', async () => {
+	const { turnDeadlineMs } = await import('./bridge.mjs');
+	assert.equal(turnDeadlineMs({}), 240_000);
+	assert.equal(turnDeadlineMs({ DISCORD_TURN_DEADLINE_MS: '90000' }), 90_000);
+	assert.equal(turnDeadlineMs({ DISCORD_TURN_DEADLINE_MS: 'abc' }), 240_000);
+	assert.equal(turnDeadlineMs({ DISCORD_TURN_DEADLINE_MS: '5' }), 240_000);
+});

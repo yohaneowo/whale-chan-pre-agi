@@ -3,6 +3,7 @@ import test from 'node:test';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
+import { setImmediate } from 'node:timers';
 import {
 	NaturalParticipation,
 	gifLinkNotes,
@@ -900,4 +901,122 @@ test('新会话清空暂存背景，管理操作使旧主动回复票据失效',
 	await f.receive(message('/new 新话题'));
 	assert.equal(f.participation.channel('room').history.length, 0);
 	assert.equal(f.participation.canSend('room', ticket), false);
+});
+
+// 2026-11-28 事故重现：第一则 @ 的回合跑了七分多钟；第二则 @ 在桥接里按频道排队，
+// 轮到它时已经过期，桥接什么都没回（没有文字、没有提示）。原本两个回合共用
+// channel.turnReplies，先结束的那轮把它清掉，后结束的那轮读它就丢 TypeError，
+// 错误被吞掉，群里也没有任何回覆。
+test('连着 @ 两次：第一轮很久、第二轮被桥接丢掉，两则都不抛错，第二则补一句', async (t) => {
+	const f = await fixture(t);
+	const p = f.participation;
+	const logs = [];
+	p.log = (text) => logs.push(text);
+	const controls = [];
+	const controlReply = async (text) => {
+		controls.push(text);
+	};
+	// 桥接按频道串行：第二轮要等第一轮结束才开始。
+	let chain = Promise.resolve();
+	let releaseFirst;
+	const firstGate = new Promise((resolve) => {
+		releaseFirst = resolve;
+	});
+	let calls = 0;
+	const deliver = () => {
+		const call = ++calls;
+		const run = chain.then(async () => {
+			if (call === 1) {
+				await firstGate;
+				p.recordReply('room', '這個我不畫啦', 'r1', 'owner');
+			}
+			// 第二轮：排队过期，桥接回传空结果，没有任何一段送出。
+		});
+		chain = run.catch(() => {});
+		return run;
+	};
+	const first = p.receive(
+		message('<@123>', { mentions: [{ id: '123' }] }),
+		identity,
+		deliver,
+		controlReply,
+	);
+	const second = p.receive(
+		message('<@123>', { mentions: [{ id: '123' }] }),
+		identity,
+		deliver,
+		controlReply,
+	);
+	await new Promise((resolve) => setImmediate(resolve));
+	releaseFirst();
+	const results = await Promise.allSettled([first, second]);
+	assert.deepEqual(
+		results.map((result) => result.status),
+		['fulfilled', 'fulfilled'],
+		results.map((result) => String(result.reason ?? '')).join(' / '),
+	);
+	assert.deepEqual(
+		controls,
+		['欸 我剛剛卡住了，你再說一次'],
+		'最新那则 @ 没有任何输出时补一句，不能整个沉默',
+	);
+	assert.ok(
+		logs.some((line) => /收到/.test(line)) &&
+			logs.some((line) => /没有任何输出/.test(line)),
+		'每则直接呼叫都留下收到与结果的日志：' + logs.join(' | '),
+	);
+});
+
+test('直接呼叫的回合有提示（没有文字、取消）或已经回话就不补；被新呼叫取代的也不补', async (t) => {
+	const f = await fixture(t);
+	const p = f.participation;
+	const controls = [];
+	const controlReply = async (text) => {
+		controls.push(text);
+	};
+	const call = (deliver) =>
+		p.receive(
+			message('<@123> 畫一張', { mentions: [{ id: '123' }] }),
+			identity,
+			deliver,
+			controlReply,
+		);
+	await call(async () => {
+		p.turnNotice('room', '(本回合没有文本回复)');
+	});
+	await call(async () => {
+		p.recordReply('room', '好', 'r1', 'owner');
+	});
+	assert.deepEqual(controls, [], '工具已经贴图（没有文字）或有回话都不补');
+	// 第一轮还没结束就有人再叫她：第一轮什么都没回也不补，由新的那轮回。
+	// 桥接按频道串行，新的那轮等旧的那轮结束才开始。
+	let release;
+	const gate = new Promise((resolve) => {
+		release = resolve;
+	});
+	const olderRun = gate;
+	const older = call(() => olderRun);
+	const newer = call(async () => {
+		await olderRun;
+		await Promise.resolve();
+		p.recordReply('room', '在', 'r2', 'owner');
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	release();
+	await Promise.all([older, newer]);
+	assert.deepEqual(controls, []);
+});
+
+test('私讯的直接呼叫没有任何输出也补一句', async (t) => {
+	const f = await fixture(t);
+	const controls = [];
+	await f.participation.receive(
+		message('在嗎', { guild_id: undefined }),
+		identity,
+		async () => {},
+		async (text) => {
+			controls.push(text);
+		},
+	);
+	assert.deepEqual(controls, ['欸 我剛剛卡住了，你再說一次']);
 });

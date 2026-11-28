@@ -177,6 +177,8 @@ export class NaturalParticipation {
 		now = () => Date.now(),
 		wait = delay,
 		warn = () => {},
+		// 一般纪录：每则直接呼叫的「收到」与「结果」配对，桥接接到 logger.info。
+		log = () => {},
 		fetchRecent,
 		guildOwner,
 		channelLabel,
@@ -203,6 +205,7 @@ export class NaturalParticipation {
 		this.now = now;
 		this.wait = wait;
 		this.warn = warn;
+		this.log = log;
 		this.channels = new Map();
 		this.state = {
 			version: 1,
@@ -257,7 +260,7 @@ export class NaturalParticipation {
 	// 只在这一轮的第一则或她指定回覆时更新；quotedId 是她用 Discord「回复」挂上的那一则。
 	recordReply(channelId, text, id, recipient, quotedId, first = true) {
 		const channel = this.channel(channelId);
-		channel.turnReplies?.push(text);
+		channel.turns?.[0]?.replies.push(text);
 		channel.lastSpokeAt = this.now();
 		const quoted =
 			quotedId &&
@@ -383,49 +386,83 @@ export class NaturalParticipation {
 		const text = String(chunk);
 		const failed = TURN_FAILED.test(text);
 		if (!failed && !TURN_SILENT.test(text)) return false;
-		if (failed)
-			this.channel(channelId).turnFailure = text.includes('max-tokens')
+		const turn = this.channel(channelId).turns?.[0];
+		if (turn) turn.notices++;
+		if (failed && turn)
+			turn.failure = text.includes('max-tokens')
 				? 'max-tokens'
 				: (QUOTA.exec(text)?.[0] ?? 'error');
 		return true;
 	}
 
+	// 每轮各记各的。桥接按频道串行，排在最前面、还没结束的那轮就是桥接正在送的那轮，
+	// 送出的话与回合提示都记到它身上。以前整个频道共用一个栏位，连着叫两次时
+	// 先结束的那轮把它清掉，后结束的那轮读到 undefined 就丢错（2026-11-28 事故）。
 	async deliverTurn(channel, deliver, text, ticket) {
-		channel.turnReplies = [];
-		channel.turnFailure = undefined;
-		const result = await deliver(text, ticket);
-		const said = channel.turnReplies.join('\n').trim();
-		const failure = channel.turnFailure;
-		channel.turnReplies = undefined;
-		channel.turnFailure = undefined;
-		return { result, said, failure };
+		const turn = { replies: [], failure: undefined, notices: 0 };
+		(channel.turns ??= []).push(turn);
+		try {
+			const result = await deliver(text, ticket);
+			return {
+				result,
+				said: turn.replies.join('\n').trim(),
+				failure: turn.failure,
+				notices: turn.notices,
+			};
+		} finally {
+			channel.turns.splice(channel.turns.indexOf(turn), 1);
+		}
 	}
 
 	// 她一轮说完就结束，不会有「等一下」。只回一句「我看看／我查一下」就停时，
 	// 自动再给一轮叫她做完；每则消息最多补一次，期间有人再叫她就不补。
 	// 输出太长被截断也再给一轮叫她精简；还是失败就用她自己的口气说一句，不贴原始错误。
-	async deliverAndFollow(channel, deliver, text, ticket, controlReply) {
+	// 直接呼叫一定有下文：回话、她自己说一句失败，或被更新的呼叫取代。桥接什么都没回
+	// （排队过期被丢掉、回合没进会话）也补一句，不让「正在输入」之后一片沉默。
+	async deliverAndFollow(
+		channel,
+		deliver,
+		text,
+		ticket,
+		controlReply,
+		messageId = '?',
+	) {
 		const epoch = channel.directEpoch;
-		let { result, said, failure } = await this.deliverTurn(
+		const started = this.now();
+		this.log(`直接呼叫 收到 #${messageId}`);
+		const finish = (outcome) =>
+			this.log(
+				`直接呼叫 结果 #${messageId}：${outcome}，${Math.round((this.now() - started) / 1000)} 秒`,
+			);
+		let { result, said, failure, notices } = await this.deliverTurn(
 			channel,
 			deliver,
 			text,
 			ticket,
 		);
 		if (failure === 'max-tokens' && epoch === channel.directEpoch)
-			({ result, said, failure } = await this.deliverTurn(
+			({ result, said, failure, notices } = await this.deliverTurn(
 				channel,
 				deliver,
 				TOO_LONG,
 				{ proactive: false },
 			));
-		if (failure) {
-			if (epoch === channel.directEpoch && !said)
+		if (failure || (!said && !notices)) {
+			const what = failure ? `失败（${failure}）` : '没有任何输出';
+			if (said) finish(`${what}，已回过话`);
+			else if (epoch !== channel.directEpoch)
+				finish(`${what}，已被更新的呼叫取代`);
+			else {
+				finish(`${what}，补一句`);
 				await controlReply?.(
-					failure === 'error' || failure === 'max-tokens' ? STUCK : failure,
-				).catch(() => this.warn('回合失败后的提示没有送出。'));
+					!failure || failure === 'error' || failure === 'max-tokens'
+						? STUCK
+						: failure,
+				).catch(() => this.warn(`回合失败后的提示没有送出 #${messageId}。`));
+			}
 			return result;
 		}
+		finish(said ? '已回话' : '只有回合提示（没有文字）');
 		const last = (
 			said
 				.split(/[\n。！？!?]/)
@@ -807,7 +844,8 @@ export class NaturalParticipation {
 					? this.dmPrompt(channel, direct)
 					: this.contextPrompt(channel, 'direct', message.id),
 				{ proactive: false },
-				message.guild_id === undefined ? undefined : controlReply,
+				controlReply,
+				message.id,
 			);
 		}
 		const mentionsOther = /<@!?\d+>/.test(text);
@@ -837,6 +875,7 @@ export class NaturalParticipation {
 				this.contextPrompt(channel, 'followup', message.id),
 				{ proactive: false },
 				controlReply,
+				message.id,
 			);
 		}
 		// 不在她刚才那段对话里的人开口，她跟对象的一对一就算告一段落；同一段对话里的人开口不算。
@@ -907,6 +946,7 @@ export class NaturalParticipation {
 				this.contextPrompt(channel, 'direct', line.id),
 				{ proactive: false },
 				controlReply,
+				message.id,
 			);
 		}
 		if (this.disabled) return;

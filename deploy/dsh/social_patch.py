@@ -8,7 +8,7 @@ def once(content, anchor, replacement):
 
 
 def social_patch(content):
-    content = 'import { admitSocialMessage, prepareSocialTurn, handleSocialControl, assertGroupSession, isSocialOwner, toGroupText, redactSecrets, registerDiscordRest, socialGuildOwner, socialChannelLabel, socialConsolidate, socialImageNotes, prepareGroupReply, registerDiscordGateway, socialPresence, socialArchive, settleSocialTurn, extractSocialReply } from "dsh-social-runtime/bridge";\n' + content
+    content = 'import { admitSocialMessage, prepareSocialTurn, handleSocialControl, assertGroupSession, isSocialOwner, toGroupText, redactSecrets, registerDiscordRest, socialGuildOwner, socialChannelLabel, socialConsolidate, socialImageNotes, prepareGroupReply, registerDiscordGateway, socialPresence, socialArchive, awaitSocialTurn, TURN_DEADLINE_NOTICE, extractSocialReply } from "dsh-social-runtime/bridge";\n' + content
     # 群聊：文字照常回覆（繁体、遮机密），[sticker:…] 换成的表情 GIF 另发一则附件；私讯只遮机密。
     # 群聊里桥接自己的回合提示（失败、取消、没有文字）不发出去，交给群聊行为处理（失败时她自己说一句）。
     # 「回复」由她自己选：回话开头写 [回覆 #編號] 才挂到那一则，没写就是一般讯息（以前一律挂在叫她的那则）。
@@ -25,7 +25,11 @@ if (!sent) continue;''')
     # 群聊自动开新会话时不发「(已自动新建会话 …)」：那是给管理用的讯息，群友不需要看到。
     content = once(content, 'const preamble = created && title !== void 0 ?', 'const preamble = this.config.preset !== "whale-social" && created && title !== void 0 ?')
     # huanqi（换气）在回合结束后另开的补救轮：等它跑完，取回答时也算进去，补救的回答才传得到 Discord。
-    content = once(content, 'const flushable = this.ctx.get("sessions");', 'await settleSocialTurn(agent);\nconst flushable = this.ctx.get("sessions");')
+    # 等回合有上限（预设 240 秒，DISCORD_TURN_DEADLINE_MS 可调）：超过就取消回合、停掉「正在输入」，
+    # 交给群聊行为处理用她的口气说一句。回合已经完整回答就不再等后面的补救轮（2026-11-28 事故）。
+    content = once(content, 'await agent.whenIdle();', '''const socialWait = await awaitSocialTurn(agent, messageId);
+this.log("info", `回合结束 #${messageId}：${Math.round(socialWait.elapsedMs / 1000)} 秒${socialWait.timedOut ? "，超过期限已取消" : ""}`);
+if (socialWait.timedOut) return { chunks: [TURN_DEADLINE_NOTICE], files: [] };''')
     content = once(content, 'const reply = extractReply(events, promptSeq);', 'const reply = extractSocialReply(events, promptSeq);')
     # 频道白名单含 "*" 就是所有服务器的所有频道；私讯仍只收拥有者。
     content = once(content, 'if (!allowedChannels.includes(message.channel_id)) return false;', 'if (!allowedChannels.includes("*") && !allowedChannels.includes(message.channel_id)) return false;')
@@ -82,6 +86,7 @@ const participation = new NaturalParticipation({
   stateFile: join(dirname(resolveStateFile(config.stateFile, ctx.baseUrl)), "participation-state.json"),
   ownerIds: config.allowedUsers,
   warn: (text) => logger.warn(text),
+  log: (text) => logger.info(text),
   guildOwner: (guildId) => socialGuildOwner(guildId),
   channelLabel: (channelId) => socialChannelLabel(channelId),
   consolidate: (lines, place, options) => socialConsolidate(lines, place, options),
@@ -101,7 +106,7 @@ const onMessage = (message) => {
     if (await handleSocialControl(message, controlReply)) return;
     await participation.receive(message, { botUserId, botName: botLabel },
       (text, ticket) => deliverMessage({ ...message, content: text, attachments: [...(message.attachments ?? []), ...(message.referenced_message?.attachments ?? [])] }, ticket), controlReply);
-  })().catch(() => logger.warn("群聊行为处理未完成，保持安静。"));
+  })().catch((error) => logger.warn(`群聊行为处理未完成，保持安静 #${message.id}：${redactSecrets(String(error?.stack ?? error)).slice(0, 600)}`));
 };
 const onMessageDelete = (data) => socialArchive("delete", data);
 const onMessageUpdate = (message) => {
@@ -116,7 +121,7 @@ const onMessageUpdate = (message) => {
   // 附件在原讯息时已经收过，编辑时不再下载。
   void participation.receiveEdit(message, { botUserId, botName: botLabel },
     (text, ticket) => deliverMessage({ ...message, content: text, attachments: [] }, ticket), controlReply)
-    .catch(() => logger.warn("编辑讯息处理未完成，保持安静。"));
+    .catch((error) => logger.warn(`编辑讯息处理未完成，保持安静 #${message.id}：${redactSecrets(String(error?.stack ?? error)).slice(0, 600)}`));
 };
 '''
     return content[:start] + wrapper + content[end:]
