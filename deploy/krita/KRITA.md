@@ -160,8 +160,9 @@ sudo sh ~/stage-krita/update_krita_files.sh ~/stage-krita
   - 拿和 guard 共用的互锁（`/var/lib/krita-guard/interlock.lock` 的 flock）。guard 每次停 / 开 Krita 之前也要拿这把锁，并且先把状态写进 `/var/lib/krita-guard/state.json` 才动 systemctl；闲置重启在锁里确认 guard 的 mode 是 `watching`（停住、锁住、或状态档读不出来都不动）、两个服务都还在跑。
   - 「关门」：把 `gate.sock` 暂时改成 0600（不跟随连结），dsh 新的请求会马上被拒、不会画到一半被打断；等 2 秒再确认一次上面三项，有动静就把门开回来、这次不动。
   - 用 `systemctl try-restart`（只重启正在跑的，不会启动停着的），然后放开锁。gate 重启会重建 0660 的 socket；没重启、失败或被 systemd 收掉时也会把门开回来。
-- 部署：`sh deploy_guard.sh <资料夹>`，会先备份到 `/var/backups/krita-guard-<时间>/`，并把 `rollback_guard.sh` 放成那里的 `rollback.sh`。回滚 `sh /var/backups/krita-guard-<时间>/rollback.sh`：每一步印 OK 或失败，全部成功才印「回滚完成」，否则印「回滚没完成」、列出失败步骤并以 1 结束；不重启 dsh、不启动停着的 krita / gate（备份里的旧 guard Requires= gate 时，gate 停着就不启动 guard，改印手动指令）；guard 开机启动和 timer 回到部署前的状态。测试：`python3 -m unittest test_krita_guard`（posix 部分要 Linux）；真机验证：`guard_livetest.sh`（另起一个测试 guard，只把 dsh 压力换成假的，真的停 / 开一次 Krita，并用 `measure_cold_start.py` 量冷启动）。
+- 部署：`sh deploy_guard.sh <资料夹>`，会先备份到 `/var/backups/krita-guard-<时间>/`，并把 `rollback_guard.sh` 放成那里的 `rollback.sh`。回滚 `sh /var/backups/krita-guard-<时间>/rollback.sh`：每一步印 OK 或失败，全部成功才印「回滚完成」，否则印「回滚没完成」、列出失败步骤并以 1 结束；不重启 dsh、不启动停着的 krita / gate（备份里的旧 guard Requires= gate 时，gate 停着就不启动 guard，改印手动指令）；guard 开机启动和 timer 回到部署前的状态。测试：`python3 -m unittest test_krita_guard`（posix 部分要 Linux）；真机验证：`guard_livetest.sh`（另起一个测试 guard，只把 dsh 压力换成假的，真的停 / 开 Krita 三次，验证尖峰、持续、自动恢复、互锁、锁住和手动开回，约 8 分钟；先确认 gate 闲置才开始）。冷启动另外用 `measure_cold_start.py` 量。
 - 2026-11-28 实测：假 dsh 压力 30% 第 15 秒停，改回 0% 后 91 秒自动开回；Krita 冷启动桥接就绪 5.4 秒、第一张空白画布 0.5 秒；重启前 anon 1220 MB、重启后约 350 MB。重启前 Krita 已顶在 MemoryHigh 上，开一张新画布就让 krita 自己的压力到约 80%、整台约 70%，dsh 压力仍是 0%，新 guard 没有误停。
+- 2026-11-28 审查修正版（e8864f1）部署后用 `guard_livetest.sh` 实测（假 dsh 压力，不画图），六项都过：一笔 30% 尖峰不停；持续 30% 第 19 秒停，同时跑的测试用闲置重启没有把 Krita 拉回来；压力回 0% 后 93 秒自动开回；flock 占住互锁 30 秒时 guard 已决定停但等锁放开才停；第 3 次停的那一刻就 LOCKED，之后 120 秒没开回；guard 锁住时闲置重启不重启（gate MainPID 没变），手动开回记 MANUAL。dsh MainPID / NRestarts 全程没变。
 
 ## 停止（一行）
 
