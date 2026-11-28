@@ -42,13 +42,13 @@ class PortIndexTests(unittest.TestCase):
             self.assertIn(kept, ported)
         self.assertTrue(ported.startswith(sp.TURN_IMPORT + port.STUDIO_IMPORT))
         self.assertIn("message.id, true, naturalTicket);", ported)
-        self.assertIn(sp.SUBSCRIBE + port.STUDIO_WIRING + port.SUBSCRIBE_ANCHOR, ported)
+        self.assertIn(sp.SUBSCRIBE + port.STUDIO_WIRING + port.GONE_WIRING + port.SUBSCRIBE_ANCHOR, ported)
 
     def test_round_two_fixes_are_wired(self):
         ported = port.port_index(fake_release())
         # 每次成功送出就记一笔：文字一送出就记，贴图附件失败只记日志（不再补「卡住了」）。
         self.assertNotIn("if (!sent) continue;", ported)
-        text_sent = ported.index("sent = await rest.createMessage(message.channel_id, prepared.text, target.messageId);")
+        text_sent = ported.index("sent = await socialReply((replyTo) => rest.createMessage(message.channel_id, prepared.text, replyTo), target.messageId,")
         booked = ported.index("participation.recordReply(message.channel_id, target.text, sent.id,", text_sent)
         self.assertLess(booked, ported.index('createMessageWithFiles(message.channel_id, "", prepared.files)', text_sent))
         self.assertIn("recordSocialCommitment(message, sent,", ported)
@@ -191,6 +191,41 @@ class RuntimeAndKritaTests(unittest.TestCase):
             port.port_krita(ported)
 
 
+class StrictReplyTests(unittest.TestCase):
+    # Sol 部署前审查：送答前的核对过了、POST 等待或重试的期间原讯息才被删，回答不能掉成一则没回覆任何人的群讯。
+    def test_every_reply_uses_a_strict_reference_and_rejection_counts_as_revoked(self):
+        ported = port.port_index(fake_release())
+        self.assertNotIn("fail_if_not_exists: false", ported)
+        self.assertIn("message_id: replyToMessageId,\n\t\t\t\tfail_if_not_exists: true", ported)
+        # 附件（贴图 GIF）没跟着文字送时也挂同一个参照。
+        self.assertIn("async createMessageWithFiles(channelId, content, files, replyToMessageId) {", ported)
+        self.assertIn("message_reference: { message_id: replyToMessageId, fail_if_not_exists: true }", ported)
+        self.assertIn('socialReply((replyTo) => rest.createMessageWithFiles(message.channel_id, "", prepared.files, replyTo), target.messageId,', ported)
+        # 被拒（讯息不在）：request 交给 rest.onGone，群聊行为处理、闸道、画室都记成撤回。
+        self.assertIn("socialNoteGone(this, path, body, form, socialError);\n\t\t\t\tthrow socialError;", ported)
+        for line in ("participation.messageGone(channelId, messageId);",
+                     "scopeAuthority?.noteRevoked({ channel_id: channelId, id: messageId });",
+                     "noteSocialStudioDeleted({ channel_id: channelId, id: messageId });"):
+            self.assertIn(line, ported)
+        self.assertIn("socialReply, socialNoteGone,", ported.splitlines()[0])
+        # 附件送不出去的那句提示：撤回了就不说。
+        self.assertIn('if (participation.canSend(message.channel_id, naturalTicket)) await rest.createMessage(message.channel_id, "⚠️ 附件上传失败', ported)
+
+    def test_a_release_with_a_lenient_reply_left_is_refused(self):
+        with self.assertRaises(ValueError):
+            port.port_index(fake_release() + "\nfail_if_not_exists: false\n")
+
+    def test_discord_send_message_reply_is_strict(self):
+        fake = "x\n" + port.TOOLS_STRICT[0] + "\ny\n"
+        ported = port.port_discord_tools(fake)
+        self.assertIn(port.TOOLS_STRICT[1], ported)
+        self.assertNotIn("fail_if_not_exists: false", ported)
+        with self.assertRaises(ValueError):
+            port.port_discord_tools(ported)
+        with self.assertRaises(ValueError):
+            port.port_discord_tools(fake + port.TOOLS_STRICT[0])
+
+
 class HuanqiTests(unittest.TestCase):
     def fake(self):
         return "".join(anchor for anchor, _ in (port.HUANQI_AFTER_TURN, port.HUANQI_CONTINUE, port.HUANQI_BREAK,
@@ -271,7 +306,8 @@ class RealReleaseCopyTests(unittest.TestCase):
                          "dsh-plugin-discord/lib/history-view.mjs", "dsh-plugin-discord/lib/gateway-scopes.mjs",
                          "dsh-social-runtime/bridge.mjs", "dsh-social-runtime/turn-guard.mjs",
                          "dsh-social-runtime/studio.mjs", "dsh-social-runtime/index.mjs",
-                         "dsh-social-runtime/krita-tools.mjs", "dsh-huanqi/lib/index.js"):
+                         "dsh-social-runtime/krita-tools.mjs", "dsh-social-runtime/discord-tools.mjs",
+                         "dsh-huanqi/lib/index.js"):
                 subprocess.run(["node", "--check", str(target / name)], check=True)
             with self.assertRaises(ValueError):
                 port.main([str(target), "--worktree"])

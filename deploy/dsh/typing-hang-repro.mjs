@@ -1,6 +1,7 @@
 // 重现并验收 2026-11-28「@ 了只显示正在输入、不回话」与第 1、2 轮审查列出的情境，
 // 以及背景画室（画图交给另一个会话，聊天不被卡住）与第 3 轮审查的 5 条 High：画室不带私讯内容、
 // 每一段等待都有期限、请求被删时图不掉成一般群讯、工具送讯照发送来源归帐、画室在 chat／full 都能用 krita_batch。
+// Sol 部署前审查：送答前的核对过了、POST 期间原讯息才被删，回答、贴图、画室交图都不掉成一般群讯，记成撤回。
 // 直接拿 VM release 副本里真正的桥接程式码来跑：index.js 的 enqueuePrompt／runPrompt／saveIncoming／
 // commandStop、DiscordRest 与 deliverMessage（送讯回圈），接上同一份副本的 natural-participation.mjs、
 // turn-guard.mjs 与 studio.mjs（画室：真的 Studio／connectStudio／draw_request，画室会话是假的）。
@@ -128,6 +129,15 @@ const deleteSource = indexText.slice(
 	indexText.indexOf('\n', deleteStart),
 );
 const patched = indexText.includes('runSocialTurn');
+// 送出时 Discord 说回覆的那则不在：index.js 把它当成撤回的接线（修正后才有）。
+const goneStart = indexText.indexOf('rest.onGone = (channelId, messageId) =>');
+const goneSource =
+	goneStart < 0
+		? undefined
+		: indexText.slice(
+				goneStart,
+				blockEnd(indexText, indexText.indexOf('{', goneStart)),
+			) + ';';
 
 // turn-guard（修正后才有）；修正前用副本 bridge.mjs 里原本的 settleSocialTurn／extractSocialReply。
 let guard = {};
@@ -205,6 +215,39 @@ let sceneStart = START;
 let sceneCount = 0;
 let nextId = 2000000000000000000n;
 const seconds = (at) => Math.round((at - sceneStart) / 100) / 10;
+
+// 副本真的 DiscordRest（换上假 fetch）。修正后它的 request 会呼叫 turn-guard 的 socialNoteGone。
+function realDiscordRest(fetch) {
+	return new Function(
+		'scope',
+		`with (scope) { return ${restSource.replace(/^var DiscordRest = /, '')} }`,
+	)(
+		new Proxy(
+			{ ...guard, fetch, API_BASE: 'https://discord.invalid/api/v10' },
+			{
+				has: () => true,
+				get: (target, key) =>
+					key === Symbol.unscopables
+						? undefined
+						: key in target
+							? target[key]
+							: globalThis[key],
+			},
+		),
+	);
+}
+// Discord 拒绝回覆已删讯息（fail_if_not_exists: true）时回的内容（表单错误，回覆对象不在）。
+const REPLY_GONE_BODY = JSON.stringify({
+	message: 'Invalid Form Body',
+	code: 50035,
+	errors: {
+		message_reference: {
+			_errors: [
+				{ code: 'REPLIES_UNKNOWN_MESSAGE', message: 'Unknown message' },
+			],
+		},
+	},
+});
 
 // ---- 假的会话（agent loop）：照 inbox 一则一则开回合，回合内容由情境的 model 决定 ----
 class FakeAgent {
@@ -308,11 +351,14 @@ class FakeAgent {
 						)
 					: send();
 			},
-			// Krita 的预览与交付：回覆原本那则请求。
-			reply: (content, replyTo) =>
+			// Krita 的预览与交付：回覆原本那则请求。strict：照移植后的 krita-tools（fail_if_not_exists: true）。
+			reply: (content, replyTo, { strict = false } = {}) =>
 				this.rest.tracked.request('POST', `/channels/${CHANNEL}/messages`, {
 					content,
-					message_reference: { message_id: replyTo, fail_if_not_exists: false },
+					message_reference: {
+						message_id: replyTo,
+						fail_if_not_exists: strict,
+					},
 				}),
 			// 聊天回合交代画图（修正后才有 draw_request）。
 			drawRequest: this.rest.drawTool
@@ -341,6 +387,7 @@ class FakeAgent {
 					round,
 					kind,
 					text: message.content?.[0]?.text ?? '',
+					idOf: (key) => this.idOf?.(key),
 				},
 				tools,
 			);
@@ -377,53 +424,64 @@ async function play(scene) {
 		info: (text) => logs.push({ at: Date.now(), level: 'info', text }),
 		warn: (text) => logs.push({ at: Date.now(), level: 'warn', text }),
 	};
+	// 桥接、补话、工具与画室的送讯都走副本真的 DiscordRest（假 fetch）：fail_if_not_exists 照副本自己的写法，
+	// Discord 照真的规则（false 掉成一般讯息，否则 400 拒绝）。
+	let via = 'bridge';
+	const discordFetch = async (url, options = {}) => {
+		const tag = via;
+		if (options.method !== 'POST' || !/\/channels\/\d+\/messages$/.test(url))
+			return new globalThis.Response(null, { status: 204 });
+		const form = options.body instanceof globalThis.FormData;
+		const payload = form
+			? JSON.parse(options.body.get('payload_json'))
+			: JSON.parse(options.body ?? '{}');
+		const reference = payload.message_reference;
+		const orphan = Boolean(reference && deleted.has(reference.message_id));
+		if (orphan && reference.fail_if_not_exists !== false)
+			return new globalThis.Response(REPLY_GONE_BODY, { status: 400 });
+		const sent = {
+			id: id(),
+			at: Date.now(),
+			content: form
+				? `［附件 ${payload.attachments.length}］`
+				: (payload.content ?? ''),
+			replyTo: orphan ? undefined : reference?.message_id,
+			orphan,
+			via: tag,
+		};
+		posted.push(sent);
+		return new globalThis.Response(JSON.stringify(sent), { status: 200 });
+	};
+	const discord = new (realDiscordRest(discordFetch))({ token: 'x' });
+	// 情境要的「POST 期间原讯息被删」：送出这句（或附件）时，先等 1 秒再删，删完 Discord 才收到。
+	const deleteDuringPost = async (match) => {
+		const item = scene.messages.find(match);
+		const message = item && messages.get(item.key);
+		if (!message || deleted.has(message.id)) return;
+		await delay(1_000);
+		deleted.add(message.id);
+		if (item.silent) gone.add(message.id);
+		else
+			onMessageDelete({ id: message.id, channel_id: CHANNEL, guild_id: GUILD });
+	};
 	const rest = {
-		async createMessage(channelId, content, replyTo) {
+		async createMessage(channelId, content, replyTo, signal) {
 			await scene.sendDelay?.(content);
-			// DiscordRest.createMessage 固定 fail_if_not_exists=false。
-			const orphan = Boolean(replyTo && deleted.has(replyTo));
-			const sent = {
-				id: id(),
-				at: Date.now(),
-				content,
-				replyTo: orphan ? undefined : replyTo,
-				orphan,
-				via: 'bridge',
-			};
-			posted.push(sent);
-			return sent;
+			await deleteDuringPost((item) => item.deleteOnSend === content);
+			via = 'bridge';
+			return discord.createMessage(channelId, content, replyTo, signal);
 		},
-		async createMessageWithFiles(channelId, content, files) {
+		async createMessageWithFiles(channelId, content, files, replyTo) {
 			await scene.filesFail?.();
-			const sent = {
-				id: id(),
-				at: Date.now(),
-				content: `［附件 ${files.length}］`,
-				via: 'bridge',
-			};
-			posted.push(sent);
-			return sent;
+			await deleteDuringPost((item) => item.deleteOnFiles);
+			via = 'bridge';
+			return discord.createMessageWithFiles(channelId, content, files, replyTo);
 		},
-		async request(method, path, body) {
-			if (method === 'POST' && /\/messages$/.test(path)) {
+		async request(method, path, body, form, signal) {
+			if (method === 'POST' && /\/messages$/.test(path))
 				await scene.toolDelay?.(body?.content ?? '');
-				const reference = body?.message_reference;
-				const orphan = Boolean(reference && deleted.has(reference.message_id));
-				if (orphan && reference.fail_if_not_exists !== false)
-					throw new Error(
-						`discord REST POST ${path} failed: 400 {"code":10008}`,
-					);
-				const sent = {
-					id: id(),
-					at: Date.now(),
-					content: body?.content ?? '',
-					replyTo: orphan ? undefined : reference?.message_id,
-					orphan,
-					via: 'tool',
-				};
-				posted.push(sent);
-				return sent;
-			}
+			via = 'tool';
+			return discord.request(method, path, body, form, signal);
 		},
 		triggerTyping: async () => {},
 	};
@@ -463,6 +521,7 @@ async function play(scene) {
 	const keyOf = (messageId) =>
 		[...messages].find(([, message]) => message.id === messageId)?.[0];
 	agent.keyOf = keyOf;
+	agent.idOf = (key) => messages.get(key)?.id;
 	// 宿主核对过的本轮来源（runtime.turns／sourceForTurn 的替身）：draw_request 从这里取请求者。
 	const sourceOf = (messageId) => {
 		const message = [...messages.values()].find((row) => row.id === messageId);
@@ -713,6 +772,12 @@ async function play(scene) {
 		}),
 	);
 
+	const noteSocialStudioDeleted = deletedSource
+		? new Function(
+				'currentRuntime',
+				`${deletedSource}; return noteSocialStudioDeleted;`,
+			)(() => runtime)
+		: undefined;
 	const onMessageDelete = deleteSource
 		? new Function(
 				'scope',
@@ -722,15 +787,20 @@ async function play(scene) {
 					// 跟正式版一样：删掉的讯息记成撤销（送答前的核对、闸道租约都不再认它）。
 					scopeAuthority: scopes,
 					socialArchive: () => {},
-					noteSocialStudioDeleted: deletedSource
-						? new Function(
-								'currentRuntime',
-								`${deletedSource}; return noteSocialStudioDeleted;`,
-							)(() => runtime)
-						: undefined,
+					noteSocialStudioDeleted,
 				}),
 			)
 		: () => {};
+	// 送出时 Discord 说回覆的那则不在（严格参照被拒）：照副本 index.js 自己的接线（修正后才有）。
+	if (goneSource)
+		new Function('scope', `with (scope) { ${goneSource}; }`)(
+			scope({
+				rest: discord,
+				participation,
+				scopeAuthority: scopes,
+				noteSocialStudioDeleted,
+			}),
+		);
 	for (const item of scene.messages)
 		if (item.deleteAt !== undefined)
 			globalThis.setTimeout(() => {
@@ -2019,6 +2089,128 @@ const scenes = [
 		},
 		expect: { A: { never: [STUCK], status: 'answered' } },
 	},
+	// ---- Sol 部署前审查：送答前的核对过了，POST 等待或重试的期间原讯息才被删 ----
+	{
+		name: '送答核对通过以后、POST 期间原讯息被删：回答不掉成一般群讯，不补「卡住了」',
+		messages: [
+			{
+				key: 'A',
+				at: 0,
+				content: `${mention} 晚餐吃什麼 PRIVATE-A`,
+				deleteOnSend: '吃麵吧',
+			},
+		],
+		async model(turn, tools) {
+			await tools.wait(3_000);
+			tools.say(`[回覆 #${turn.messageId}] 吃麵吧`);
+		},
+		check({ posted }) {
+			return posted
+				.filter((row) => row.orphan || row.content === STUCK)
+				.map((row) => `原讯息被删以后还送出「${row.content.slice(0, 12)}」`);
+		},
+		expect: { A: { absent: [STUCK, '吃麵吧'], status: 'revoked' } },
+	},
+	{
+		name: '只回贴图：POST 期间原讯息被删、删除事件漏了：贴图不掉成一般群讯，不补「卡住了」',
+		messages: [
+			{
+				key: 'A',
+				at: 0,
+				content: `${mention} 早安 PRIVATE-A`,
+				deleteOnFiles: true,
+				silent: true,
+			},
+		],
+		prepare: async (text) => ({
+			text: text.replace(/\[sticker:[^\]]*\]/gu, '').trim(),
+			files: [{ filename: 'wave.gif', data: new Uint8Array(1) }],
+		}),
+		async model(turn, tools) {
+			await tools.wait(2_000);
+			tools.say(`[回覆 #${turn.messageId}] [sticker:wave]`);
+		},
+		check({ posted }) {
+			return posted.map(
+				(row) => `原讯息被删以后还送出「${row.content.slice(0, 12)}」`,
+			);
+		},
+		expect: { A: { absent: [STUCK], status: 'revoked' } },
+	},
+	{
+		name: '她回覆的那则（[回覆 #编号]）已经被删、叫她的那则还在：改回覆叫她的那则',
+		messages: [
+			{
+				key: 'O',
+				at: 0,
+				author: friend,
+				content: '早安 PRIVATE-O',
+				goneAt: 5_000,
+			},
+			{ key: 'A', at: 10_000, content: `${mention} 他剛剛說什麼 PRIVATE-A` },
+		],
+		async model(turn, tools) {
+			await tools.wait(2_000);
+			tools.say(`[回覆 #${turn.idOf('O')}] 他說早安`);
+		},
+		check({ posted }) {
+			return posted
+				.filter((row) => row.orphan)
+				.map((row) => `「${row.content.slice(0, 12)}」掉成一般群讯`);
+		},
+		expect: {
+			A: { replies: ['他說早安'], never: [STUCK], status: 'answered' },
+		},
+	},
+	{
+		name: '画室交图时请求已被删、删除事件漏了：画室记成撤回停下，不接着画、不补话',
+		messages: [
+			{
+				key: 'A',
+				at: 0,
+				content: `${mention} 畫一隻貓 PRIVATE-A`,
+				goneAt: 60_000,
+			},
+		],
+		async model(turn, tools) {
+			return chatDraw(tools, turn);
+		},
+		// 照移植后的 krita-tools：交付用严格参照；被拒时工具把错误交回给画室会话，它照样结束这一轮。
+		async studio(turn, tools) {
+			await tools.wait(10_000);
+			tools.tool('krita_batch', { action: 'start', width: 512, height: 512 });
+			await tools.wait(120_000);
+			await tools
+				.reply(FINAL, turn.messageId, { strict: true })
+				.catch(() => tools.say('交付失敗'));
+		},
+		typingMax: 30_000,
+		check({ logs, posted, messages, studioAgents }) {
+			const problems = [];
+			const id = messages.get('A')?.id;
+			for (const row of posted.filter((row) => row.orphan))
+				problems.push(`「${row.content.slice(0, 12)}」掉成一般群讯`);
+			if (
+				!logs.some((line) =>
+					line.text.startsWith(`畫室 结果 #${id} status=deleted `),
+				)
+			)
+				problems.push('画室没有把被删的请求记成撤回（status=deleted）');
+			const rounds = studioAgents
+				.flatMap((agent) => agent.events)
+				.filter(
+					(event) =>
+						event.type === 'user/message' &&
+						event.data?.source?.kind !== 'loop-guard',
+				).length;
+			if (rounds > 1)
+				problems.push(`请求已经不在，画室还接着画（共 ${rounds} 轮）`);
+			return problems;
+		},
+		expect: {
+			A: { posts: [GO], within: 10_000, never: [STUCK, STUDIO_FAILED] },
+		},
+	},
 ];
 
 // 「正在输入」被限流：拿副本里真正的 DiscordRest 与 beginTypingFor 跑。第一次 typing 回 429（retry_after 1 秒），
@@ -2035,23 +2227,7 @@ async function typingRateLimited() {
 			});
 		return new globalThis.Response(null, { status: 204 });
 	};
-	const DiscordRest = new Function(
-		'scope',
-		`with (scope) { return ${restSource.replace(/^var DiscordRest = /, '')} }`,
-	)(
-		new Proxy(
-			{ fetch, API_BASE: 'https://discord.invalid/api/v10' },
-			{
-				has: () => true,
-				get: (target, key) =>
-					key === Symbol.unscopables
-						? undefined
-						: key in target
-							? target[key]
-							: globalThis[key],
-			},
-		),
-	);
+	const DiscordRest = realDiscordRest(fetch);
 	const rest = new DiscordRest({ token: 'x' });
 	const beginTypingFor = new Function(
 		'scope',
@@ -2100,16 +2276,6 @@ const engine = {
 const PNG =
 	'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
 const work = (n) => 'work-' + String(n).padStart(24, '0');
-const sceneOf = (values) =>
-	new Proxy(values, {
-		has: () => true,
-		get: (target, key) =>
-			key === Symbol.unscopables
-				? undefined
-				: key in target
-					? target[key]
-					: globalThis[key],
-	});
 async function realRuntime(groupTools) {
 	const { SocialRuntime } = await import(
 		pathToFileURL(join(runtimeDir, 'index.mjs')).href
@@ -2282,10 +2448,7 @@ function fakeDiscord() {
 		}
 		return new globalThis.Response(null, { status: 204 });
 	};
-	const DiscordRest = new Function(
-		'scope',
-		`with (scope) { return ${restSource.replace(/^var DiscordRest = /, '')} }`,
-	)(sceneOf({ fetch, API_BASE: 'https://discord.invalid/api/v10' }));
+	const DiscordRest = realDiscordRest(fetch);
 	return { rest: new DiscordRest({ token: 'x' }), created, deleted };
 }
 const studioBridge = (create) => ({

@@ -8,6 +8,7 @@ import {
 	awaitSocialTurn,
 	errorTrace,
 	socialFollowup,
+	socialMessageGone,
 	socialTurnState,
 } from './turn-guard.mjs';
 
@@ -312,7 +313,8 @@ export class Studio {
 								typeof sent?.content === 'string' ? sent.content : text;
 							return 'sent';
 						},
-						() => 'send-failed',
+						// 送出时 Discord 说请求那则已经不在（严格参照被拒）：对方撤回了，不是送不出去。
+						(error) => (socialMessageGone(error) ? 'revoked' : 'send-failed'),
 					),
 				late,
 			]);
@@ -397,6 +399,13 @@ export class Studio {
 		let note = 'none';
 		if (text && pending.length) await this.settled(pending);
 		if (text) note = await this.sendNote(job, text);
+		// 补的那句才发现请求已经被删（删除事件还没到或漏了）：跟收到删除事件一样，记成撤回的终态，
+		// 之后再交代同一则也不画。
+		if (note === 'revoked') {
+			outcome = 'deleted';
+			text = undefined;
+			this.requestDeleted(job.channelId, job.messageId);
+		}
 		this.log(
 			`畫室 结果 #${job.messageId} status=${outcome} turn=${result?.status ?? 'none'} rounds=${result?.rounds ?? 0} note=${note} secs=${Math.round((this.now() - started) / 1000)}`,
 		);

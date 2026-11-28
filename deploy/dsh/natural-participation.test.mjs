@@ -1527,3 +1527,53 @@ test('讯息已撤回：桥接的提示不发出去，也不补「卡住了」',
 	assert.deepEqual(controls, []);
 	assert.match(result(logs, ids[0])[0], /status=revoked /);
 });
+
+// Sol 部署前审查：送答前的核对过了，POST 等待或重试的期间原讯息才被删。回覆用严格的讯息参照，Discord 拒绝时
+// 桥接的 rest.onGone 通知这里（messageGone）：这则呼叫不再送、不补「卡住了」，结果记成 revoked。
+test('送出时 Discord 说原讯息不在（严格参照被拒）：不再送、不补「卡住了」，记成撤回', async (t) => {
+	const f = await fixture(t);
+	let canSendAfter;
+	const deliver = async (text, ticket) => {
+		const id = ticket.round.call.messageId;
+		// 桥接送第一段时被拒：DiscordRest 先通知撤回，再丢出错误（桥接接住、记 sendFailed）。
+		f.participation.messageGone('room', id);
+		f.participation.sendFailed('room', ticket);
+		canSendAfter = f.participation.canSend('room', ticket);
+	};
+	const { ids, controls, logs } = await directCalls(f, deliver, [
+		'<@123> KEY-A 問題',
+	]);
+	assert.equal(canSendAfter, false, '撤回以后其余段落与附件都不送');
+	assert.deepEqual(controls, [], '不补「卡住了」');
+	assert.match(result(logs, ids[0])[0], /status=revoked /);
+	// 别的频道、别则的通知不影响这则。
+	const channel = f.participation.channel('room');
+	const call = f.participation.openCall(channel, '42', async () => {});
+	f.participation.messageGone('other', '42');
+	f.participation.messageGone('room', '43');
+	assert.equal(
+		f.participation.canSend('room', {
+			proactive: false,
+			round: { call, said: [] },
+		}),
+		true,
+	);
+	f.participation.closeCall(call);
+});
+
+test('补的那句送出时才被拒（原讯息不在）：结果记成撤回，不当成补话失败', async (t) => {
+	const f = await fixture(t);
+	const logs = [];
+	f.participation.log = (text) => logs.push(text);
+	const input = message('<@123> KEY-A 問題', { mentions: [{ id: '123' }] });
+	await f.participation.receive(
+		input,
+		identity,
+		async () => {},
+		async () => {
+			f.participation.messageGone('room', input.id);
+			throw new Error('discord REST POST x failed: 400 {"code": 10008}');
+		},
+	);
+	assert.match(result(logs, input.id)[0], /status=revoked /);
+});

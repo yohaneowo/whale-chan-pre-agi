@@ -498,6 +498,7 @@ export class NaturalParticipation {
 			call.closed ||
 			call.prefaced ||
 			call.stopped ||
+			call.revoked ||
 			call.drawEnded ||
 			this.delivered(call)
 		)
@@ -512,7 +513,7 @@ export class NaturalParticipation {
 			this.log(`直接呼叫 先说一句 #${call.messageId} kind=${kind} status=sent`);
 		} catch {
 			this.log(
-				`直接呼叫 先说一句 #${call.messageId} kind=${kind} status=send-failed`,
+				`直接呼叫 先说一句 #${call.messageId} kind=${kind} status=${call.revoked ? 'revoked' : 'send-failed'}`,
 			);
 		} finally {
 			call.prefacing = undefined;
@@ -532,6 +533,7 @@ export class NaturalParticipation {
 			drawing: undefined,
 			prefaced: false,
 			stopped: false,
+			revoked: false,
 			closed: false,
 		};
 		this.calls.set(call.messageId, call);
@@ -581,7 +583,11 @@ export class NaturalParticipation {
 				deliver,
 				text,
 			);
-			if (notice === 'max-tokens' && epoch === channel.directEpoch)
+			if (
+				notice === 'max-tokens' &&
+				!call.revoked &&
+				epoch === channel.directEpoch
+			)
 				({ result, said, notice } = await this.deliverRound(
 					call,
 					deliver,
@@ -597,6 +603,7 @@ export class NaturalParticipation {
 			).trim();
 			if (
 				!notice &&
+				!call.revoked &&
 				said &&
 				said.length <= 80 &&
 				PROMISE.test(last) &&
@@ -628,8 +635,8 @@ export class NaturalParticipation {
 	// 交给画室以后这轮没说话：替她说「好，我去畫」或「前面還有一張…」，不说「卡住了」。
 	async settleCall(call, turn) {
 		if (call.stopped) return 'stopped';
-		// 讯息已经被删或改掉：回覆对象不在了，不补任何话（补了会掉成一般群讯）。
-		if (turn === 'revoked') return 'revoked';
+		// 讯息已经被删或改掉（送答前核对时发现，或送出时被 Discord 拒绝）：回覆对象不在了，不补任何话。
+		if (turn === 'revoked' || call.revoked) return 'revoked';
 		// 画室已经结束、自己回过话（或请求被删）：这边不再补「好，我去畫」「卡住了」。
 		if (call.drawEnded && !this.delivered(call)) return 'draw-done';
 		let text;
@@ -647,7 +654,8 @@ export class NaturalParticipation {
 			await call.controlReply?.(text);
 			return kind + '-sent';
 		} catch {
-			return kind + '-failed';
+			// 补的那句送出时才发现那则已经不在（严格参照被拒）：一样是撤回。
+			return call.revoked ? 'revoked' : kind + '-failed';
 		}
 	}
 
@@ -861,9 +869,20 @@ export class NaturalParticipation {
 		}
 	}
 
-	// 送答前问：主动插话过期了，或这则呼叫已经被 /stop 停掉，就不送。
+	// 送出时 Discord 说这则已经不在（回覆的严格参照被拒，桥接的 rest.onGone）：当成对方撤回。
+	// 这则呼叫不再送、不补「卡住了」或「好，我去畫」（补了也只会被拒），结果记成 revoked。
+	messageGone(channelId, messageId) {
+		const call = this.calls.get(String(messageId));
+		if (call && call.channelId === String(channelId)) {
+			call.revoked = true;
+			clearTimeout(call.preface);
+		}
+	}
+
+	// 送答前问：主动插话过期了，或这则呼叫已经被 /stop 停掉、已经撤回，就不送。
 	canSend(channelId, ticket) {
-		if (ticket?.round?.call?.stopped) return false;
+		if (ticket?.round?.call?.stopped || ticket?.round?.call?.revoked)
+			return false;
 		return (
 			!ticket?.proactive || ticket.epoch === this.channel(channelId).directEpoch
 		);

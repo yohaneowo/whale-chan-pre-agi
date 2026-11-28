@@ -12,7 +12,7 @@ def once(content, anchor, replacement):
 # ---- 一轮的期限、取消与归帐（2026-11-28「正在输入」不停）----
 # 这些片段同时给 social_patch（从上游重建）与 port_typing_fix（移植到 VM 现行 release）用，
 # 两边接上的程式码一模一样。
-TURN_IMPORT = 'import { runSocialTurn, awaitSocialTurn, socialFollowup, socialPromptSeq, socialBounded, trackSocialSends, onSocialTurn, errorTrace, stopSocialTurns, socialTyping, TURN_DEADLINE_NOTICE } from "dsh-social-runtime/bridge";\n'
+TURN_IMPORT = 'import { runSocialTurn, awaitSocialTurn, socialFollowup, socialPromptSeq, socialBounded, trackSocialSends, onSocialTurn, errorTrace, stopSocialTurns, socialTyping, socialReply, socialNoteGone, TURN_DEADLINE_NOTICE } from "dsh-social-runtime/bridge";\n'
 
 # 「正在输入」从 runSocialTurn 亮起，期限（预设 280 秒）从这里算，任何情况都熄灯；
 # 卡住的附件、flush 不会再拖住灯与频道队列。
@@ -60,16 +60,29 @@ PROMPT_SEQ = ('const promptSeq = findPromptSeq(events, messageId);',
 # 日志只写讯息 ID 与 errorTrace（错误类别与堆疊位置），不写错误内文。
 PROMPT_FAILED = ('this.log("warn", `prompt failed: ${String(error)}`);',
                  'this.log("warn", `prompt failed #${messageId}：${errorTrace(error)}`);')
+# 所有回覆都用严格的讯息参照（fail_if_not_exists: true）：送答前的核对过了、POST 等待或重试的期间原讯息才被删，
+# Discord 会拒绝，回答不会掉成一则没回覆任何人的群讯（Sol 部署前审查）。被拒（Unknown Message）时 request
+# 交给 rest.onGone，桥接当成对方撤回：不送、不补「卡住了」。附件（贴图 GIF）没跟着文字时也挂同一个参照。
+STRICT_REPLY = ("message_id: replyToMessageId,\n\t\t\t\tfail_if_not_exists: false",
+                "message_id: replyToMessageId,\n\t\t\t\tfail_if_not_exists: true")
+FILES_REPLY = ('async createMessageWithFiles(channelId, content, files) {\n\t\tconst form = new FormData();\n\t\tform.append("payload_json", JSON.stringify({\n\t\t\tcontent,\n',
+               'async createMessageWithFiles(channelId, content, files, replyToMessageId) {\n\t\tconst form = new FormData();\n\t\tform.append("payload_json", JSON.stringify({\n\t\t\tcontent,\n'
+               '\t\t\t...replyToMessageId === void 0 ? {} : { message_reference: { message_id: replyToMessageId, fail_if_not_exists: true } },\n')
+REST_GONE = ("throw new Error(`discord REST ${method} ${path} failed: ${String(response.status)} ${text.slice(0, 300)}`);",
+             "const socialError = new Error(`discord REST ${method} ${path} failed: ${String(response.status)} ${text.slice(0, 300)}`);\n"
+             "\t\t\t\tsocialNoteGone(this, path, body, form, socialError);\n\t\t\t\tthrow socialError;")
 # 送讯：每一段凭 naturalTicket（这则呼叫的这一轮）记帐，送出失败也记。
 # 每次成功送出就记一笔：文字送出就算答覆，后面的贴图附件失败只记日志，不再补「卡住了」。
+# 她选的回覆对象不在了就改回覆叫她的那则（socialReply）；贴图跟着文字送就不挂参照，只有贴图时挂同一个参照。
 def group_send(commitment=''):
     return ('''let sent;
 if (prepared.text.trim()) {
-  sent = await rest.createMessage(message.channel_id, prepared.text, target.messageId);
+  sent = await socialReply((replyTo) => rest.createMessage(message.channel_id, prepared.text, replyTo), target.messageId, message.guild_id === void 0 ? void 0 : message.id);
   participation.recordReply(message.channel_id, target.text, sent.id, participation.replyPartner(target, message.author.id), target.messageId, index === 0, naturalTicket);
 ''' + commitment + '''}
 if (prepared.files.length) try {
-  const withFiles = await rest.createMessageWithFiles(message.channel_id, "", prepared.files);
+  const withFiles = await (sent ? rest.createMessageWithFiles(message.channel_id, "", prepared.files)
+    : socialReply((replyTo) => rest.createMessageWithFiles(message.channel_id, "", prepared.files, replyTo), target.messageId, message.guild_id === void 0 ? void 0 : message.id));
   if (!sent && withFiles) participation.recordReply(message.channel_id, target.text, withFiles.id, participation.replyPartner(target, message.author.id), target.messageId, index === 0, naturalTicket);
 } catch (error) {
   if (!sent) throw error;
@@ -84,18 +97,24 @@ FILES = ('await rest.createMessageWithFiles(message.channel_id, "", reply.files)
          'participation.recordFiles(message.channel_id, naturalTicket, await rest.createMessageWithFiles(message.channel_id, "", reply.files));')
 FILES_FAILED = ('logger.warn(`discord-bridge: file upload failed: ${String(error)}`);',
                 'participation.sendFailed(message.channel_id, naturalTicket);\nlogger.warn(`discord-bridge: file upload failed #${message.id}：${errorTrace(error)}`);')
+# 附件送不出去时的那句提示：讯息已经撤回（或这则被停掉）就不说。
+FILES_NOTICE = ('await rest.createMessage(message.channel_id, "⚠️ 附件上传失败,文件仍在服务器上。").catch(() => {});',
+                'if (participation.canSend(message.channel_id, naturalTicket)) await rest.createMessage(message.channel_id, "⚠️ 附件上传失败,文件仍在服务器上。").catch(() => {});')
 HANDLING_FAILED = ('logger.warn(`discord-bridge: message handling failed: ${String(error)}`);',
                    'logger.warn(`discord-bridge: message handling failed #${message.id}：${errorTrace(error)}`);')
 # 工具（discord_send_message、Krita）送到频道的讯息记到正在跑的那则呼叫名下。
 TRACKED_REST = ('registerDiscordRest(rest);',
                 'registerDiscordRest(trackSocialSends(rest, (channelId, messageId) => participation.recordToolMessage(channelId, messageId)));')
+# 回覆的那则在送出时已经不在（严格参照被拒）：群聊行为处理把那则呼叫记成撤回（不送、不补话）。
+GONE_WIRING = 'rest.onGone = (channelId, messageId) => participation.messageGone(channelId, messageId);\n'
 # turn-guard 的回合事件交给群聊行为处理（目前不做事，保留接点）。
 SUBSCRIBE = 'onSocialTurn((event) => participation.turnEvent(event));\n'
 MESSAGE_FAILED = '.catch((error) => logger.warn(`群聊行为处理未完成，保持安静 #${message.id}：${errorTrace(error)}`))'
 EDIT_FAILED = '.catch((error) => logger.warn(`编辑讯息处理未完成，保持安静 #${message.id}：${errorTrace(error)}`))'
 # 一轮的整段生命周期（runPrompt 本体与 deliverMessage 送讯）共用的接点，上游与现行 release 都有。
 LIFECYCLE = [ENQUEUE, ENQUEUE_AT, SIGNATURE, SAVE_SIGNATURE, FETCH, ATTACH, FLUSH, PROMPT_SEQ, PROMPT_FAILED,
-             SEND_FAILED, FILES, FILES_FAILED, HANDLING_FAILED, COMMAND_STOP, TYPING, INCOMING_FAILED]
+             SEND_FAILED, FILES, FILES_FAILED, FILES_NOTICE, HANDLING_FAILED, COMMAND_STOP, TYPING, INCOMING_FAILED,
+             STRICT_REPLY, FILES_REPLY, REST_GONE]
 
 
 def social_patch(content):
@@ -181,7 +200,7 @@ const participation = new NaturalParticipation({
   seenImages: (message) => socialImageNotes(message),
   fetchRecent: (channelId, before) => rest.request("GET", `/channels/${channelId}/messages?limit=20&before=${before}`),
 });
-''' + SUBSCRIBE + '''const onMessage = (message) => {
+''' + GONE_WIRING + SUBSCRIBE + '''const onMessage = (message) => {
   // 原文帐本收全部：群聊、私讯、她自己发的，都在过滤之前记下。
   socialArchive("message", message);
   if (!isAllowed(message, botUserId, config.allowedUsers, config.allowedChannels)) return;

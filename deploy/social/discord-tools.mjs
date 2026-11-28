@@ -365,7 +365,7 @@ const DEFINITIONS = [
 						? {
 								message_reference: {
 									message_id: reply_to,
-									fail_if_not_exists: false,
+									fail_if_not_exists: true,
 								},
 							}
 						: {}),

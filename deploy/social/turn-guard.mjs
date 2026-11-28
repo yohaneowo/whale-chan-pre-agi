@@ -160,6 +160,46 @@ function referenceOf(body, form) {
 	return /^\d{16,22}$/.test(String(id ?? '')) ? String(id) : undefined;
 }
 
+// Discord 说那则讯息已经不在（被删）：带严格参照（fail_if_not_exists: true）的回覆被拒，或取原讯息查不到。
+// 官方文件没写回覆被拒时的确切错误码，Unknown Message（10008）与表单错误里的 REPLIES_UNKNOWN_MESSAGE 都认。
+export function socialMessageGone(error) {
+	const text = String(error?.message ?? '');
+	return (
+		/^discord REST [A-Z]+ \S+ failed: (?:400|404)\b/u.test(text) &&
+		/"code"\s*:\s*10008\b|REPLIES_UNKNOWN_MESSAGE|Unknown Message/iu.test(text)
+	);
+}
+
+// DiscordRest 送讯失败时呼叫（index.js 的 request 接上）：挂了回复、而 Discord 说回复的那则不在，
+// 就交给 rest.onGone(频道, 那则)，桥接把它当成对方撤回（跟收到删除事件一样）。错误照样丢出。
+export function socialNoteGone(rest, path, body, form, error) {
+	const channelId = /^\/channels\/(\d+)\/messages$/.exec(String(path))?.[1];
+	const messageId = channelId && referenceOf(body, form);
+	if (!messageId || !socialMessageGone(error)) return;
+	try {
+		rest?.onGone?.(channelId, messageId);
+	} catch {
+		/* 记撤回失败不影响原本的错误。 */
+	}
+}
+
+// 桥接送一则回覆（严格参照）。她自己选的回覆对象（[回覆 #編號]）不在了、但叫她的那则还在：改回覆叫她的那则。
+// 叫她的那则也不在，错误照样丢出（桥接当成撤回，不送、不补「卡住了」）。
+export async function socialReply(send, replyTo, fallback) {
+	try {
+		return await send(replyTo);
+	} catch (error) {
+		if (
+			!replyTo ||
+			!fallback ||
+			replyTo === fallback ||
+			!socialMessageGone(error)
+		)
+			throw error;
+		return await send(fallback);
+	}
+}
+
 // 工具送讯的来源：工具一开始执行就记下「哪个会话、为哪则讯息」在跑（runtime 在注册工具时包上），
 // 之后这次执行里送出的讯息，不管拖到什么时候才真的送出，都认这个来源。
 const sendOrigin = new AsyncLocalStorage();

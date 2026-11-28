@@ -87,6 +87,14 @@ class SocialPatchTests(unittest.TestCase):
         self.assertNotIn("rest.triggerTyping(channelId)", self.patched)
         self.assertIn("incoming attachment failed #${messageId}：${errorTrace(error)}", self.patched)
 
+    def test_replies_use_strict_references(self):
+        # Sol 部署前审查：所有回覆用严格的讯息参照；被拒时 request 交给 rest.onGone，群聊行为处理记成撤回。
+        self.assertNotIn("fail_if_not_exists: false", self.patched)
+        self.assertIn("fail_if_not_exists: true", self.patched)
+        self.assertIn("socialNoteGone(this, path, body, form, socialError);", self.patched)
+        self.assertIn("rest.onGone = (channelId, messageId) => participation.messageGone(channelId, messageId);", self.patched)
+        self.assertIn("socialReply((replyTo) => rest.createMessage(message.channel_id, prepared.text, replyTo), target.messageId,", self.patched)
+
     def test_drifted_upstream_is_refused(self):
         for anchor in ("await agent.whenIdle();", "const promptSeq = findPromptSeq(events, messageId);", "const response = await fetch(attachment.url);"):
             with self.assertRaises(ValueError):

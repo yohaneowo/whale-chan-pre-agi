@@ -76,6 +76,13 @@ socialStudio.on((event) => participation.drawEvent(event));
 // 画室回覆请求的那句（没画成、画太久…）也是她对那则讯息实际送出的回答，回放时接上。
 socialStudio.on((event) => { if (event.type === "end" && event.noteId && event.text) historyView.sent(event.channelId, event.messageId, event.text); });
 '''
+# 送出时 Discord 说回覆的那则已经不在（严格参照被拒；删除事件还没到或漏了也一样）：跟收到删除事件一样当成撤回：
+# 群聊行为处理不送、不补话，闸道记成撤销，画室那张安静停掉。不写进原文帐本（不是真的收到删除事件）。
+GONE_WIRING = ("rest.onGone = (channelId, messageId) => {\n"
+               "  participation.messageGone(channelId, messageId);\n"
+               "  scopeAuthority?.noteRevoked({ channel_id: channelId, id: messageId });\n"
+               "  noteSocialStudioDeleted({ channel_id: channelId, id: messageId });\n"
+               "};\n")
 # 聊天回放接上的「她当时的回答」只用这个频道实际送出的（部署前审查：会话里会有心跳另开一轮的定时输出、
 # 没送出去的草稿）：桥接每次成功送出文字、补话（等我一下、卡住了、好我去畫）都记到那则讯息名下。
 SENT_REPLY = ("participation.recordReply(message.channel_id, target.text, sent.id, participation.replyPartner(target, message.author.id), target.messageId, index === 0, naturalTicket);\n  await recordSocialCommitment(",
@@ -386,7 +393,7 @@ def port_index(content):
                                 DELIVER_CHECK, SENT_REPLY, SENT_CONTROL, SENT_EDIT_CONTROL):
         content = once(content, anchor, replacement)
     content = once(content, *REVOKED_TURN)
-    content = once(content, SUBSCRIBE_ANCHOR, sp.SUBSCRIBE + STUDIO_WIRING + SUBSCRIBE_ANCHOR)
+    content = once(content, SUBSCRIBE_ANCHOR, sp.SUBSCRIBE + STUDIO_WIRING + GONE_WIRING + SUBSCRIBE_ANCHOR)
     content = once(content, OLD_MESSAGE_FAILED, sp.MESSAGE_FAILED)
     content = once(content, OLD_EDIT_FAILED, sp.EDIT_FAILED)
     # 保留现行 release 自己的补丁（gatewayScopes、history-view、drain、承诺、Krita）。
@@ -396,6 +403,9 @@ def port_index(content):
                  "tools.referenceHint("):
         if kept not in content:
             raise ValueError("移植后少了现行 release 的补丁，停止。")
+    # 回覆一律用严格的讯息参照（Sol 部署前审查）。
+    if "fail_if_not_exists: false" in content:
+        raise ValueError("还有回覆没用严格的讯息参照，停止。")
     for gone in ("await agent.whenIdle();", "await settleSocialTurn(agent);", "findPromptSeq(events, messageId)",
                  "String(error)}`);\n\t\t\t\t\t\tbreak;", "rest.triggerTyping(channelId)", "if (!sent) continue;",
                  "incoming attachment failed: ${String(error)}"):
@@ -453,6 +463,21 @@ def port_krita(content):
     for anchor, replacement in KRITA:
         content = sp.once(content, anchor, replacement)
     return content.rstrip("\n") + "\n" + KRITA_EXPORT
+
+
+# discord_send_message 的 reply_to（groupTools=full 时群聊也用它送附件）：一样用严格的讯息参照。被拒时工具把错误交回给她，
+# DiscordRest 同时交给 rest.onGone 记成撤回（Sol 部署前审查）。
+TOOLS_STRICT = ("message_id: reply_to,\n\t\t\t\t\t\t\t\t\tfail_if_not_exists: false,",
+                "message_id: reply_to,\n\t\t\t\t\t\t\t\t\tfail_if_not_exists: true,")
+
+
+def port_discord_tools(content):
+    if "fail_if_not_exists: false" not in content and "fail_if_not_exists: true" in content:
+        raise ValueError("这份 release 的 discord-tools.mjs 已经移植过。")
+    content = sp.once(content, *TOOLS_STRICT)
+    if "fail_if_not_exists: false" in content:
+        raise ValueError("discord-tools.mjs 还有回覆没用严格的讯息参照，停止。")
+    return content
 
 
 def apply_hunks(content, patch):
@@ -546,6 +571,7 @@ def main(argv=None, replace=os.replace):
     index_path, np_path = plugin / "index.js", plugin / "natural-participation.mjs"
     history_path, scopes_path = plugin / "history-view.mjs", plugin / "gateway-scopes.mjs"
     bridge_path, runtime_path, krita_path = runtime / "bridge.mjs", runtime / "index.mjs", runtime / "krita-tools.mjs"
+    tools_path = runtime / "discord-tools.mjs"
     huanqi_path = args.release / "dsh-huanqi/lib/index.js"
     read = lambda path: path.read_text(encoding="utf-8").replace("\r\n", "\n")
     source = lambda name: (args.repo / name).read_bytes() if args.worktree else git(args.repo, "show", f"{args.rev}:{name}")
@@ -554,6 +580,7 @@ def main(argv=None, replace=os.replace):
     bridge = port_bridge(read(bridge_path), develop_bridge)
     social = port_runtime(read(runtime_path))
     krita = port_krita(read(krita_path))
+    discord_tools = port_discord_tools(read(tools_path))
     history = port_history(read(history_path))
     scopes = port_scopes(read(scopes_path))
     huanqi = port_huanqi(read(huanqi_path))
@@ -569,13 +596,14 @@ def main(argv=None, replace=os.replace):
         (bridge_path, encode(bridge)),
         (runtime_path, encode(social)),
         (krita_path, encode(krita)),
+        (tools_path, encode(discord_tools)),
         (history_path, encode(history)),
         (scopes_path, encode(scopes)),
         (huanqi_path, encode(huanqi)),
         (runtime / "turn-guard.mjs", source("deploy/social/turn-guard.mjs")),
         (runtime / "studio.mjs", source("deploy/social/studio.mjs")),
     ], replace=replace)
-    print("已移植：index.js、natural-participation.mjs、history-view.mjs、gateway-scopes.mjs、bridge.mjs、index.mjs、krita-tools.mjs、dsh-huanqi/lib/index.js，新增 turn-guard.mjs、studio.mjs")
+    print("已移植：index.js、natural-participation.mjs、history-view.mjs、gateway-scopes.mjs、bridge.mjs、index.mjs、krita-tools.mjs、discord-tools.mjs、dsh-huanqi/lib/index.js，新增 turn-guard.mjs、studio.mjs")
 
 
 if __name__ == "__main__":

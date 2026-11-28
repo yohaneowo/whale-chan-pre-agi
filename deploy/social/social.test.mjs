@@ -949,7 +949,7 @@ test('Discord 进阶工具：回覆与投票、自己的讯息、置顶、成员
 	const sent = calls.at(-1)[2];
 	assert.deepEqual(sent.message_reference, {
 		message_id: '800000002',
-		fail_if_not_exists: false,
+		fail_if_not_exists: true,
 	});
 	assert.equal(sent.poll.question.text, '繁:吃什麼');
 	assert.deepEqual(

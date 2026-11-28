@@ -1605,3 +1605,147 @@ test('一轮结束时讯息已被撤销：不管怎么结束都只回「訊息�
 		TURN_REVOKED_NOTICE,
 	]);
 });
+
+// Sol 部署前审查：送答前的核对过了，POST 等待或重试的期间原讯息才被删。
+const REPLY_GONE = new Error(
+	'discord REST POST /channels/1/messages failed: 400 {"message": "Invalid Form Body", "code": 50035, "errors": {"message_reference": {"_errors": [{"code": "REPLIES_UNKNOWN_MESSAGE", "message": "Unknown message"}]}}}',
+);
+
+test('讯息不在了：严格参照被拒（10008 或 REPLIES_UNKNOWN_MESSAGE）才算，其他错误不算', async () => {
+	const { socialMessageGone } = await import('./turn-guard.mjs');
+	assert.equal(socialMessageGone(REPLY_GONE), true);
+	assert.equal(
+		socialMessageGone(
+			new Error(
+				'discord REST POST /channels/1/messages failed: 404 {"message": "Unknown Message", "code": 10008}',
+			),
+		),
+		true,
+	);
+	for (const text of [
+		'discord REST POST /channels/1/messages failed: 500 Unknown Message',
+		'discord REST POST /channels/1/messages failed: 403 {"code": 50013}',
+		'fetch failed',
+	])
+		assert.equal(socialMessageGone(new Error(text)), false, text);
+	assert.equal(socialMessageGone(undefined), false);
+});
+
+test('DiscordRest 送讯被拒：挂了回复且那则不在，才交给 rest.onGone（附件表单也认得）', async () => {
+	const { socialNoteGone } = await import('./turn-guard.mjs');
+	const gone = [];
+	const rest = { onGone: (channel, message) => gone.push([channel, message]) };
+	const path = `/channels/${ids(1)}/messages`;
+	socialNoteGone(
+		rest,
+		path,
+		{ message_reference: { message_id: ids(5) } },
+		undefined,
+		REPLY_GONE,
+	);
+	const form = new globalThis.FormData();
+	form.append(
+		'payload_json',
+		JSON.stringify({ message_reference: { message_id: ids(6) } }),
+	);
+	socialNoteGone(rest, path, {}, form, REPLY_GONE);
+	// 没挂回复、不是送讯、不是「不在了」的错误：都不算。
+	socialNoteGone(rest, path, { content: 'x' }, undefined, REPLY_GONE);
+	socialNoteGone(
+		rest,
+		`/channels/${ids(1)}/typing`,
+		{ message_reference: { message_id: ids(7) } },
+		undefined,
+		REPLY_GONE,
+	);
+	socialNoteGone(
+		rest,
+		path,
+		{ message_reference: { message_id: ids(8) } },
+		undefined,
+		new Error('discord REST POST x failed: 500 oops'),
+	);
+	assert.deepEqual(gone, [
+		[ids(1), ids(5)],
+		[ids(1), ids(6)],
+	]);
+	// onGone 自己出错不影响原本的错误。
+	socialNoteGone(
+		{
+			onGone: () => {
+				throw new Error('x');
+			},
+		},
+		path,
+		{ message_reference: { message_id: ids(9) } },
+		undefined,
+		REPLY_GONE,
+	);
+});
+
+test('桥接的回覆：她选的那则不在了就改回覆叫她的那则；叫她的那则也不在就丢出错误', async () => {
+	const { socialReply } = await import('./turn-guard.mjs');
+	const tried = [];
+	const send = (missing) => async (replyTo) => {
+		tried.push(replyTo);
+		if (missing.includes(replyTo)) throw REPLY_GONE;
+		return { id: 'sent', replyTo };
+	};
+	assert.deepEqual(await socialReply(send([ids(1)]), ids(1), ids(2)), {
+		id: 'sent',
+		replyTo: ids(2),
+	});
+	assert.deepEqual(tried, [ids(1), ids(2)]);
+	await assert.rejects(socialReply(send([ids(2)]), ids(2), ids(2)), REPLY_GONE);
+	await assert.rejects(
+		socialReply(send([ids(1), ids(2)]), ids(1), ids(2)),
+		REPLY_GONE,
+	);
+	// 其他错误不改回覆对象；没挂回复照原样送。
+	tried.length = 0;
+	const broken = new Error('discord REST POST x failed: 500 oops');
+	await assert.rejects(
+		socialReply(
+			async () => {
+				throw broken;
+			},
+			ids(1),
+			ids(2),
+		),
+		broken,
+	);
+	assert.deepEqual(await socialReply(send([]), undefined, ids(2)), {
+		id: 'sent',
+		replyTo: undefined,
+	});
+});
+
+test('画室补的那句送出时才发现请求已被删：记成撤回（deleted），之后再交代同一则也不画', async () => {
+	const { Studio } = await import('./studio.mjs');
+	const logs = [];
+	const ended = [];
+	const studio = new Studio({
+		run: () => Promise.resolve({ delivered: 'none', status: 'settled' }),
+		notify: async () => {
+			throw REPLY_GONE;
+		},
+		timer: manualTimers().timer,
+		log: (line) => logs.push(line),
+	});
+	studio.on((event) => event.type === 'end' && ended.push(event));
+	studio.request(job(1));
+	await flush(30);
+	await studio.idle;
+	assert.ok(
+		logs.some(
+			(line) =>
+				line.startsWith(`畫室 结果 #${ids(101)} status=deleted `) &&
+				line.includes('note=revoked'),
+		),
+		logs.join('\n'),
+	);
+	assert.equal(ended.at(-1).outcome, 'deleted');
+	assert.equal(ended.at(-1).text, undefined);
+	assert.equal(studio.recent.at(-1).outcome, 'deleted');
+	assert.equal(studio.request(job(1)).status, 'deleted');
+});
