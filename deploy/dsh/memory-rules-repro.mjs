@@ -1583,6 +1583,67 @@ await scenario('審查：訊息編輯以後，重試用改過的文字', async (
 	}
 });
 
+await scenario(
+	'審查：重試前訊息被刪了就不整理那則；帳本裡沒有的訊息照樣整理',
+	async (problems) => {
+		const w = world();
+		try {
+			const { row, lines } = notesLines(w);
+			let calls = 0;
+			w.model.consolidator = (options) => {
+				calls++;
+				if (calls === 1)
+					throw Object.assign(new Error('upstream 500'), { status: 500 });
+				return echoNotes(options);
+			};
+			await w.runtime.consolidate(lines, '#general').catch(() => {});
+			await w.runtime.notesQueue;
+			w.runtime.archive.record('delete', {
+				id: row.id,
+				channel_id: GENERAL,
+				guild_id: GUILD,
+			});
+			if (w.runtime.noteBatches) w.runtime.noteBatches.retryMs = 0;
+			const dir = join(w.stateRoot, 'notes', 'batches');
+			for (const name of readdirSync(dir).filter((entry) =>
+				entry.endsWith('.json'),
+			)) {
+				const batch = JSON.parse(readFileSync(join(dir, name), 'utf8'));
+				batch.retryAt = 0;
+				writeFileSync(join(dir, name), JSON.stringify(batch));
+			}
+			w.runtime.retryNotes?.();
+			await w.runtime.notesQueue;
+			await w.runtime.notesQueue;
+			if (journalText(w).includes('麻糬'))
+				problems.push('讯息在重试前被删了，重试还是把它整理进日记');
+			// 帐本里没有的讯息（id 对不上帐本，例如帐本漏记）：不能当成删掉、整批默默不整理。
+			const loose = [
+				{
+					role: 'user',
+					speaker: FRIEND,
+					name: '群友甲',
+					text: '我家的狗叫布丁，今天去打預防針',
+					at: NOW - 600_000,
+					id: '1999999999999999999',
+				},
+			];
+			w.model.consolidator = (options) =>
+				echoNotes(options).replaceAll('麻糬', '布丁');
+			const result = await w.runtime
+				.consolidate(loose, '#general')
+				.catch((error) => ({ error: String(error?.message) }));
+			await w.runtime.notesQueue;
+			if (!journalText(w).includes('布丁'))
+				problems.push(
+					`帐本里没有的讯息整批没整理（${JSON.stringify(result).slice(0, 60)}）`,
+				);
+		} finally {
+			w.cleanup();
+		}
+	},
+);
+
 await scenario('審查：出處已經被刪掉的記憶不再帶出', async (problems) => {
 	const w = world();
 	try {

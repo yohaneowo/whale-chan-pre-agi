@@ -30,7 +30,7 @@ Sol 第 1 轮审查找到的问题，每一项都先在 `memory-rules-repro.mjs`
 - **公开频道只看 @everyone**：改成完整的权限覆写（任何角色或个人的拒绝检视／读历史都算不公开，@everyone 也要能读历史），直接问 Discord（不再经过 10 分钟的资料快取），快取过期就当不公开；载入失败或回的东西不对时把那个服务器的快取作废；论坛贴文、公开讨论串跟着上层频道**现在**的状态。Discord 闸道送来频道、讨论串、角色、服务器的变动事件时立刻作废（runtime 拿到闸道时多看一眼这些事件，不改 Discord 外挂）。冷启动：她要回话之前先等权限载好（最多 3 秒），载不好就当不公开。
 - **背景整理的批次不会自己醒来**：失败的批次到期会自己醒来重试；新程序启动后（预设 60 秒）把上一个程序没做完的批次接着做。
 - **同一批同时交两次，问了两次模型、写了两笔日记**：同一批排队或在跑时不再排第二次；排到了再从批次帐读最新的一份。
-- **讯息改过以后重试还写旧的文字**：每次整理前（不只是重试）都核对原文帐本的删改；内容指纹（`linesBasis`）变了，之前模型整理的结果就不用，照现在的文字重新整理。
+- **讯息改过以后重试还写旧的文字**：每次整理前（不只是重试）都核对原文帐本的删改（删除只认帐本里明确的删除纪录：帐本里没有的讯息照原样整理，不会整批默默略过——真模型沙盒抓到过这个）；内容指纹（`linesBasis`）变了，之前模型整理的结果就不用，照现在的文字重新整理。
 - **出处被删的记忆还会复活**：召回记录的出处一定要在原文帐本里找得到（以前找不到就照记录上的频道放行）；私讯的记忆也一样。出处在记忆写下之后被改过，那条记忆也不带（改过的原话照样可以从帐本想起）。
 - **「有线索才翻」靠关键字**：拿掉所有关键字规则。她要回话之前（`prepare`，会被 await），另外问一次**回忆守门员**模型（`createRecallGate`，跟画室的守门员一样：单轮、不带人设与记忆、群友的话包在带随机码的不可信标签里、只认 JSON、opencode-go 用 low 与会话编号、8 秒期限）。它只看叫她的那则、被回覆的那则、这则之前十分钟的几句（含她自己说的），回 `{recall, explicit, queries}`。说要翻才自动带旧事、工具才开；说不用就连工具都关；没判出来（逾时、出错）就不自动带，工具开着让聊天模型自己决定，一轮最多翻 2 次。没有字的讯息（只有 @、表情、网址）不用问。守门员推出来的搜寻词（「搞定了沒」→「重灌」）在范围内照关键词找原话。日期与点名频道仍由程式解析（那是「范围」，不是「要不要翻」）。真模型实测见下面「回忆守门员实测」。
 - 题库能修的一起修了：出处只认群友说的话（她自己的话不当证据，c8-3）；`chat_search` 一次回她自己的话不超过别人的话（c8-2），每则带作者 id（两个同名的人分得开，c3-2）；私讯里的原话标「私訊（私下）」（c5-3）；整句搜寻照原本的门槛，只有守门员给的搜寻词放宽（c2-2 不再把不相干的闲聊拉进来）。
@@ -69,8 +69,8 @@ Sol 第 1 轮审查找到的问题，每一项都先在 `memory-rules-repro.mjs`
 2. **移植**（仓库根目录，已提交的版本）：`python deploy/dsh/port_memory_rules.py rel`。印出「已移植：index.mjs、memory.mjs、notes.mjs、archive.mjs、chat-tools.mjs、gateway-scopes.mjs、natural-participation.mjs、index.js，新增 recall-rules.mjs、notes-batches.mjs」才算成功；同一份副本跑第二次会被拒绝。
 3. **本机验收**：
    ```sh
-   node deploy/dsh/memory-rules-repro.mjs --release rel           # 移植后：25 项全部通过，代码 0（第 1 轮审查加了 13 项）
-   node deploy/dsh/memory-rules-repro.mjs --release rel-原样副本  # 现行版本：25 项全部失败，代码 1
+   node deploy/dsh/memory-rules-repro.mjs --release rel           # 移植后：26 项全部通过，代码 0（第 1 轮审查加了 14 项）
+   node deploy/dsh/memory-rules-repro.mjs --release rel-原样副本  # 现行版本：26 项全部失败，代码 1
    node deploy/dsh/typing-hang-repro.mjs --release rel             # 上一轮的 52 项仍全部通过
    DSH_RELEASE_COPY=rel-原样副本 python -m unittest discover -s deploy/dsh -p test_port_memory_rules.py
    ```

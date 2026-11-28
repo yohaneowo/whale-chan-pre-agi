@@ -633,7 +633,8 @@ NEW_CONSOLIDATE = r'''	// 背景整理：把一段对话交给模型挑出值得
 	}
 
 	// 每次要整理（第一次与每次重试）之前再看一次原文帐本：删掉的讯息不整理，改过的用改过的字。
-	// 帐本里找不到的讯息（已删除）也当成删掉。回传 { lines, gone }。
+	// 删掉的只认帐本里明确的删除纪录（这批所在的频道）；帐本里没有的讯息照原样留着（对不上帐本时，
+	// 不能把整批当成删掉默默不整理）。回传 { lines, gone }。
 	reviseNoteLines(batch) {
 		const ids = batch.lines
 			.map((line) => String(line.id ?? ''))
@@ -646,7 +647,17 @@ NEW_CONSOLIDATE = r'''	// 背景整理：把一段对话交给模型挑出值得
 				.filter((row) => wanted.has(row.id))
 				.map((row) => [row.id, row]),
 		);
-		const gone = new Set(ids.filter((id) => !current.has(id)));
+		const missing = ids.filter((id) => !current.has(id));
+		const gone =
+			missing.length && batch.where?.channelId
+				? this.archive.deletedMessageIds(
+						missing.map((id) => ({
+							id,
+							channelId: batch.where.channelId,
+							guildId: batch.where.guildId ?? null,
+						})),
+					)
+				: new Set();
 		const lines = batch.lines.flatMap((line) => {
 			const id = String(line.id ?? '');
 			if (gone.has(id)) return [];
