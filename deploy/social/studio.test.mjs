@@ -6,6 +6,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+const { AbortController } = globalThis;
+
 const flush = async (rounds = 10) => {
 	for (let index = 0; index < rounds; index++) await Promise.resolve();
 };
@@ -1033,7 +1035,7 @@ test('draw_request：只有这则明确要她画才交给画室；不是画图�
 		'幫我看看這張圖',
 	])
 		assert.equal(drawIntent(text), false, text);
-	assert.equal(drawIntent('眼睛改大一點', { sourceJob: 'work-x' }), true);
+	assert.equal(drawIntent('眼睛改大一點', { editing: true }), true);
 	assert.equal(drawIntent('眼睛改大一點'), false, '没有要改的作品就不算');
 	assert.equal(drawIntent('照這張', { attachments: 1 }), true);
 	const requests = [];
@@ -1172,5 +1174,152 @@ test('同一个频道的会话延续好几天：离上一则群友讯息很久�
 		),
 		'',
 		'一小时内的不提',
+	);
+});
+
+// 部署前审查（2026-11-28）：「請問你是怎麼畫畫的」「先不要畫」、带附件的「描述一下這張圖」都被当成要画，
+// 「幫我做一張頭像」反而被挡。正反例在 draw-intent-cases.mjs（54 句，繁简混写、带附件、改作品）。
+test('drawIntent：只有这一则肯定在请她画／做图才算；否定、询问、描述图片都不算', async () => {
+	const { drawIntent } = await import('./studio.mjs');
+	const { DRAW_INTENT_CASES, judgeCase } =
+		await import('./draw-intent-cases.mjs');
+	assert.ok(DRAW_INTENT_CASES.length >= 30);
+	const wrong = DRAW_INTENT_CASES.filter(
+		(row) => judgeCase(drawIntent, row) !== row.want,
+	).map((row) => `${row.want ? '该画' : '不该画'}：${row.text}`);
+	assert.deepEqual(wrong, []);
+});
+
+test('draw_request：要改的作品（source_job）必须是这个频道画过的；别的频道的、不知道的都不收', async () => {
+	const { drawRequestTool, Studio } = await import('./studio.mjs');
+	const work = (n) => 'work-' + String(n).padStart(24, '0');
+	const requests = [];
+	const studio = new Studio({
+		run: () => new Promise(() => {}),
+		notify: async () => {},
+		timer: manualTimers().timer,
+	});
+	const original = studio.request.bind(studio);
+	studio.request = (input) => (requests.push(input), original(input));
+	studio.noteWork(work(1), ids(1));
+	studio.noteWork(work(2), ids(9));
+	const source = {
+		messageId: ids(101),
+		channelId: ids(1),
+		guildId: ids(2),
+		authorId: ids(201),
+		authorName: '小羅',
+		text: '<@1> 眼睛改大一點',
+	};
+	const agent = { id: 'chat', session: { id: 'session-chat' } };
+	const runtime = {
+		studio,
+		studios: new Map(),
+		turns: new Map([['chat', source]]),
+		sourceForTurn: () => source,
+	};
+	const tool = drawRequestTool(runtime);
+	const call = (source_job) =>
+		tool.execute({ action: 'start', brief: '眼睛改大', source_job }, { agent });
+	const elsewhere = await call(work(2));
+	assert.equal(elsewhere.ok, false, '别的频道的作品');
+	assert.match(elsewhere.message, /不是這個頻道/);
+	assert.equal((await call(work(3))).ok, false, '不知道的作品');
+	assert.equal(requests.length, 0);
+	assert.equal((await call(work(1))).ok, true, '这个频道画的就收');
+	assert.equal(requests.length, 1);
+	assert.equal(requests[0].sourceJob, work(1));
+});
+
+test('画室记下这个频道画了哪些作品（Krita 这则请求实际碰过的作品编号）', async () => {
+	const { Studio, runStudioJob } = await import('./studio.mjs');
+	const work = 'work-' + 'a'.repeat(24);
+	const agent = { session: { snapshotEvents: () => [] } };
+	const result = await runStudioJob(
+		{
+			acquire: async () => agent,
+			bind() {},
+			followup: (_agent, text) => ({ id: 'p', text }),
+			wait: async () => ({ status: 'settled' }),
+			deliveries: () => ({ final: 1, previews: 0, works: [work] }),
+		},
+		job(1, { attachmentIds: [] }),
+		new AbortController().signal,
+	);
+	assert.deepEqual(result.works, [work]);
+	const studio = new Studio({
+		run: async () => result,
+		notify: async () => {},
+		timer: manualTimers().timer,
+	});
+	studio.request(job(1));
+	await flush(30);
+	await studio.idle;
+	assert.equal(studio.workChannel(work), ids(1));
+	assert.equal(studio.workChannel('work-' + 'b'.repeat(24)), undefined);
+});
+
+test('画室没画成：先告诉聊天那边这张结束了（再送补的那句）；排队中被删的也通知', async () => {
+	const { Studio } = await import('./studio.mjs');
+	const order = [];
+	const studio = new Studio({
+		run: async () => ({ delivered: 'none', status: 'settled', rounds: 1 }),
+		notify: async () => (order.push('note'), { id: ids(900) }),
+		timer: manualTimers().timer,
+	});
+	studio.on((event) => order.push(event.type));
+	studio.request(job(1));
+	await flush(30);
+	await studio.idle;
+	assert.deepEqual(order, ['accepted', 'start', 'finishing', 'note', 'end']);
+	// 排队中的那张被删：也要有 end，聊天那边才不会再替它说「等我一下」。
+	const events = [];
+	const busy = new Studio({
+		run: () => new Promise(() => {}),
+		notify: async () => {},
+		timer: manualTimers().timer,
+	});
+	busy.on((event) => events.push(event));
+	busy.request(job(1));
+	busy.request(job(2));
+	busy.requestDeleted(ids(1), ids(102));
+	assert.ok(
+		events.some(
+			(event) =>
+				event.type === 'end' &&
+				event.messageId === ids(102) &&
+				event.outcome === 'deleted',
+		),
+	);
+});
+
+// 部署前审查：核对成功的同时期限到了或被 /stop，不能还是当成可以送。
+test('送答前的核对：核对过了但这时已经被中止或讯息被撤销，就不送', async () => {
+	const { socialCanDeliver } = await import('./turn-guard.mjs');
+	const controller = new AbortController();
+	assert.equal(
+		await socialCanDeliver(async () => (controller.abort(), true), {
+			signal: controller.signal,
+			pause: async () => {},
+		}),
+		false,
+		'核对期间被中止',
+	);
+	assert.equal(
+		await socialCanDeliver(async () => true, {
+			signal: controller.signal,
+			pause: async () => {},
+		}),
+		true,
+		'进来之前就到期限（flush 卡住）：答案已经有了，核对过就照送',
+	);
+	let revoked = false;
+	assert.equal(
+		await socialCanDeliver(async () => ((revoked = true), true), {
+			revoked: () => revoked,
+			pause: async () => {},
+		}),
+		false,
+		'核对期间讯息被撤销',
 	);
 });

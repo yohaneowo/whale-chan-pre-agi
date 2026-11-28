@@ -20,6 +20,9 @@ const { AbortController } = globalThis;
 export const DEFAULT_TURN_DEADLINE_MS = 280_000;
 export const TURN_STEPS_TEXT = '這一輪我做了太多步，先停一下；要繼續再叫我。';
 export const TURN_DEADLINE_NOTICE = '⚠️ 回合失败: ' + TURN_STEPS_TEXT;
+// 讯息已经被删或改掉（闸道记成撤销）：桥接回这句，群聊行为处理认得它，不发出去、也不补「卡住了」
+// （回覆对象不在了，补的那句会掉成一般群讯）。开头跟「⏹️ 回合被取消」一样，旧的处理也不会发出去。
+export const TURN_REVOKED_NOTICE = '⏹️ 回合被取消（訊息已撤回）';
 // 期限到了以后，给桥接自己收尾（取消回合、写 turn/end、回传提示）的时间；再久就不等了。
 const GRACE_MS = 15_000;
 // 取消后等回合写入 turn/end 的时间。
@@ -573,7 +576,9 @@ async function settleRescues(agent, pause) {
 // 送答前的核对（闸道的 historyCanDeliver：要向 Discord 重新取原讯息、频道、成员与身分组，3 秒期限）
 // 偶尔会因为 Discord 慢或限流而没过；没过就整轮答覆丢掉、补一句「我剛剛卡住了」
 // （2026-11-28 第 4 则：回合正常答完，3 秒后核对没过）。所以没过时隔一下再核对，最多 attempts 次；
-// 讯息已经被删或改掉（revoked）、期限到或 /stop 就不再试。
+// 讯息已经被删或改掉（revoked）、期限到或 /stop 就不再试。核对过了，但核对的这段时间里被中止或撤销，
+// 也不算过（部署前审查：核对成功时会忽略刚刚的中止讯号）。进来之前就已经到期限的（例如 flush 卡到期限）
+// 不在此列：答案已经有了，核对过就照送（「flush 卡住」情境）。
 export async function socialCanDeliver(
 	check,
 	{
@@ -585,6 +590,7 @@ export async function socialCanDeliver(
 		onMiss = () => {},
 	} = {},
 ) {
+	const abortedBefore = Boolean(signal?.aborted);
 	for (let attempt = 1; ; attempt++) {
 		let ok;
 		try {
@@ -592,7 +598,7 @@ export async function socialCanDeliver(
 		} catch {
 			ok = false;
 		}
-		if (ok) return true;
+		if (ok) return (abortedBefore || !signal?.aborted) && !revoked();
 		onMiss(attempt);
 		if (attempt >= attempts || signal?.aborted || revoked()) return false;
 		await pause(gapMs);

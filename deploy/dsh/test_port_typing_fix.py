@@ -26,7 +26,7 @@ def fake_release():
     anchors += [sp.FOLLOWUP[0], port.RELEASE_WAIT, sp.NOTICE_TICKET[0], port.RELEASE_SEND, port.COMMITMENT_REPLY[0],
                 sp.TRACKED_REST[0], port.PARTICIPATION_LOG[0], port.LEASE_DECLARE[0], LEASE_BLOCK,
                 port.LEASE_END[0], port.HISTORY_GUIDE[0], port.SUBSCRIBE_ANCHOR, port.OLD_MESSAGE_FAILED, port.OLD_EDIT_FAILED,
-                port.STUDIO_DELETE[0], port.DELIVER_CHECK[0]]
+                port.STUDIO_DELETE[0], port.DELIVER_CHECK[0], port.SENT_CONTROL[0], port.SENT_EDIT_CONTROL[0]]
     kept = [k for k in KEPT if k not in ("this.gatewayScopes.turn(agent,channelId,messageId)",
                                          "recordSocialCommitment(message, sent,", "tools.referenceHint(")]
     return "\n/*--*/\n".join(anchors + kept) + "\n"
@@ -69,7 +69,20 @@ class PortIndexTests(unittest.TestCase):
         self.assertIn("studioModule.DRAW_GUIDE+studioModule.studioRecentNote(", ported)
         # 送答前的核对没过就隔一下再核对（2026-11-28 第 4 则）。
         self.assertIn("!await socialCanDeliver(() => this.gatewayScopes.historyCanDeliver(agent,messageId), {", ported)
-        self.assertIn("socialCanDeliver }", port.STUDIO_IMPORT)
+        self.assertIn("socialCanDeliver, TURN_REVOKED_NOTICE }", port.STUDIO_IMPORT)
+
+    def test_review_revoked_messages_get_no_fallback_and_sent_replies_are_booked(self):
+        ported = port.port_index(fake_release())
+        # 讯息被撤销：送答前的核对、闸道租约都回「訊息已撤回」（群聊行为处理不发、不补「卡住了」）；期限到回期限提示。
+        self.assertIn("return {chunks:this.gatewayScopes.revoked?.has(messageId) ? [TURN_REVOKED_NOTICE]\n"
+                      "\t\t\t\t\t: socialBudget?.signal.aborted ? [TURN_DEADLINE_NOTICE] : [],files:[]};", ported)
+        self.assertIn("return {chunks:this.gatewayScopes.revoked?.has(messageId) ? [TURN_REVOKED_NOTICE] : [],files:[]};\n"
+                      "\t\tsocialLease =", ported)
+        # 她实际送出的话（回答、补的那句、画室的那句）记到那则讯息名下，回放只接这些。
+        self.assertIn("naturalTicket);\n  historyView.sent(message.channel_id, message.id, target.text);", ported)
+        self.assertEqual(ported.count("participation.recordReply(message.channel_id, text, sent.id);\n"
+                                      "    historyView.sent(message.channel_id, message.id, text);"), 2)
+        self.assertIn("historyView.sent(event.channelId, event.messageId, event.text)", ported)
 
     def test_round_three_deleted_request_stops_the_studio(self):
         ported = port.port_index(fake_release())
@@ -91,10 +104,16 @@ class PortIndexTests(unittest.TestCase):
 class HistoryViewTests(unittest.TestCase):
     def test_replay_is_dated_bounded_and_keeps_her_replies(self):
         fake = "".join(anchor for anchor, _ in (port.HISTORY_HELPERS, port.HISTORY_AGE, port.HISTORY_TEXT,
-                                                 port.HISTORY_REPLIES, port.HISTORY_PUSH))
+                                                 port.HISTORY_REPLIES, port.HISTORY_PUSH, port.HISTORY_SENT))
         ported = port.port_history(fake)
         self.assertIn("const REPLAY_MAX_AGE_MS=6*3600_000;", ported)
-        self.assertIn("filter(([id,event])=>id===liveId || !(Number(event.time)<since))", ported)
+        # 回放范围照 Discord 讯息的时间（讯息编号），不照会话时间（部署前审查）。
+        self.assertIn("filter(([id])=>!liveId || id===liveId || snowflakeTime(id)>=since)", ported)
+        self.assertNotIn("event.time", ported)
+        # 接上的回答只用这个频道实际送出的（historyView.sent 记的），不从会话里抓。
+        self.assertIn("const text=sentText(target.channelId,row.id);", ported)
+        self.assertIn("	sent(channel,event,text) {", ported)
+        self.assertNotIn("asked=bySeq.has(event.seq)", ported)
         self.assertIn("text:replayText(current,native,id===liveId)", ported)
         self.assertIn("if (event.seq<start && replies.has(event.seq)) result.push(replies.get(event.seq));", ported)
         with self.assertRaises(ValueError):
@@ -150,6 +169,10 @@ class RuntimeAndKritaTests(unittest.TestCase):
         # 请求那则被删了：Discord 拒绝，不掉成一般群讯。
         self.assertIn("fail_if_not_exists: true,", ported)
         self.assertNotIn("fail_if_not_exists: false", ported)
+        # 这则请求碰过的作品编号：画室记成这个频道画的（续改要核对 source_job）。
+        self.assertIn("works: new Set(),", ported)
+        self.assertIn("turn.works.add(work);", ported)
+        self.assertIn("works: [...(turn.works ?? [])]", ported)
         with self.assertRaises(ValueError):
             port.port_krita(ported)
 

@@ -18,6 +18,12 @@
   - 送答前的核对（闸道 `historyCanDeliver`，要向 Discord 重新取原讯息、频道、成员与身分组，3 秒期限）没过就隔 1.5 秒再核对，最多 3 次（`socialCanDeliver`）；讯息已被删或改掉就不再试。日志 `送答核对没过 #ID：第 N 次`。
   - 聊天回放（`history-view.mjs`）：只回放 6 小时以内的讯息；每则标上时间（台北）与说话的人（都取自 Discord 核对过的原讯息），这次的那则标明「這則在叫你／沒人叫你…」，回放的旧讯息后面接上她当时的回答（只取文字）。
   - 「等我一下，我弄一下」不再按时间先说；只有交给画室以后、20 秒还没说话才说。群聊纪录不是今天的讯息连日期一起写；会话里离上一则群友讯息超过 3 小时，就附一句「之前的话题都过去了」（`socialRecencyNote`，没有闸道回放的设定才看得到）。
+- **部署前审查（2026-11-28）的修正**：
+  - 要不要画（`drawIntent`）改成逐个子句看：否定（不要畫、先別畫、算了）、询问（怎麼畫、用什麼畫、會畫畫嗎、要多久）、学画的子句不算；其余子句要有「请她画／做图」的说法才算（「幫我畫」「畫一隻」「幫我做一張頭像」「來一張桌布」「再來一張」「P一張圖」「draw」「make me an avatar」）。名词里的「畫」「圖」（畫風、畫室、動畫、截圖、照片）不算动作。照附件画要这则真的带了图而且说了「照這張畫」「參考這張」「變成動漫風」这类话，「描述一下這張圖」「這張圖是什麼意思」不算。正反例 57 句在 `deploy/social/draw-intent-cases.mjs`（`node deploy/social/draw-intent-cases.mjs` 印出结果表）。
+  - 改作品（`source_job`）必须是这个频道画室画过的：Krita 这则请求实际碰过的作品编号（闸道收下的才算）由画室记成这个频道的（`Studio.noteWork`／`workChannel`）；别的频道的、不知道的（含重启以前画的）都不收。
+  - 聊天回放接上的「她当时的回答」只用这个频道实际送出的文字：桥接每次成功送出（她的回答、补的那句、画室的那句）都记到那则讯息名下（`historyView.sent`），不再从会话里抓（会话里有心跳另开一轮的定时输出、没送出去的草稿）。只记这次启动以后送出的。回放的 6 小时范围照 Discord 讯息编号里的时间，不照进会话的时间。
+  - 送答前的核对过了，但核对的这段时间里被中止（期限、/stop）或讯息被撤销，就不送；进来之前就到期限的（例如 flush 卡到期限）照旧核对过就送。讯息被撤销时，送答核对与闸道租约都回「⏹️ 回合被取消（訊息已撤回）」（`TURN_REVOKED_NOTICE`），群聊行为处理不发出去、也不补「卡住了」（`status=revoked`）；核对没过又到期限时回期限的提示。
+  - 画室这张结束了（画好、没画成、被删、被取消）就先发 `finishing` 事件再送补的那句；排队中被删的也发 `end`。群聊行为处理收到后不再替它说「等我一下」或「好，我去畫」（`status=draw-done`）。
 - **其他**：「正在输入」被限流时不在 REST 里重送，熄灯后送到一半的也取消；附件下载失败的日志不写错误内文（可能带档名或网址）；只 @ 的判断不把「附档案、Discord 贴图、embed、挂了回复（引用抓不到也一样）、她一分钟内刚说过话」当成只 @。
 
 ## 会动到的档案
@@ -49,8 +55,8 @@
 3. **本机验收**：
 
    ```sh
-   node deploy/dsh/typing-hang-repro.mjs --release rel          # 移植后：38 项全部通过，代码 0
-   node deploy/dsh/typing-hang-repro.mjs --release rel-原样副本  # 现行版本：37 项失败（宿主规则那项通过），代码 1
+   node deploy/dsh/typing-hang-repro.mjs --release rel          # 移植后：42 项全部通过，代码 0
+   node deploy/dsh/typing-hang-repro.mjs --release rel-原样副本  # 现行版本：41 项失败（宿主规则那项通过），代码 1
    DSH_RELEASE_COPY=rel-原样副本 python -m unittest discover -s deploy/dsh -p test_port_typing_fix.py
    ```
 
@@ -58,9 +64,9 @@
 
    另外 5 项直接用副本真的 social runtime（`index.mjs`）跑。第一项照正式宿主（dsh-tools、dsh-system-prompt）的规则（`deploy/social/host-contract.mjs`，照宿主的错误讯息自己写的，不含宿主原始码）：release 里全部工具都要能登记（要有 `output { schema, render }`、output schema 只能用 type/oneOf/properties/required/additionalProperties/items/enum/const 加注解、`timeoutMs` 是正数），挂上聊天与画室会话时 `tools.restrict` 只能点名已登记的全域工具、`presentAs` 每个作用域一次、系统提示段落 order 是有限数且同名不重复、没有没登记的 `{{变数}}`，`draw_request` 的回传值要合 output schema。2026-11-28 第一次部署时宿主就是因为 `draw_request` 少了 output 拒绝整个 social runtime（只连得上闸道，不会回话），假宿主没抓到；其余检查也都改用这套规则。其余 4 项：群聊画室不带私讯记忆与拥有者人物卡（合成一段私讯记忆和人物卡上的私下条目，最坏的模型把看到的全部贴出来，上下文与输出都不能有那段字）；请求被删时真的 `krita_batch` 交付与画室补的那句（真的 `DiscordRest`，假 fetch 照 Discord 的 `fail_if_not_exists` 规则）都不掉成一般群讯；画室会话在 `groupTools=chat` 与 `full` 都能用 `krita_batch`、聊天会话都不能；`sendOrigin` 与 apply 里每个工具都包了送讯来源。
 
-4. **真宿主、真模型跑一次画室与聊天（部署前，在 VM 上）**：`studio-sandbox.sh <9 个新档的目录> <沙盒目录> [秒数] [情境]`，`OPENCODE_GO_API_KEY` 只放环境变数（从 Doppler 的 dev 取，不写进档案或指令列），沙盒放进记忆体上限 1G 的 scope、可用记忆体不到 1.6G 就不跑。nobody 身分（多 kritaio 群组）、临时目录、另一个连接埠、没有 Discord token；正式的 Krita 闸道只收正式 dsh.service 的 node，所以另开一个临时闸道（`studio-sandbox-gate.py`：同一个 Krita，作品登记用沙盒自己的，跑完删掉沙盒画的作品目录）。换气额度从 0 开始（跟 2026-11-28 正式环境一样）。情境（`studio-sandbox-probe.mjs`）：`draw` 画一张小鯨魚并交出图；`draw-huanqi` 画到一半塞进换气熔断的提示（inject＋steer）再用 `discord-turn-answered` 中止一次，仍要画完；`after-fail` 让一张画不完（期限 15 秒）以后聊「你最喜歡什麼顏色」「你畫畫的時候還能聊天嗎」，不能交给画室；`double` 连 @ 两则都要有回答。图存在沙盒的 `out/`。注意：沙盒没有闸道（gatewayScopes），聊天的回放（history-view）不会套用，那部分只在重现脚本里用副本真的 history-view 检查。
+4. **真宿主、真模型跑一次画室与聊天（部署前，在 VM 上）**：`studio-sandbox.sh <9 个新档的目录> <沙盒目录> [秒数] [情境]`，`OPENCODE_GO_API_KEY` 只放环境变数（从 Doppler 的 dev 取，不写进档案或指令列），沙盒放进记忆体上限 1G 的 scope、可用记忆体不到 1.6G 就不跑。nobody 身分（多 kritaio 群组）、临时目录、另一个连接埠、没有 Discord token；正式的 Krita 闸道只收正式 dsh.service 的 node，所以另开一个临时闸道（`studio-sandbox-gate.py`：同一个 Krita，作品登记用沙盒自己的，跑完删掉沙盒画的作品目录）。换气额度从 0 开始（跟 2026-11-28 正式环境一样）。情境（`studio-sandbox-probe.mjs`）：`draw` 画一张小鯨魚并交出图；`draw-huanqi` 画到一半塞进换气熔断的提示（inject＋steer）再用 `discord-turn-answered` 中止一次，仍要画完；`after-fail` 让一张画不完（期限 15 秒）以后聊「你最喜歡什麼顏色」「你畫畫的時候還能聊天嗎」，不能交给画室；`double` 连 @ 两则都要有回答；`intent`（部署前审查）说「先不要畫」「請問你是怎麼畫畫的」不能交给画室，「幫我做一張頭像」要交给画室并画完（她先问要什么样的就再说清楚一次）。图存在沙盒的 `out/`。注意：沙盒没有闸道（gatewayScopes），聊天的回放（history-view）不会套用，那部分只在重现脚本里用副本真的 history-view 检查。
 5. **真宿主启动（部署前）**：在 VM 上用 nobody 身分、临时目录、另一个连接埠、没有 Discord token 与模型金钥，把新 release 的副本走真的 `trusted-entry.mjs` 启动一次（设定里所有正式路径与 socket 都换成临时目录），日志不能有 `entry did not activate` 或任何注册错误；再用一个只在沙盒载入的探针外挂，以真宿主的 `agents.create` 建聊天会话、送一则讯息（要走到组系统提示，只因没有金钥而停），并走真的 `connectStudio`／`studio.request` 让宿主建出画室会话。
-6. **部署（要主人同意才做）**：在 VM 上把现行 release 目录复制成新的 release（名字带日期，例如 `…-studio-1128`），用第 2 步的 7 个档案替换／新增到新 release 里对应的位置，`node --check` 这 7 个档案，再把 `current` 指到新 release、重启 `dsh.service`。回滚就是把 `current` 指回原本的 release 再重启。
+6. **部署（要主人同意才做）**：在 VM 上把现行 release 目录复制成新的 release（名字带日期，例如 `…-studio-1128`），用第 2 步的 9 个档案替换／新增到新 release 里对应的位置，`node --check` 这 9 个档案，再把 `current` 指到新 release、重启 `dsh.service`。原本的 release 目录不动、只换 `current` 指标，回滚就是把 `current` 指回原本的 release 再重启。
 7. **设定（可不设）**：`DISCORD_TURN_DEADLINE_MS`（聊天回合，预设 280000，30 秒～30 分钟）；`DISCORD_DRAW_DEADLINE_MS`（一张图，预设 600000，1～60 分钟）；`SLOW_TURN_NOTICE_SECONDS`（预设 20）。
 8. **真频道验收（要主人同意才做）**：在测试频道（之后改用主人指定的另一个测试频道，不再用原本的群聊频道）请她画一张，画的期间另一个人 @ 她聊天，再请第三个人也画一张。`journalctl -u dsh.service | grep -E '直接呼叫|畫室'`：每一则 @ 都要有「收到 #ID」与「结果 #ID status=…」；画图那则 status 是 `answered` 或 `draw-ack-sent`，画室有「畫室 收到／开始／结果 #ID status=delivered」；第二张是 `status=queued`。「正在输入」只在聊天回合那几秒亮。日志里不能出现任何讯息内文。另外请人画到一半把请求那则删掉：群里不能出现那张图或「卡住了」，日志有 `畫室 结果 #ID status=deleted`。正式环境是 `groupTools: full`（2026-11-28 唯读确认），要看画室真的叫得动 `krita_batch`。
 

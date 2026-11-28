@@ -386,6 +386,69 @@ export function apply(ctx) {
 				const rb = await answer(chat, b);
 				record({ code: 'double', a: ra, b: rb, tools: digest(chat).tools });
 			}
+			// 6. 要不要画（部署前审查）：「先不要畫」「請問你是怎麼畫畫的」不交给画室；「幫我做一張頭像」交给画室并画完。
+			// 工具结果只记 draw_request 的（看程式有没有挡、挡的理由）。
+			if (want('intent')) {
+				const chat = await newChat();
+				const accepted = () =>
+					studio.recent.length +
+					(studio.running ? 1 : 0) +
+					studio.waiting.length;
+				const drawResults = (from) =>
+					chat.session
+						.snapshotEvents()
+						.filter(
+							(event) =>
+								(event.seq ?? 0) >= from &&
+								event.type === 'tool/result' &&
+								JSON.stringify(event.data ?? {}).includes('畫'),
+						)
+						.map((event) => JSON.stringify(event.data ?? {}).slice(0, 160));
+				for (const [code, content] of [
+					['intent-dont', '先不要畫'],
+					['intent-how', '請問你是怎麼畫畫的'],
+				]) {
+					const before = accepted();
+					const from = lastSeq(chat);
+					const turn = await answer(chat, send(chat, content));
+					record({
+						code,
+						secs: turn.secs,
+						status: turn.status,
+						text: turn.text,
+						tools: digest(chat, from).tools,
+						drawResults: drawResults(from),
+						studioAccepted: accepted() - before,
+					});
+				}
+				for (const content of ['幫我做一張頭像', '小鯨魚的頭像，幫我做一張']) {
+					const before = accepted();
+					const from = lastSeq(chat);
+					const sent = send(chat, content);
+					const turn = await answer(chat, sent);
+					const handed = accepted() - before;
+					const end = handed
+						? await studioDone(sent.messageId, 12 * 60_000)
+						: undefined;
+					record({
+						code: 'intent-avatar',
+						content,
+						secs: turn.secs,
+						text: turn.text,
+						tools: digest(chat, from).tools,
+						drawResults: drawResults(from),
+						studioAccepted: handed,
+						outcome: end?.outcome ?? 'not-handed',
+						pngs: posted
+							.filter(
+								(row) => row.replyTo === sent.messageId && row.files.length,
+							)
+							.map((row) => row.files.join(',')),
+					});
+					// 她先问要什么样的头像（没交给画室、程式也没挡）时，才再说清楚一次。
+					if (handed) break;
+				}
+			}
 			// 5. 背景整理记忆（2026-11-25 改走 opencode-go 以后每批都失败）：照 consolidate 的参数直接问一次模型，
 			// 看它回了什么（思考多长、正文多长、怎么结束），再跑一次真的 consolidate。
 			if (want('consolidate')) {

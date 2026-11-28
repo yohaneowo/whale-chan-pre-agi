@@ -73,6 +73,8 @@ export class Studio {
 		// 已经被删掉的请求讯息（「频道:讯息」）：之后才交代的也不画。
 		this.deleted = new Set();
 		this.recent = [];
+		// 画室画过的作品 → 哪个频道（续改时核对 source_job 是这个频道的作品）。只记这次启动以后画的。
+		this.works = new Map();
 		this.running = undefined;
 		this.waiting = [];
 		this.listeners = new Set();
@@ -203,6 +205,13 @@ export class Studio {
 			if (!match(job)) return true;
 			count++;
 			this.log(`畫室 结果 #${job.messageId} status=${reason} secs=0`);
+			// 排队中的也要通知聊天那边这张结束了（不然它还会替这张说「等我一下」）。
+			this.emit({
+				type: 'end',
+				channelId: job.channelId,
+				messageId: job.messageId,
+				outcome: reason,
+			});
 			return false;
 		});
 		if (this.running && match(this.running) && !this.running.cancelled) {
@@ -210,6 +219,19 @@ export class Studio {
 			count++;
 		}
 		return count;
+	}
+
+	// 这件作品是这个画室在哪个频道画的（不知道就是 undefined）。
+	workChannel(work) {
+		return this.works.get(String(work));
+	}
+
+	noteWork(work, channelId) {
+		if (!/^work-[0-9a-f]{24}$/.test(String(work))) return;
+		this.works.delete(work);
+		this.works.set(work, String(channelId));
+		if (this.works.size > 500)
+			this.works.delete(this.works.keys().next().value);
 	}
 
 	stop(job, reason) {
@@ -329,6 +351,14 @@ export class Studio {
 			outcome = timedOut ? 'timeout' : 'failed';
 			text = timedOut ? STUDIO_TEXT.timeout : STUDIO_TEXT.failed;
 		}
+		for (const work of result?.works ?? []) this.noteWork(work, job.channelId);
+		// 先告诉聊天那边这张结束了，再送补的那句：送的期间聊天那边不能再替它说「等我一下」「好，我去畫」。
+		this.emit({
+			type: 'finishing',
+			channelId: job.channelId,
+			messageId: job.messageId,
+			outcome,
+		});
 		let note = 'none';
 		if (text) note = await this.sendNote(job, text);
 		this.log(
@@ -421,7 +451,9 @@ export async function runStudioJob(
 		const status = outcome?.status ?? 'none';
 		const sent = deliveries(job.messageId) ?? {};
 		const previews = sent.previews ?? 0;
-		if (sent.final) return { delivered: 'final', status, rounds: round };
+		// 这则请求 Krita 实际碰过的作品（记成这个频道画的，之后续改要核对）。
+		const works = [...(sent.works ?? [])];
+		if (sent.final) return { delivered: 'final', status, rounds: round, works };
 		// 画室最后一句（只看这次送进去的那则之后）：「不畫」就是它判断不该画。
 		const events =
 			agent.session?.snapshotEvents?.() ?? agent.session?.events ?? [];
@@ -432,38 +464,117 @@ export async function runStudioJob(
 				status,
 				declined: true,
 				rounds: round,
+				works,
 			};
 		if (signal.aborted || status === 'lost' || round >= maxRounds)
 			return {
 				delivered: previews ? 'preview' : 'none',
 				status,
 				rounds: round,
+				works,
 			};
 	}
 }
 
 // 聊天会话用的说明：画图交给画室，自己只回一句。
 export const DRAW_GUIDE =
-	'只有這次叫你的那則訊息明確請你畫圖、改圖或照附件畫時，才呼叫 draw_request（action=start），brief 寫清楚要畫什麼、構圖、風格、顏色，以及對方原話裡的重點；要改之前的作品就填 source_job，要照對方的圖就填 attachment_ids。之前的畫圖請求不管畫成沒有，畫室都已經自己回覆過對方，不要因為上一張沒畫成就再交一次。交出去之後背景會畫，畫好會自動回覆對方那則訊息；你這輪只照工具結果回一句短話，不要說已經畫好，也不要自己用 krita_batch。對方說不要畫了就用 action=cancel；問畫到哪就用 action=status。';
+	'只有這次叫你的那則訊息明確請你畫圖、改圖或照附件畫時，才呼叫 draw_request（action=start），brief 寫清楚要畫什麼、構圖、風格、顏色，以及對方原話裡的重點；要改這個頻道畫室畫過的作品就填 source_job（別的頻道的、查不到的不能填），要照對方的圖就填 attachment_ids。之前的畫圖請求不管畫成沒有，畫室都已經自己回覆過對方，不要因為上一張沒畫成就再交一次。交出去之後背景會畫，畫好會自動回覆對方那則訊息；你這輪只照工具結果回一句短話，不要說已經畫好，也不要自己用 krita_batch。對方說不要畫了就用 action=cancel；問畫到哪就用 action=status。';
 
-// 这一则是不是明确要她画（或改她画过的图）。聊天模型在画室失败以后会把后面的 @ 都当成画图
-// （2026-11-28：「你畫畫的時候還能聊天嗎」「你最喜歡什麼顏色」都被交给画室），所以不能只靠提示词。
-// 「你畫畫的時候…」「畫得不錯」这类提到画、但没有要她画的，不算。
-const DRAW_ASK =
-	/(?:幫|帮|給|给|替|請|请|來|来|再|也|要|想|可以|能不能|能|快|去|麻煩|麻烦|拜託|拜托|求)[^。！？!?，,]{0,8}[畫画繪绘]|[畫画繪绘](?:一|兩|两|三|幾|几|個|个|張|张|隻|只|幅|下|出|成|點|点|些|我|你|他|她|它|這|这|那|條|条|頭|头|朵|棵|座|份|套)|^[畫画繪绘]|描いて|再(?:來|来)?一(?:張|张|幅)/u;
-const DRAW_ASK_EN = /\b(?:draw|paint|sketch)\b/iu;
+// 这一则是不是肯定在请她画／做图（或改这个频道画过的作品、照附件画）。聊天模型在画室失败以后会把后面的 @
+// 都当成画图（2026-11-28：「你畫畫的時候還能聊天嗎」「你最喜歡什麼顏色」都被交给画室），所以不能只靠提示词。
+// 部署前审查：「請問你是怎麼畫畫的」「先不要畫」、带附件的「描述一下這張圖」不能算，「幫我做一張頭像」要算。
+// 逐个子句看：否定（不要畫、先別畫）、询问（怎麼畫、用什麼畫、會畫畫嗎）、学画的子句不算；
+// 其余的子句要有「请她画／做图」的说法才算。正反例在 draw-intent-cases.mjs。
+const DRAW = '[畫画繪绘]';
+// 后面接这些就是在说画过的、画好没（「畫的」「畫得」「畫好了嗎」「畫到哪」），不是请她画。
+const NOT_ASKING = '(?![的得過过好完了到著着])';
+const MEASURE =
+	'(?:一|兩|两|三|四|五|幾|几|個|个|張|张|隻|只|幅|下|點|点|些|條|条|頭|头|朵|棵|座|份|套|組|组|版|次)';
+const IMAGE =
+	'(?:圖|图|頭像|头像|插畫|插画|桌布|壁紙|壁纸|表情包|貼圖|贴图|海報|海报|封面|立繪|立绘|大頭貼|大头贴|卡片|賀卡|贺卡|明信片|logo|icon|banner|avatar|pfp)';
+const ASK =
+	'(?:幫|帮|替|給我|给我|請|请|麻煩|麻烦|拜託|拜托|求|可以|能|想|要|來|来|再|也|快|去|順便|顺便|改|試|试|重新|重)';
+// 名词里的「畫」「圖」不算动作（畫風、畫室、動畫、截圖、照片…）。
+const NOUNS = new RegExp(
+	`${DRAW}(?:風|风|面|質|质|家|師|师|室|布|筆|笔|作|展|冊|册|工|功|技|法|素|板|廊|具)|(?:動|动|漫|計|计|規|规|企|刻|筆|笔|插)${DRAW}(?:家|師|师)?|(?:圖|图)(?:表|案|書|书|層|层)|(?:地|截|流程|架構|架构)(?:圖|图)|照片|相片`,
+	'gu',
+);
+const CLAUSE = /[，,。.！!？?；;:：\n~～…]+|(?:然後|然后|但是|不過|不过)/u;
+const NEGATED = new RegExp(
+	`(?:不要|不用|不必|不需要|不想|不准|不許|不许|不可以|别|別|甭|勿|停止|算了|取消|免了)[^，]{0,4}?(?:${DRAW}|做|弄|生成|改|修)|不${DRAW}了|停筆|停笔`,
+	'u',
+);
+const ASKING_ABOUT = new RegExp(
+	`(?:怎麼|怎么|怎樣|怎样|如何|為什麼|为什么|為何|为何|用什麼|用什么|用啥|拿什麼|拿什么|多久|多長時間|多长时间|哪裡|哪里|在哪|什麼時候|什么时候|是誰|是谁)[^，]{0,8}?(?:${DRAW}|做|弄|生成)|(?:會|会)${DRAW}|擅長|擅长|(?:學|学|教)[^，]{0,3}?${DRAW}`,
+	'u',
+);
+const DRAW_ASKS = [
+	new RegExp(`${ASK}[^，]{0,8}?${DRAW}${NOT_ASKING}`, 'u'),
+	new RegExp(`^(?:那|就|欸|诶|快|先)?${DRAW}(?!${DRAW})${NOT_ASKING}.`, 'u'),
+	new RegExp(`${DRAW}${MEASURE}`, 'u'),
+	new RegExp(
+		`${ASK}[^，]{0,6}?(?:做|弄|生成|生|產生|产生|整|搞|設計|设计|製作|制作|合成|p)(?![的得過过好完了])[^，]{0,8}?${IMAGE}`,
+		'iu',
+	),
+	new RegExp(
+		`(?:想要|要|來|来|求|給我|给我|再)${MEASURE}{1,2}[^，]{0,8}?${IMAGE}`,
+		'iu',
+	),
+	new RegExp(`把[^，]{0,10}?${DRAW}成`, 'u'),
+	/(?:再|重)(?:來|来)?(?:一|1)(?:張|张|幅|版|個|个)|描いて/u,
+];
+// 照对方的附件画（这则真的带了图）：「照這張畫」「參考這張」「變成動漫風」，或只回一句「照這張」。
+const REFERENCE_ASKS = [
+	new RegExp(
+		`(?:照|參考|参考|仿|模仿|依照|按照|根據|根据)(?:著|着)?[^，]{0,8}?(?:${DRAW}|做|弄|改|變|变|生成)`,
+		'u',
+	),
+	new RegExp(
+		`(?:變成|变成|改成|換成|换成|轉成|转成|弄成|做成|${DRAW}成)[^，]{0,10}?(?:風|风|樣|样|版|圖|图|頭像|头像|q)`,
+		'iu',
+	),
+	/^(?:就)?(?:照|參考|参考|按|依)(?:著|着)?(?:這|这|此)(?:張|张|個|个)?(?:圖|图)?(?:吧|啦|喔|哦|好了)?$/u,
+];
+// 改这个频道画过的作品：有要改的说法就算。
 const EDIT_ASK =
-	/改|修|調|调|換|换|加|拿掉|去掉|刪|删|重[畫画]|大一點|大一点|小一點|小一点|顏色|颜色/u;
-const REFERENCE_ASK = /照|參考|参考|這張|这张|這個|这个/u;
+	/改|修|調|调|換|换|加|拿掉|去掉|刪|删|重[畫画]|大一點|大一点|小一點|小一点|顏色|颜色|變|变/u;
+// 只问要画多久、没有请她画的说法（「你畫一張要多久」）也是询问。
+const DURATION = /多久|幾分鐘|几分钟|多長時間|多长时间|要花多少/u;
+const POLITE = /幫|帮|替|請|请|麻煩|麻烦|拜託|拜托|可以|能/u;
+const ENGLISH_NO =
+	/\b(?:don'?t|do not|stop|no need|never mind|how (?:do|did|does|can|could) (?:you|u)|what (?:do|did) you)\b/iu;
+const ENGLISH_ASK =
+	/\b(?:draw|paint|sketch|illustrate|doodle)\b|\bmake (?:me )?(?:an? )?(?:avatar|pfp|picture|image|drawing|icon|wallpaper|illustration)\b/iu;
 
-export function drawIntent(text, { sourceJob, attachments = 0 } = {}) {
-	const plain = String(text ?? '')
-		.replace(/<@!?\d+>/gu, '')
-		.replace(/\s+/gu, '');
-	if (!plain) return false;
-	if (DRAW_ASK.test(plain) || DRAW_ASK_EN.test(String(text))) return true;
-	if (sourceJob && EDIT_ASK.test(plain)) return true;
-	return attachments > 0 && REFERENCE_ASK.test(plain);
+export function drawIntent(text, { editing = false, attachments = 0 } = {}) {
+	const raw = String(text ?? '')
+		.replace(/<@!?\d+>/gu, ' ')
+		.trim();
+	if (!raw) return false;
+	const english = raw.replace(/\s+/gu, ' ');
+	if (ENGLISH_ASK.test(english) && !ENGLISH_NO.test(english)) return true;
+	const plain = raw
+		.replace(/\s+/gu, '')
+		.replace(NOUNS, '■')
+		// 「可不可以」「能不能」「要不要」当成「可以」「能」「要」（不然「不可以」会被当成否定）。
+		.replace(/(\p{Script=Han})不\1/gu, '$1');
+	for (const clause of plain.split(CLAUSE)) {
+		if (
+			!clause ||
+			NEGATED.test(clause) ||
+			ASKING_ABOUT.test(clause) ||
+			(DURATION.test(clause) && !POLITE.test(clause))
+		)
+			continue;
+		if (DRAW_ASKS.some((pattern) => pattern.test(clause))) return true;
+		if (
+			attachments > 0 &&
+			REFERENCE_ASKS.some((pattern) => pattern.test(clause))
+		)
+			return true;
+		if (editing && EDIT_ASK.test(clause)) return true;
+	}
+	return false;
 }
 
 const ref = (messageId) => '#' + String(messageId).slice(-4);
@@ -563,10 +674,18 @@ export function drawRequestTool(runtime) {
 						: '這個頻道目前沒有在畫或排隊的圖。',
 				);
 			}
-			// 程式检查：这一则（叫她的那则）要明确要她画，不然不收。
+			// 要改的作品必须是这个频道画过的（画室记下的；重启以前画的查不到）。
+			if (
+				args.source_job &&
+				studio.workChannel?.(args.source_job) !== String(source.channelId)
+			)
+				return NO(
+					'source_job 不是這個頻道畫過的作品（或是重啟以前畫的，已經查不到），不能拿來改。要畫新的就不要填 source_job；找不到那張就照實跟對方說。',
+				);
+			// 程式检查：这一则（叫她的那则）要肯定在请她画，不然不收。
 			if (
 				!drawIntent(source.text, {
-					sourceJob: args.source_job,
+					editing: Boolean(args.source_job),
 					attachments: source.referenceAttachments?.length ?? 0,
 				})
 			)

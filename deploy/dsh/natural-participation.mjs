@@ -24,6 +24,8 @@ const STEPS_TEXT = '這一輪我做了太多步，先停一下；要繼續再叫
 const TURN_FAILED = /^⚠️ (?:回合失败|出错了|消息没有进入会话)/;
 const TURN_SILENT = /^(?:⏹️ 回合被取消|\(本回合没有文本回复\)$)/;
 function noticeCode(text) {
+	// 讯息已经被删或改掉（桥接送答前核对时发现）：不发出去，也不补「卡住了」。
+	if (text.startsWith('⏹️') && text.includes('訊息已撤回')) return 'revoked';
 	if (text.startsWith('⏹️')) return 'cancelled';
 	if (text.startsWith('(本回合没有文本回复)')) return 'empty';
 	if (text.startsWith('⚠️ 消息没有进入会话')) return 'lost';
@@ -437,6 +439,15 @@ export class NaturalParticipation {
 
 	// 画室收下了这则呼叫的画图请求（studio 的 accepted 事件）：开始画或排队。
 	drawEvent(event) {
+		// 画室这张结束了（画好、没画成、被删、被取消）：这则呼叫不再替它说「等我一下」「好，我去畫」，
+		// 画室自己已经回过话了（部署前审查：画室先失败了，还是补了这两句）。
+		if (event?.type === 'finishing' || event?.type === 'end') {
+			const call = this.calls.get(String(event.messageId));
+			if (call && call.channelId === String(event.channelId)) {
+				call.drawEnded = String(event.outcome ?? 'ended');
+				clearTimeout(call.preface);
+			}
+		}
 		if (event?.type === 'end') {
 			// 画室回覆对方的那句（没画成、画太久…）：会话里没有，记下来下一批附上。
 			if (event.text && event.noteId)
@@ -452,7 +463,7 @@ export class NaturalParticipation {
 		if (call && call.channelId === String(event.channelId)) {
 			call.drawing = event.status === 'queued' ? 'queued' : 'started';
 			// 只有交给画室（真的要做比较久的事）以后才可能先说一句；一般聊天就算慢也不插这句。
-			if (!call.preface && !call.closed)
+			if (!call.preface && !call.closed && !call.drawEnded)
 				call.preface = this.timer(
 					() => void this.preface(call, 'slow'),
 					this.config.prefaceMs,
@@ -481,7 +492,13 @@ export class NaturalParticipation {
 
 	// 先说一句：只说一次，已经有东西送达、已经结束或被指令停掉就不说。不算答覆。
 	async preface(call, kind) {
-		if (call.closed || call.prefaced || call.stopped || this.delivered(call))
+		if (
+			call.closed ||
+			call.prefaced ||
+			call.stopped ||
+			call.drawEnded ||
+			this.delivered(call)
+		)
 			return;
 		call.prefaced = kind;
 		try {
@@ -603,6 +620,10 @@ export class NaturalParticipation {
 	// 交给画室以后这轮没说话：替她说「好，我去畫」或「前面還有一張…」，不说「卡住了」。
 	async settleCall(call, turn) {
 		if (call.stopped) return 'stopped';
+		// 讯息已经被删或改掉：回覆对象不在了，不补任何话（补了会掉成一般群讯）。
+		if (turn === 'revoked') return 'revoked';
+		// 画室已经结束、自己回过话（或请求被删）：这边不再补「好，我去畫」「卡住了」。
+		if (call.drawEnded && !this.delivered(call)) return 'draw-done';
 		let text;
 		if (turn === 'steps') text = STEPS_TEXT;
 		else if (this.delivered(call)) return 'answered';

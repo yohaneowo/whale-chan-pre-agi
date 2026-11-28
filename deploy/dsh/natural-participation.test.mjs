@@ -1383,3 +1383,87 @@ test('私讯的直接呼叫没有任何输出也补一句', async (t) => {
 	);
 	assert.deepEqual(controls, ['欸 我剛剛卡住了，你再說一次']);
 });
+
+// 部署前审查（2026-11-28）：画室先失败了（已经回了「這張我畫到一半卡住了」），20 秒到了还是补「等我一下」，
+// 这轮没说话时又补「好，我去畫」。画室结束（画好、没画成、被删）以后都不能再替她说这两句。
+test('画室已经结束（没画成或请求被删）：不再先说「等我一下」，也不补「好，我去畫」', async (t) => {
+	const timers = [];
+	const f = await fixture(t);
+	f.participation.timer = (run, ms) => (
+		timers.push({ run, ms }),
+		timers.length
+	);
+	let drawEvents = [];
+	const { deliver } = bridgeFor(f.participation, {
+		A: {
+			run: async () => {
+				for (const event of drawEvents) f.participation.drawEvent(event);
+				for (const row of timers) row.run();
+				return { chunks: ['(本回合没有文本回复)'] };
+			},
+		},
+	});
+	const controls = [];
+	const logs = [];
+	f.participation.log = (text) => logs.push(text);
+	const failed = message('<@123> KEY-A 畫貓', { mentions: [{ id: '123' }] });
+	drawEvents = [
+		{
+			type: 'accepted',
+			channelId: 'room',
+			messageId: failed.id,
+			status: 'started',
+		},
+		{ type: 'start', channelId: 'room', messageId: failed.id },
+		{
+			type: 'finishing',
+			channelId: 'room',
+			messageId: failed.id,
+			outcome: 'failed',
+		},
+		{
+			type: 'end',
+			channelId: 'room',
+			messageId: failed.id,
+			outcome: 'failed',
+			text: '這張我畫到一半卡住了，先停下來；要再畫再叫我。',
+			noteId: 'n1',
+		},
+	];
+	await f.participation.receive(failed, identity, deliver, async (text) =>
+		controls.push(text),
+	);
+	const gone = message('<@123> KEY-A 也畫狗', { mentions: [{ id: '123' }] });
+	timers.length = 0;
+	drawEvents = [
+		{
+			type: 'accepted',
+			channelId: 'room',
+			messageId: gone.id,
+			status: 'queued',
+		},
+		{ type: 'end', channelId: 'room', messageId: gone.id, outcome: 'deleted' },
+	];
+	await f.participation.receive(gone, identity, deliver, async (text) =>
+		controls.push(text),
+	);
+	assert.deepEqual(controls, [], '画室已经回过话（或请求被删），这边不再补');
+	assert.doesNotMatch(result(logs, failed.id)[0], /draw-ack|fallback/);
+	assert.match(result(logs, failed.id)[0], /preface=no /);
+	assert.doesNotMatch(result(logs, gone.id)[0], /draw-ack|fallback/);
+});
+
+// 部署前审查：讯息被撤销（删掉或改掉）时，桥接送答前的核对不会过；这时不能再走一般备援补「卡住了」
+// （回覆对象已经不在，Discord 会把它贴成一般群讯）。桥接回「⏹️ 回合被取消（訊息已撤回）」。
+test('讯息已撤回：桥接的提示不发出去，也不补「卡住了」', async (t) => {
+	const f = await fixture(t);
+	const { deliver, posted } = bridgeFor(f.participation, {
+		A: { chunks: ['⏹️ 回合被取消（訊息已撤回）'] },
+	});
+	const { ids, controls, logs } = await directCalls(f, deliver, [
+		'<@123> KEY-A 問題',
+	]);
+	assert.deepEqual(posted, []);
+	assert.deepEqual(controls, []);
+	assert.match(result(logs, ids[0])[0], /status=revoked /);
+});

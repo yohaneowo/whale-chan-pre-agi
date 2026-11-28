@@ -48,18 +48,24 @@ LEASE_DECLARE = ("let scopeAgent;", "let scopeAgent;\n\t\tlet socialLease;")
 # A 晚拿一次就把已经轮到的 B 的租约换掉，B 的正常答覆会被当成不能投递。
 LEASE_GUARD = ("scopeAgent=agent;", "if (socialBudget?.signal.aborted) return { chunks: [TURN_DEADLINE_NOTICE], files: [] };\n\t\t\tscopeAgent=agent;")
 LEASE_TAKE = ("if (this.gatewayScopes && !await this.gatewayScopes.turn(agent,channelId,messageId))\n\t\t\treturn {chunks:[],files:[]};",
-              "if (this.gatewayScopes && !await this.gatewayScopes.turn(agent,channelId,messageId))\n\t\t\treturn {chunks:[],files:[]};\n\t\tsocialLease = this.gatewayScopes?.active.get(agent);")
+              "if (this.gatewayScopes && !await this.gatewayScopes.turn(agent,channelId,messageId))\n"
+              "\t\t\treturn {chunks:this.gatewayScopes.revoked?.has(messageId) ? [TURN_REVOKED_NOTICE] : [],files:[]};\n"
+              "\t\tsocialLease = this.gatewayScopes?.active.get(agent);")
 # 送答前的核对偶尔会因为 Discord 慢或限流没过，整轮答覆就被丢掉（2026-11-28 第 4 则）：没过隔一下再核对。
+# 部署前审查：讯息被撤销（删掉或改掉）时回「訊息已撤回」的提示（群聊行为处理不发出去、也不补「卡住了」，
+# 不然补的那句会掉成一般群讯）；期限到或 /stop 时照期限的提示。
 DELIVER_CHECK = ("if (this.gatewayScopes && !await this.gatewayScopes.historyCanDeliver(agent,messageId))\n\t\t\t\treturn {chunks:[],files:[]};",
                  "if (this.gatewayScopes && !await socialCanDeliver(() => this.gatewayScopes.historyCanDeliver(agent,messageId), {\n"
                  "\t\t\t\tsignal: socialBudget?.signal,\n"
                  "\t\t\t\trevoked: () => Boolean(this.gatewayScopes.revoked?.has(messageId)),\n"
                  "\t\t\t\tonMiss: (attempt) => this.log(\"warn\", `送答核对没过 #${messageId}：第 ${attempt} 次`),\n"
-                 "\t\t\t}))\n\t\t\t\treturn {chunks:[],files:[]};")
+                 "\t\t\t}))\n"
+                 "\t\t\t\treturn {chunks:this.gatewayScopes.revoked?.has(messageId) ? [TURN_REVOKED_NOTICE]\n"
+                 "\t\t\t\t\t: socialBudget?.signal.aborted ? [TURN_DEADLINE_NOTICE] : [],files:[]};")
 LEASE_END = ("if (scopeAgent) this.gatewayScopes?.end(scopeAgent);",
              "if (scopeAgent && this.gatewayScopes?.active.get(scopeAgent) === socialLease) this.gatewayScopes.end(scopeAgent);")
 # 背景画室：/stop 也停画室；登入后建画室，画室收下请求时告诉群聊行为处理。
-STUDIO_IMPORT = 'import { createSocialStudio, stopSocialStudio, noteSocialStudioDeleted, socialCanDeliver } from "dsh-social-runtime/bridge";\n'
+STUDIO_IMPORT = 'import { createSocialStudio, stopSocialStudio, noteSocialStudioDeleted, socialCanDeliver, TURN_REVOKED_NOTICE } from "dsh-social-runtime/bridge";\n'
 # 请求讯息被删（含批次删除）：画室那张安静停掉，画好的图不会掉成一般群讯（第 3 轮审查）。
 STUDIO_DELETE = ('const onMessageDelete = (data) => {scopeAuthority?.noteRevoked(data);socialArchive("delete",data);};',
                  'const onMessageDelete = (data) => {scopeAuthority?.noteRevoked(data);socialArchive("delete",data);noteSocialStudioDeleted(data);};')
@@ -67,7 +73,18 @@ STUDIO_STOP = ("commandStop(channelId) {\n\t\tstopSocialTurns(channelId);",
                "commandStop(channelId) {\n\t\tstopSocialTurns(channelId);\n\t\tstopSocialStudio(channelId);")
 STUDIO_WIRING = '''const socialStudio = createSocialStudio({ bridges: { group: bridge, owner: ownerBridge }, rest, log: (text) => logger.info(text) });
 socialStudio.on((event) => participation.drawEvent(event));
+// 画室回覆请求的那句（没画成、画太久…）也是她对那则讯息实际送出的回答，回放时接上。
+socialStudio.on((event) => { if (event.type === "end" && event.noteId && event.text) historyView.sent(event.channelId, event.messageId, event.text); });
 '''
+# 聊天回放接上的「她当时的回答」只用这个频道实际送出的（部署前审查：会话里会有心跳另开一轮的定时输出、
+# 没送出去的草稿）：桥接每次成功送出文字、补话（等我一下、卡住了、好我去畫）都记到那则讯息名下。
+SENT_REPLY = ("participation.recordReply(message.channel_id, target.text, sent.id, participation.replyPartner(target, message.author.id), target.messageId, index === 0, naturalTicket);\n  await recordSocialCommitment(",
+              "participation.recordReply(message.channel_id, target.text, sent.id, participation.replyPartner(target, message.author.id), target.messageId, index === 0, naturalTicket);\n"
+              "  historyView.sent(message.channel_id, message.id, target.text);\n  await recordSocialCommitment(")
+SENT_CONTROL = ("const sent = await rest.createMessage(message.channel_id, message.guild_id === void 0 ? redactSecrets(text) : await toGroupText(text), message.id);\n    participation.recordReply(message.channel_id, text, sent.id);",
+                "const sent = await rest.createMessage(message.channel_id, message.guild_id === void 0 ? redactSecrets(text) : await toGroupText(text), message.id);\n    participation.recordReply(message.channel_id, text, sent.id);\n    historyView.sent(message.channel_id, message.id, text);")
+SENT_EDIT_CONTROL = ("const sent = await rest.createMessage(message.channel_id, await toGroupText(text), message.id);\n    participation.recordReply(message.channel_id, text, sent.id);",
+                     "const sent = await rest.createMessage(message.channel_id, await toGroupText(text), message.id);\n    participation.recordReply(message.channel_id, text, sent.id);\n    historyView.sent(message.channel_id, message.id, text);")
 # 闸道核验过的聊天请求由 history-view 附上的工具说明：聊天会话改成「交给画室」的说明。
 # 另外附上这个频道画室最近的结果（没画成的已经回报过了，不要自己补画）。
 HISTORY_GUIDE = ("return tools.KRITA_GUIDE+tools.referenceHint(",
@@ -95,22 +112,46 @@ function replayText(current,native,live) {
 		: /沒人直接叫你/u.test(header) ? '沒人直接叫你，但大家在接你剛說的話' : '這則在叫你';
 	return `［${when}，這次的新訊息；${how}］${who}${current.text}`;
 }
+// 她在这个频道对每则讯息实际送出的文字（桥接每次成功送出时记下，historyView.sent）。回放接上的「她当时的回答」
+// 只用这里的，不从会话里抓（会话里有心跳另开一轮的定时输出、没送出去的草稿）。只记这次启动以后送出的。
+const sentReplies=new Map();
+const sentText=(channel,event)=>(sentReplies.get(channel+':'+event)??[]).join('\\n').trim();
+// 接上的回答用宿主产生的 assistant 讯息当形状（同一轮她自己的回答；没有就用之前最近一则），文字换成实际送出的。
+function replyShape(session,whole,seq,start) {
+	let shape;
+	let open=false;
+	for (const event of whole) {
+		if (event.seq>=start) break;
+		if (event.seq===seq) { open=true; continue; }
+		if (event.seq>seq && (event.type==='turn/end' || origin(event))) { if (open && shape?.same) break; open=false; }
+		if (event.type!=='assistant/message' || (event.seq>seq && !open)) continue;
+		const message=derivedWithoutCursor(session,event);
+		if (message?.role==='assistant') shape={message,same:open};
+	}
+	return shape?.message;
+}
 ''')
 HISTORY_AGE = ("\tconst chosen=[...sources].slice(-26);",
-               "\t// 聊天（有当轮讯息）时，太久以前的不再当成眼前的对话回放。\n"
-               "\tconst since=liveId ? Date.now()-REPLAY_MAX_AGE_MS : -Infinity;\n"
-               "\tconst chosen=[...sources].filter(([id,event])=>id===liveId || !(Number(event.time)<since)).slice(-26);")
+               "\t// 聊天（有当轮讯息）时，太久以前的不再当成眼前的对话回放。时间照 Discord 讯息本身（讯息编号里的时间），\n"
+               "\t// 不照进会话的时间（很晚才进会话的旧讯息也算旧的；部署前审查）。\n"
+               "\tconst since=Date.now()-REPLAY_MAX_AGE_MS;\n"
+               "\tconst chosen=[...sources].filter(([id])=>!liveId || id===liveId || snowflakeTime(id)>=since).slice(-26);")
 HISTORY_TEXT = ("content:[{type:'text',text:current.text}]}};",
                 "content:[{type:'text',text:replayText(current,native,id===liveId)}]}};")
 HISTORY_REPLIES = ("\tconst bySeq=new Map(proven.filter(row=>verified.has(row.id)).map(row=>[row.seq,row]));\n",
                    "\tconst bySeq=new Map(proven.filter(row=>verified.has(row.id)).map(row=>[row.seq,row]));\n"
-                   "\t// 回放的旧讯息后面接上她当时的回答（只取文字）：不然一串旧问题看起来都还没回。\n"
-                   "\tconst replies=new Map();\n\tlet asked;\n\tfor (const event of whole) {\n\t\tif (event.seq>=start) break;\n"
-                   "\t\tif (event.type==='user/message' && origin(event)) asked=bySeq.has(event.seq) ? event.seq : undefined;\n"
-                   "\t\telse if (asked!==undefined && event.type==='assistant/message') {\n"
-                   "\t\t\tconst message=derivedWithoutCursor(session,event);\n"
-                   "\t\t\tconst text=(message?.content??[]).filter(block=>block.type==='text').map(block=>block.text??'').join('').trim();\n"
-                   "\t\t\tif (text) replies.set(asked,{...message,content:[{type:'text',text}]});\n\t\t}\n\t}\n")
+                   "\t// 回放的旧讯息后面接上她当时在这个频道实际送出的回答（只取文字）：不然一串旧问题看起来都还没回。\n"
+                   "\tconst replies=new Map();\n\tfor (const [seq,row] of bySeq) {\n\t\tif (seq>=start) continue;\n"
+                   "\t\tconst text=sentText(target.channelId,row.id);\n\t\tconst shape=text && replyShape(session,whole,seq,start);\n"
+                   "\t\tif (shape) replies.set(seq,{...shape,id:'verified-reply-'+seq,content:[{type:'text',text}]});\n\t}\n")
+HISTORY_SENT = ("\towns(id) { return authority?.owns(id)===true; },\n",
+                "\towns(id) { return authority?.owns(id)===true; },\n"
+                "\t// 桥接每次成功送出（她的回答、补的那句、画室的那句）都记一笔：哪个频道、回应哪则讯息、送了什么。\n"
+                "\tsent(channel,event,text) {\n"
+                "\t\tif (!discordId(channel) || !discordId(event) || typeof text!=='string' || !text.trim()) return;\n"
+                "\t\tconst key=channel+':'+event;\n\t\tconst rows=sentReplies.get(key)??[];\n\t\tsentReplies.delete(key);\n"
+                "\t\tsentReplies.set(key,[...rows,text.trim().slice(0,1000)].slice(-6));\n"
+                "\t\tif (sentReplies.size>2048) sentReplies.delete(sentReplies.keys().next().value);\n\t},\n")
 HISTORY_PUSH = ("\t\t\tresult.push(retained.message);\n",
                 "\t\t\tresult.push(retained.message);\n\t\t\tif (event.seq<start && replies.has(event.seq)) result.push(replies.get(event.seq));\n")
 SCOPES_SOURCE = ("return row.content.trim() || attachments.length ? {id:event,text:row.content,actor,attachments,images} : null;",
@@ -217,6 +258,14 @@ KRITA = [
     # 请求那则被删了：让 Discord 拒绝（fail_if_not_exists），图不会掉成一般群讯（第 3 轮审查）。
     ("message_id: source.messageId,\n\t\t\t\t\t\t\t\t\t\tfail_if_not_exists: false,",
      "message_id: source.messageId,\n\t\t\t\t\t\t\t\t\t\tfail_if_not_exists: true,"),
+    # 这则请求 Krita 实际碰过的作品编号（闸道收下的才算，闸道只让请求者在原会话动自己的作品）：
+    # 画室记成这个频道画的，之后续改要核对 source_job 是这个频道的作品（部署前审查）。
+    ("\t\t\toriginals: new Set(),\n\t\t\tredraws: new Set(),\n",
+     "\t\t\toriginals: new Set(),\n\t\t\tredraws: new Set(),\n\t\t\tworks: new Set(),\n"),
+    ("\t\t\t\t\tif (!result.ok)\n\t\t\t\t\t\treturn refusal(result.message || 'Krita 這次沒有做成。');\n",
+     "\t\t\t\t\tif (!result.ok)\n\t\t\t\t\t\treturn refusal(result.message || 'Krita 這次沒有做成。');\n"
+     "\t\t\t\t\tfor (const work of [result.data?.job, result.job, args.job])\n"
+     "\t\t\t\t\t\tif (/^work-[0-9a-f]{24}$/.test(work ?? '')) turn.works.add(work);\n"),
 ]
 # 每个工具都包一层送讯来源（apply 里的 ctx.tools.register 全部换掉）。
 APPLY_START = "export async function apply(ctx, config = {}) {"
@@ -229,9 +278,9 @@ KRITA_EXPORT = '''
 // 画室用：这则请求 Krita 实际回覆了几张（正式交付、预览）。
 export function kritaDeliveries(runtime, messageId) {
 	const turn = deliveries.get(runtime)?.get(String(messageId));
-	if (!turn) return { final: 0, previews: 0 };
+	if (!turn) return { final: 0, previews: 0, works: [] };
 	const final = [...turn.receipts.values()].filter((receipt) => receipt?.delivery === 'sent').length;
-	return { final, previews: turn.previewsSent ?? 0 };
+	return { final, previews: turn.previewsSent ?? 0, works: [...(turn.works ?? [])] };
 }
 '''
 
@@ -247,7 +296,7 @@ def port_index(content):
     content = once(content, RELEASE_WAIT, sp.WAIT)
     for anchor, replacement in (sp.NOTICE_TICKET, SEND, COMMITMENT_REPLY, sp.TRACKED_REST, PARTICIPATION_LOG,
                                 LEASE_DECLARE, LEASE_GUARD, LEASE_TAKE, LEASE_END, STUDIO_STOP, HISTORY_GUIDE, STUDIO_DELETE,
-                                DELIVER_CHECK):
+                                DELIVER_CHECK, SENT_REPLY, SENT_CONTROL, SENT_EDIT_CONTROL):
         content = once(content, anchor, replacement)
     content = once(content, SUBSCRIBE_ANCHOR, sp.SUBSCRIBE + STUDIO_WIRING + SUBSCRIBE_ANCHOR)
     content = once(content, OLD_MESSAGE_FAILED, sp.MESSAGE_FAILED)
@@ -299,7 +348,7 @@ def port_runtime(content):
 def port_history(content):
     if "replayText(" in content:
         raise ValueError("这份 release 的 history-view.mjs 已经移植过。")
-    for anchor, replacement in (HISTORY_HELPERS, HISTORY_AGE, HISTORY_TEXT, HISTORY_REPLIES, HISTORY_PUSH):
+    for anchor, replacement in (HISTORY_HELPERS, HISTORY_AGE, HISTORY_TEXT, HISTORY_REPLIES, HISTORY_PUSH, HISTORY_SENT):
         content = sp.once(content, anchor, replacement)
     return content
 

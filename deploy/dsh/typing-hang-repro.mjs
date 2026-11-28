@@ -469,6 +469,9 @@ async function play(scene) {
 				authorName: message.author.username,
 				owner: message.author.id === OWNER,
 				text: message.content,
+				referenceAttachments: (message.attachments ?? []).map(({ id }) => ({
+					id,
+				})),
 			}
 		);
 	};
@@ -558,6 +561,7 @@ async function play(scene) {
 	// 这次核对当成没过（Discord 慢或限流，2026-11-28 第 4 则）。
 	scopes.historyCanDeliver = async (current, event) =>
 		!scene.deliverMiss?.(keyOf(event)) &&
+		!scopes.revoked.has(event) &&
 		scopes.active.get(current)?.row.event === event;
 
 	// 桥接：从 index.js 取出的真方法，挂在一个只有必要栏位的物件上。
@@ -676,7 +680,8 @@ async function play(scene) {
 				`with (scope) { ${deleteSource}; return onMessageDelete; }`,
 			)(
 				scope({
-					scopeAuthority: undefined,
+					// 跟正式版一样：删掉的讯息记成撤销（送答前的核对、闸道租约都不再认它）。
+					scopeAuthority: scopes,
 					socialArchive: () => {},
 					noteSocialStudioDeleted: deletedSource
 						? new Function(
@@ -1705,6 +1710,96 @@ const scenes = [
 			B: { replies: [STUCK], status: 'fallback-sent' },
 		},
 	},
+	{
+		// 部署前审查（2026-11-28）：画室先失败了，聊天那轮还没结束，20 秒到了照样补「等我一下」，
+		// 这轮没说话又补「好，我去畫」。画室已经回过「卡住了」，这两句都不该再出现。
+		name: '画室先失败了：不再补「等我一下」和「好，我去畫」',
+		messages: [
+			{ key: 'A', at: 0, content: `${mention} 畫一隻小鯨魚 PRIVATE-A` },
+		],
+		async model(turn, tools) {
+			if (tools.drawRequest)
+				await tools.drawRequest({ brief: '小鯨魚 PRIVATE-BRIEF' });
+			// 聊天那轮拖了一阵、没说话（最坏的情况）。
+			await tools.wait(25_000);
+		},
+		async studio(turn, tools) {
+			await tools.wait(1_000);
+			tools.fail();
+		},
+		typingMax: 30_000,
+		expect: {
+			A: {
+				replies: [STUDIO_FAILED],
+				never: ['等我一下，我弄一下', GO, STUCK],
+			},
+		},
+	},
+	{
+		// 部署前审查：讯息在回合中被删（撤销），送答前的核对不会过；不能再走一般备援补「卡住了」
+		// （回覆对象不在了，会掉成一般群讯）。
+		name: '讯息在回合中被删：不补「卡住了」，也不掉成一般群讯',
+		messages: [
+			{
+				key: 'A',
+				at: 0,
+				content: `${mention} 晚餐吃什麼 PRIVATE-A`,
+				deleteAt: 3_000,
+			},
+		],
+		async model(turn, tools) {
+			await tools.wait(5_000);
+			tools.say('吃麵');
+		},
+		check({ posted }) {
+			return posted
+				.filter((row) => row.orphan || row.content === STUCK)
+				.map((row) => `讯息被删以后还送出「${row.content.slice(0, 12)}」`);
+		},
+		expect: { A: { never: [STUCK], absent: [STUCK], status: 'revoked' } },
+	},
+	{
+		// 部署前审查：「請問你是怎麼畫畫的」「先不要畫」、带附件的「描述一下這張圖」被当成要画，
+		// 「幫我做一張頭像」反而被挡。模型每则都先呼叫 draw_request（最坏的情况），要靠程式判断。
+		name: '要不要画：询问、否定、描述图片都不交给画室；「幫我做一張頭像」交给画室',
+		messages: [
+			{ key: 'A', at: 0, content: `${mention} 請問你是怎麼畫畫的 PRIVATE-A` },
+			{ key: 'B', at: 60_000, content: `${mention} 先不要畫 PRIVATE-B` },
+			{
+				key: 'C',
+				at: 120_000,
+				content: `${mention} 描述一下這張圖 PRIVATE-C`,
+				attachments: [
+					{
+						id: '1999999999999999001',
+						filename: 'a.png',
+						content_type: 'image/png',
+						size: 10,
+						url: 'https://cdn.discordapp.com/attachments/1/2/a.png',
+					},
+				],
+			},
+			{ key: 'D', at: 180_000, content: `${mention} 幫我做一張頭像 PRIVATE-D` },
+		],
+		fetch: async () => new globalThis.Response(new Uint8Array([1, 2, 3])),
+		async model(turn, tools) {
+			if (!tools.drawRequest) {
+				await tools.wait(2_000);
+				return tools.say('嗯');
+			}
+			const result = await tools.drawRequest({ brief: '頭像 PRIVATE-BRIEF' });
+			await tools.wait(1_500);
+			tools.say(result.ok ? GO : '嗯');
+		},
+		studio: (turn, tools) => studioDraw(turn, tools, 1),
+		typingMax: 30_000,
+		expect: {
+			A: { posts: ['嗯'], never: [GO], noStudio: true, status: 'answered' },
+			B: { never: [GO], noStudio: true, status: 'answered' },
+			C: { never: [GO], noStudio: true, status: 'answered' },
+			D: { posts: [GO], final: 300_000, never: [STUCK] },
+		},
+	},
 ];
 
 // 「正在输入」被限流：拿副本里真正的 DiscordRest 与 beginTypingFor 跑。第一次 typing 回 429（retry_after 1 秒），
@@ -2403,6 +2498,8 @@ async function historyReplayCheck() {
 			[oldId]: { text: '明天幫我搬家', name: '群友甲', at: oldAt },
 			[liveId]: { text: '你今天好安靜', name: '站長', at: now - 2_000 },
 		};
+		// 她当时实际送出的回答（桥接每次成功送出就记；修正前没有这个接点）。
+		historyView.sent?.(CHANNEL, oldId, '下雨是要送什麼啦');
 		historyView.install({
 			owns: () => true,
 			route: async () => ({ channelId: CHANNEL, sessionId: SESSION }),
@@ -2469,10 +2566,153 @@ async function historyReplayCheck() {
 	return problems;
 }
 
+// 部署前审查（2026-11-28）：回放的旧讯息后面接的「她当时的回答」是从会话里抓的，下一轮的定时输出
+// （心跳在会话里另开一轮写的那段）会被接成上一则的回答；没送出去的草稿也会被当成她说过的话。
+// 6 小时的回放范围也是用会话时间算的，不是 Discord 讯息的时间。
+async function historyRepliesCheck() {
+	const { historyView } = await import(
+		pathToFileURL(join(plugin, 'history-view.mjs')).href
+	);
+	const problems = [];
+	const now = Date.now();
+	const ids = {
+		sent: snowflake(now - 3_500_000),
+		unsent: snowflake(now - 3_000_000),
+		old: snowflake(now - 7 * 3_600_000),
+		live: snowflake(now - 2_000),
+	};
+	let seq = 0;
+	const events = [];
+	const push = (type, time, data) =>
+		events.push({ type, seq: ++seq, time, data });
+	const user = (time, id, text) =>
+		push('user/message', time, {
+			message: {
+				id: 'u' + (seq + 1),
+				role: 'user',
+				content: [
+					{ type: 'text', text: '（#閒聊｜沙盒，群聊新訊息。）\n' + text },
+				],
+				source: {
+					kind: 'user',
+					discordMessageId: id,
+					discordChannelId: CHANNEL,
+				},
+			},
+		});
+	const said = (time, text) =>
+		push('assistant/message', time, {
+			message: {
+				id: 'a' + (seq + 1),
+				role: 'assistant',
+				content: [{ type: 'text', text }],
+				source: { kind: 'model' },
+			},
+		});
+	let turn = 0;
+	const round = (time, body) => {
+		push('turn/start', time, { turn: ++turn });
+		body();
+		push('turn/end', time, { turn, reason: { kind: 'completed' } });
+	};
+	round(now - 3_600_000, () => {
+		user(now - 3_600_000, ids.sent, '明天幫我搬家');
+		said(now - 3_598_000, '下雨是要送什麼啦');
+	});
+	// 心跳另开一轮写的定时输出（不是回覆谁，也没送到这个频道）。
+	round(now - 3_300_000, () =>
+		said(now - 3_300_000, '今天的海很安靜 PRIVATE-HEARTBEAT'),
+	);
+	round(now - 3_000_000, () => {
+		user(now - 3_000_000, ids.unsent, '你喜歡貓嗎');
+		said(now - 2_998_000, '這句沒送出去 PRIVATE-UNSENT');
+	});
+	// Discord 上是 7 小时前的讯息，但很晚才进会话（会话时间是 1 分钟前）。
+	round(now - 60_000, () => {
+		user(now - 60_000, ids.old, '七小時前的舊話');
+		said(now - 59_000, '好喔');
+	});
+	push('turn/start', now - 1_000, { turn: ++turn });
+	user(now - 1_000, ids.live, '你今天好安靜');
+	const session = {
+		header: {},
+		snapshotEvents: () => events,
+		eventAt: (at) => events.find((event) => event.seq === at),
+		deriveEventMessage: (event) => event.data.message,
+	};
+	const raw = {
+		[ids.sent]: { text: '明天幫我搬家', name: '群友甲', at: now - 3_500_000 },
+		[ids.unsent]: { text: '你喜歡貓嗎', name: '群友乙', at: now - 3_000_000 },
+		[ids.old]: {
+			text: '七小時前的舊話',
+			name: '群友丙',
+			at: now - 7 * 3_600_000,
+		},
+		[ids.live]: { text: '你今天好安靜', name: '站長', at: now - 2_000 },
+	};
+	historyView.sent?.(CHANNEL, ids.sent, '下雨是要送什麼啦');
+	// 别的频道同一则编号送出的话不算。
+	historyView.sent?.(
+		'1000000000000000099',
+		ids.unsent,
+		'別的頻道 PRIVATE-ELSEWHERE',
+	);
+	historyView.install({
+		owns: () => true,
+		route: async () => ({ channelId: CHANNEL, sessionId: SESSION }),
+		eligible: async (target, list) => new Set(list),
+		batch: async (target, list) => new Map(list.map((id) => [id, { id }])),
+		source: async (target, id) =>
+			raw[id] && { id, actor: FRIEND, attachments: [], images: [], ...raw[id] },
+		live: () => true,
+		memories: async () => [],
+		guide: async () => '',
+	});
+	const options = { sessionId: SESSION, messages: [] };
+	historyView.mark(options, {
+		kind: 'chat',
+		session,
+		turn,
+		sequences: [],
+		system: {
+			id: 'sys',
+			role: 'system',
+			content: [{ type: 'text', text: '系統' }],
+		},
+		live: [events.at(-1).data.message],
+	});
+	const projected = await historyView.apply(options);
+	const texts = (projected?.messages ?? []).map((message) => ({
+		role: message.role,
+		text: (message.content ?? []).map((block) => block.text ?? '').join(''),
+	}));
+	if (!texts.length) return ['没有回放'];
+	const at = (needle) => texts.findIndex((row) => row.text.includes(needle));
+	const sentAt = at('明天幫我搬家');
+	if (sentAt < 0) problems.push('1 小时前的讯息没有回放');
+	else if (texts[sentAt + 1]?.text !== '下雨是要送什麼啦')
+		problems.push(
+			`「明天幫我搬家」后面接的不是她当时送出的回答（接的是「${(texts[sentAt + 1]?.text ?? '').slice(0, 12)}」）`,
+		);
+	if (at('PRIVATE-HEARTBEAT') >= 0)
+		problems.push('心跳另开一轮的定时输出被接成上一则的回答');
+	if (at('PRIVATE-UNSENT') >= 0)
+		problems.push('没送出去的草稿被当成她当时的回答');
+	if (at('PRIVATE-ELSEWHERE') >= 0) problems.push('别的频道送出的话被接进来');
+	if (at('七小時前的舊話') >= 0)
+		problems.push('Discord 上 7 小时前的讯息还在回放（范围是用会话时间算的）');
+	if (at('你今天好安靜') < 0) problems.push('这次的讯息没有回放');
+	return problems;
+}
+
 const runtimeChecks = [
 	{
 		name: '聊天回放：几天前的旧讯息不当成眼前的对话；回放的讯息标日期、说话的人，接上她当时的回答',
 		run: historyReplayCheck,
+	},
+	{
+		name: '聊天回放：只接上她在这个频道实际送出的回答（不接定时输出、没送出的草稿），范围照 Discord 讯息的时间',
+		run: historyRepliesCheck,
 	},
 	{
 		name: '照正式宿主规则登记全部工具、挂上聊天与画室会话、组系统提示（不丢错）',
