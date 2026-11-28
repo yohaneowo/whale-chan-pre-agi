@@ -2,8 +2,8 @@
 # 部署新版 krita-guard（只看 dsh 自己的压力、持续 15 秒才停、自动恢复）和 Krita 闲置重启 timer。
 # 以 root 执行：sh deploy_guard.sh <放着 deploy/krita 档案的资料夹>
 #
-# 1. 先把现行的 guard / Krita 相关 unit、drop-in、脚本备份到 /var/backups/krita-guard-<时间>/，并写好
-#    同一个资料夹里的 rollback.sh（一键回滚）。
+# 1. 先把现行的 guard / Krita 相关 unit、drop-in、脚本备份到 /var/backups/krita-guard-<时间>/，并把
+#    rollback_guard.sh 放成同一个资料夹里的 rollback.sh（一键回滚；每一步照实回报，不拉起停着的 gate）。
 # 2. 装 krita_guard.py、krita_idle_restart.py 到 /opt/krita-gate，三个 unit 到 /etc/systemd/system。
 # 3. daemon-reload、重启 guard、启用 timer。不重启 dsh.service，也不重启 krita.service / krita-gate.service。
 # 4. 检查：guard active、日志有新版的 guard start、gate socket 在、dsh 的 MainPID / NRestarts 没变。
@@ -20,7 +20,8 @@ NEW_FILES="krita_guard.py krita_idle_restart.py"
 
 fail() { echo "deploy_guard: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || fail "要用 root 执行"
-for f in $NEW_FILES $NEW_UNITS; do [ -f "$SRC/$f" ] || fail "缺 $SRC/$f"; done
+for f in $NEW_FILES $NEW_UNITS rollback_guard.sh; do [ -f "$SRC/$f" ] || fail "缺 $SRC/$f"; done
+sh -n "$SRC/rollback_guard.sh" || fail "rollback_guard.sh 语法有错"
 python3 -m py_compile "$SRC/krita_guard.py" "$SRC/krita_idle_restart.py" || fail "Python 档案不能编译"
 for f in $NEW_UNITS; do cp "$SRC/$f" "/tmp/verify-$f"; done
 systemd-analyze verify /tmp/verify-krita-works-guard.service /tmp/verify-krita-idle-restart.service >/dev/null 2>&1 ||
@@ -46,28 +47,8 @@ done > "$B/status-before.txt"
 systemctl show dsh -p MainPID -p NRestarts > "$B/dsh-before.txt"
 (cd "$B" && find . -type f ! -name SHA256SUMS -exec sha256sum {} + > SHA256SUMS)
 
-cat > "$B/rollback.sh" <<EOF
-#!/bin/sh
-# 回滚到 $TS 之前的 krita-guard：旧的 guard unit 和 krita_guard.sh，移除闲置重启 timer。
-# 不重启 dsh.service；krita / krita-gate 维持现状（停着的话请手动 systemctl start krita-gate.service）。
-set -u
-B=$B
-systemctl disable --now krita-idle-restart.timer 2>/dev/null
-systemctl stop krita-idle-restart.service 2>/dev/null
-for f in $NEW_UNITS; do
-	if [ -e "\$B/units/\$f" ]; then cp -a "\$B/units/\$f" $U/\$f; else rm -f $U/\$f; fi
-done
-for f in $NEW_FILES; do
-	if [ -e "\$B/opt/\$f" ]; then cp -a "\$B/opt/\$f" $G/\$f; else rm -f $G/\$f; fi
-done
-cp -a "\$B/opt/krita_guard.sh" $G/krita_guard.sh
-systemctl daemon-reload
-# 旧 guard Requires= krita-gate：gate 停着时 restart 会把 gate 一起带起来，和旧版行为一样。
-systemctl restart krita-works-guard.service
-systemctl --no-pager status krita-works-guard.service krita-gate.service dsh.service | grep -E '^(●|     Active)'
-echo "已回滚到 $TS 之前的版本"
-EOF
-chmod 0700 "$B/rollback.sh"
+# 回滚脚本：照实回报每一步，不会把停着的 krita / krita-gate 拉起来（见 rollback_guard.sh 开头）。
+install -o root -g root -m 0700 "$SRC/rollback_guard.sh" "$B/rollback.sh"
 echo "备份：$B（回滚：sh $B/rollback.sh）"
 
 # ---- 2. 安装 ----
@@ -98,7 +79,11 @@ check() {
 }
 if ! check; then
 	echo "检查没过，自动回滚" >&2
-	sh "$B/rollback.sh"
+	if sh "$B/rollback.sh"; then
+		echo "已自动回滚（部署失败）" >&2
+	else
+		echo "自动回滚也没完成，请照上面的失败步骤手动处理（备份在 $B）" >&2
+	fi
 	exit 1
 fi
 echo "部署完成。dsh: $dsh_before（没变）"
