@@ -52,7 +52,10 @@ LEASE_TAKE = ("if (this.gatewayScopes && !await this.gatewayScopes.turn(agent,ch
 LEASE_END = ("if (scopeAgent) this.gatewayScopes?.end(scopeAgent);",
              "if (scopeAgent && this.gatewayScopes?.active.get(scopeAgent) === socialLease) this.gatewayScopes.end(scopeAgent);")
 # 背景画室：/stop 也停画室；登入后建画室，画室收下请求时告诉群聊行为处理。
-STUDIO_IMPORT = 'import { createSocialStudio, stopSocialStudio } from "dsh-social-runtime/bridge";\n'
+STUDIO_IMPORT = 'import { createSocialStudio, stopSocialStudio, noteSocialStudioDeleted } from "dsh-social-runtime/bridge";\n'
+# 请求讯息被删（含批次删除）：画室那张安静停掉，画好的图不会掉成一般群讯（第 3 轮审查）。
+STUDIO_DELETE = ('const onMessageDelete = (data) => {scopeAuthority?.noteRevoked(data);socialArchive("delete",data);};',
+                 'const onMessageDelete = (data) => {scopeAuthority?.noteRevoked(data);socialArchive("delete",data);noteSocialStudioDeleted(data);};')
 STUDIO_STOP = ("commandStop(channelId) {\n\t\tstopSocialTurns(channelId);",
                "commandStop(channelId) {\n\t\tstopSocialTurns(channelId);\n\t\tstopSocialStudio(channelId);")
 STUDIO_WIRING = '''const socialStudio = createSocialStudio({ bridges: { group: bridge, owner: ownerBridge }, rest, log: (text) => logger.info(text) });
@@ -88,6 +91,22 @@ export function createSocialStudio(options) {
 export function stopSocialStudio(channelId) {
 	return currentRuntime().studio?.stopChannel(channelId) ?? 0;
 }
+
+// 讯息被删（MESSAGE_DELETE 带 id，MESSAGE_DELETE_BULK 带 ids）：在画或排队的那张安静停掉。
+export function noteSocialStudioDeleted(data) {
+	let studio;
+	try {
+		studio = currentRuntime().studio;
+	} catch {
+		return 0; // runtime 还没就绪：没有画室，也就没有要停的。
+	}
+	if (!studio || typeof data?.channel_id !== 'string') return 0;
+	const ids = Array.isArray(data.ids) ? data.ids : [data.id];
+	let count = 0;
+	for (const id of ids)
+		if (typeof id === 'string') count += studio.requestDeleted(data.channel_id, id);
+	return count;
+}
 '''
 
 # ---- dsh-social-runtime/index.mjs：画室会话只画图，聊天会话只交代 ----
@@ -95,7 +114,8 @@ RUNTIME = [
     ('import { kritaTools, kritaGuideFor, reportKritaRoute, observeKritaScope, referenceAttachments } from "./krita-tools.mjs";',
      'import { kritaTools, kritaGuideFor, reportKritaRoute, observeKritaScope, referenceAttachments } from "./krita-tools.mjs";\n'
      'import { referenceHint as kritaReferenceHint } from "./krita-tools.mjs";\n'
-     'import { drawRequestTool, DRAW_GUIDE } from "./studio.mjs";'),
+     'import { drawRequestTool, DRAW_GUIDE } from "./studio.mjs";\n'
+     'import { socialSendOriginTool } from "./turn-guard.mjs";'),
     ('for (const tool of kritaTools(runtime)) ctx.tools.register(tool);',
      'for (const tool of kritaTools(runtime)) ctx.tools.register(tool);\n\tctx.tools.register(drawRequestTool(runtime));'),
     # 画室会话的编号（→ 它服务的聊天会话）；模型请求另外计数，画图时聊天不会被「目前有点忙」挡下。
@@ -104,10 +124,23 @@ RUNTIME = [
      'const studioCall = this.studios.has(options.sessionId);\n\t\tif (studioCall ? this.studioInFlight >= 1 : this.inFlight >= 2) {'),
     ('this.inFlight++;', 'if (studioCall) this.studioInFlight++;\n\t\telse this.inFlight++;'),
     ('this.inFlight--;', 'if (studioCall) this.studioInFlight--;\n\t\t\telse this.inFlight--;'),
+    # 画室会话只能用 krita_batch，而且不管 groupTools 是 chat 还是 full 都能用（不再往下走群聊的限制）；
+    # 聊天会话一律不能用 krita_batch（第 3 轮审查）。
     ('toolGuard(exec) {',
      "toolGuard(exec) {\n"
-     "\t\tif (this.studios.has(exec.agent?.id) && exec.name !== 'krita_batch') return '畫室只用 krita_batch 畫圖。';\n"
-     "\t\tif (exec.name === 'krita_batch' && !this.studios.has(exec.agent?.id)) return '畫圖交給背景畫室：用 draw_request 交代要畫什麼，再回一句短話；不要自己用 krita_batch。';"),
+     "\t\tif (this.studios.has(exec.agent?.id)) return exec.name === 'krita_batch' ? undefined : '畫室只用 krita_batch 畫圖。';\n"
+     "\t\tif (exec.name === 'krita_batch') return '畫圖交給背景畫室：用 draw_request 交代要畫什麼，再回一句短話；不要自己用 krita_batch。';"),
+    # 画室会话不带记忆、人物卡、相关旧讯息（群聊会话会带拥有者私讯的记忆，画室不能有）：
+    # 它只需要「画什么、回覆哪则」，都在画室收到的那则讯息里（第 3 轮审查）。
+    ("\t\t\ttext: () => {\n\t\t\t\tconst source = this.turns.get(agent.id);\n\t\t\t\t// 追問承諾時",
+     "\t\t\ttext: () => {\n\t\t\t\tif (this.studios.has(agent.id)) return '';\n\t\t\t\tconst source = this.turns.get(agent.id);\n\t\t\t\t// 追問承諾時"),
+    # 工具送讯照「发送来源」归帐：工具一开始执行就记下哪个会话、为哪则讯息在跑（第 3 轮审查）。
+    ("\n\tsourceForTurn(agent) {",
+     "\n\t// 工具执行一开始的来源：哪个会话、为哪则讯息在跑。这次执行里送出的讯息照它归帐（turn-guard.mjs），\n"
+     "\t// 不看送出时轮到谁。\n"
+     "\tsendOrigin(exec) {\n\t\tconst source = this.sourceForTurn(exec?.agent);\n"
+     "\t\treturn {\n\t\t\tsessionId: exec?.agent?.id,\n\t\t\tchannelId: source?.channelId,\n\t\t\tmessageId: source?.messageId,\n\t\t};\n\t}\n"
+     "\n\tsourceForTurn(agent) {"),
     ("exec.name !== 'remember' && exec.name !== 'krita_batch'",
      "exec.name !== 'remember' && exec.name !== 'draw_request'"),
     ("agent.ctx.systemPrompt.context({ name: 'krita-works', order: 951, interpolate: false, required: true, text: () => kritaGuideFor(this, agent) });",
@@ -124,7 +157,17 @@ KRITA = [
     # 画室画的图仍归原本的聊天会话（续改、recent 找得到以前在聊天里画的作品）。
     ("const session = agent?.session?.id;", "const session = runtime.studios?.get(agent?.id) ?? agent?.session?.id;"),
     ("\t\t\t\t\t\tconst receipt = {", "\t\t\t\t\t\tif (preview) turn.previewsSent = (turn.previewsSent ?? 0) + 1;\n\t\t\t\t\t\tconst receipt = {"),
+    # 请求那则被删了：让 Discord 拒绝（fail_if_not_exists），图不会掉成一般群讯（第 3 轮审查）。
+    ("message_id: source.messageId,\n\t\t\t\t\t\t\t\t\t\tfail_if_not_exists: false,",
+     "message_id: source.messageId,\n\t\t\t\t\t\t\t\t\t\tfail_if_not_exists: true,"),
 ]
+# 每个工具都包一层送讯来源（apply 里的 ctx.tools.register 全部换掉）。
+APPLY_START = "export async function apply(ctx, config = {}) {"
+APPLY_RUNTIME = ("\truntime = new SocialRuntime(ctx, config, engine);\n",
+                 "\truntime = new SocialRuntime(ctx, config, engine);\n"
+                 "\t// 每个工具都包一层：执行一开始记下来源，之后送出的讯息照来源归帐。\n"
+                 "\tconst registerTool = (tool) =>\n\t\tctx.tools.register(\n"
+                 "\t\t\tsocialSendOriginTool(tool, (exec) => runtime.sendOrigin(exec)),\n\t\t);\n")
 KRITA_EXPORT = '''
 // 画室用：这则请求 Krita 实际回覆了几张（正式交付、预览）。
 export function kritaDeliveries(runtime, messageId) {
@@ -146,7 +189,7 @@ def port_index(content):
     content = once(content, sp.FOLLOWUP[0], sp.FOLLOWUP[1])
     content = once(content, RELEASE_WAIT, sp.WAIT)
     for anchor, replacement in (sp.NOTICE_TICKET, SEND, COMMITMENT_REPLY, sp.TRACKED_REST, PARTICIPATION_LOG,
-                                LEASE_DECLARE, LEASE_GUARD, LEASE_TAKE, LEASE_END, STUDIO_STOP, HISTORY_GUIDE):
+                                LEASE_DECLARE, LEASE_GUARD, LEASE_TAKE, LEASE_END, STUDIO_STOP, HISTORY_GUIDE, STUDIO_DELETE):
         content = once(content, anchor, replacement)
     content = once(content, SUBSCRIBE_ANCHOR, sp.SUBSCRIBE + STUDIO_WIRING + SUBSCRIBE_ANCHOR)
     content = once(content, OLD_MESSAGE_FAILED, sp.MESSAGE_FAILED)
@@ -187,7 +230,12 @@ def port_runtime(content):
         raise ValueError("这份 release 的 index.mjs 已经移植过。")
     for anchor, replacement in RUNTIME:
         content = sp.once(content, anchor, replacement)
-    return content
+    start = content.index(APPLY_START)
+    head, body = content[:start], content[start:]
+    if body.count("ctx.tools.register(") < 5:
+        raise ValueError("现行 release 的 apply 注册工具的写法变了，须重新审阅。")
+    body = sp.once(body.replace("ctx.tools.register(", "registerTool("), *APPLY_RUNTIME)
+    return head + body
 
 
 def port_krita(content):

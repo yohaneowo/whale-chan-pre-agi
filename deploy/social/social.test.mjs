@@ -286,6 +286,70 @@ test('即使群聊曾挂完整预设，也必须在执行层拒绝所有系统�
 	assert.equal(runtime.toolGuard({ agent: owner, name: 'bash' }), undefined);
 });
 
+test('工具送讯来源：工具一开始执行时取宿主核对过的本轮来源，之后送出的讯息照它归帐', async (t) => {
+	const { socialSendOriginTool, trackSocialSends } =
+		await import('./turn-guard.mjs');
+	const { runtime, group } = fixture(t);
+	const turnOf = (id) => [
+		{
+			type: 'user/message',
+			data: {
+				source: {
+					kind: 'user',
+					discordMessageId: id,
+					discordChannelId: '1000000000000000003',
+				},
+			},
+		},
+	];
+	for (const id of ['1000000000000000101', '1000000000000000102'])
+		runtime.ingress.set(id, {
+			authorId: 'member',
+			messageId: id,
+			channelId: '1000000000000000003',
+			guildId: 'guild',
+			at: Date.now(),
+			text: '',
+		});
+	group.session.snapshotEvents = () => turnOf('1000000000000000101');
+	assert.deepEqual(runtime.sendOrigin({ agent: group }), {
+		sessionId: 'group-agent',
+		channelId: '1000000000000000003',
+		messageId: '1000000000000000101',
+	});
+	const sent = [];
+	const rest = trackSocialSends(
+		{ request: async () => ({ id: '1' }) },
+		(channelId, messageId) => sent.push(messageId),
+	);
+	let go;
+	const ready = new Promise((resolve) => (go = resolve));
+	const tool = socialSendOriginTool(
+		{
+			name: 'discord_send_message',
+			execute: async () => {
+				await ready;
+				return rest.request('POST', '/channels/1000000000000000003/messages', {
+					content: 'a',
+				});
+			},
+		},
+		(exec) => runtime.sendOrigin(exec),
+	);
+	const pending = tool.execute({}, { agent: group });
+	// 工具还没送出就轮到下一则：仍算开始执行时的那一则。
+	group.session.snapshotEvents = () => turnOf('1000000000000000102');
+	go();
+	await pending;
+	assert.deepEqual(sent, ['1000000000000000101']);
+	// 没有可核对来源的会话（网页）：不归给任何一则。
+	const web = {
+		...group,
+		session: { ...group.session, snapshotEvents: () => [] },
+	};
+	assert.equal(runtime.sendOrigin({ agent: web }).messageId, undefined);
+});
+
 test('工具来源从桥接身份取得，模型参数不能伪造作者或跨范围绑定', async (t) => {
 	const { runtime, group, owner, contexts } = fixture(t);
 	const message = {
@@ -3320,7 +3384,7 @@ test('自动续做重用同一个 Discord ID：等待与取回答都只认这次
 });
 
 test('runSocialTurn：「正在输入」任何情况都熄灯，期限到了不等卡住的 I/O', async () => {
-	const { runSocialTurn, socialBounded, TURN_DEADLINE_NOTICE, activeSocialTurn, trackSocialSends } =
+	const { runSocialTurn, socialBounded, TURN_DEADLINE_NOTICE, activeSocialTurn, trackSocialSends, runWithSocialSendOrigin } =
 		await import('./bridge.mjs');
 	const timers = [];
 	const timer = (run, ms) => {
@@ -3372,16 +3436,20 @@ test('runSocialTurn：「正在输入」任何情况都熄灯，期限到了不�
 	);
 	assert.equal(lit, 0);
 
-	// 工具送讯记到此刻正在跑的那则讯息名下；别的频道、没在跑的都不记。
+	// 工具送讯记到工具执行时记下的那则讯息名下；别的频道、typing、没有来源的（就算此刻有一轮在跑）都不记。
 	const sent = [];
 	const rest = trackSocialSends(
 		{ request: async (method, path) => ({ id: path.includes('typing') ? undefined : 's1' }) },
 		(channelId, messageId, id) => sent.push([channelId, messageId, id]),
 	);
+	const origin = { sessionId: 'chat', channelId: '42', messageId: 'm4' };
 	await runSocialTurn({ channelId: '42', messageId: 'm4', beginTyping, timer }, async () => {
+		await runWithSocialSendOrigin(origin, async () => {
+			await rest.request('POST', '/channels/42/messages', {});
+			await rest.request('POST', '/channels/43/messages', {});
+			await rest.request('POST', '/channels/42/typing');
+		});
 		await rest.request('POST', '/channels/42/messages', {});
-		await rest.request('POST', '/channels/43/messages', {});
-		await rest.request('POST', '/channels/42/typing');
 		return { chunks: [], files: [] };
 	});
 	await rest.request('POST', '/channels/42/messages', {});

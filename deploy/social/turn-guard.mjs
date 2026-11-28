@@ -2,6 +2,7 @@
 // 桥接按频道串行 runPrompt，但送讯在串行之外；这里不靠「最早还没结束的那轮」这类顺序假设。
 // 同一则讯息自动续做（「我看看」之后再给一轮）时，期限与停止讯号沿用第一轮的，不重新计时。
 // 画图不在这里：聊天回合只交代给背景画室（studio.mjs），几秒就结束。
+import { AsyncLocalStorage } from 'node:async_hooks';
 import process from 'node:process';
 import {
 	clearInterval,
@@ -156,10 +157,36 @@ function referenceOf(body, form) {
 	return /^\d{16,22}$/.test(String(id ?? '')) ? String(id) : undefined;
 }
 
+// 工具送讯的来源：工具一开始执行就记下「哪个会话、为哪则讯息」在跑（runtime 在注册工具时包上），
+// 之后这次执行里送出的讯息，不管拖到什么时候才真的送出，都认这个来源。
+const sendOrigin = new AsyncLocalStorage();
+
+export function runWithSocialSendOrigin(origin, run) {
+	return sendOrigin.run(origin ?? {}, run);
+}
+
+// runtime 注册工具时包一层：originOf(exec) 回传 { sessionId, channelId, messageId }（取自宿主核对过的本轮来源）。
+export function socialSendOriginTool(tool, originOf) {
+	return {
+		...tool,
+		execute(args, exec) {
+			let origin;
+			try {
+				origin = originOf(exec);
+			} catch {
+				origin = undefined;
+			}
+			return runWithSocialSendOrigin(origin, () =>
+				tool.execute.call(tool, args, exec),
+			);
+		},
+	};
+}
+
 // 工具（discord_send_message、Krita 的预览与交付）用的 REST：送到某频道成功时记帐。
-// 归给谁看「是哪则讯息送出的」：挂了回复就是被回复的那则；没挂回复时，只有送出前后
-// 桥接都在跑同一则才算它的（A 的工具晚送达、那时已经轮到 B，不会算给 B）。
-// 桥接自己的送讯不经过这里，另外凭 ticket 记帐。
+// 归给谁看「是哪则讯息送出的」：挂了回复就是被回复的那则；没挂回复时，看这次工具执行一开始记下的来源
+// （同一个频道才算）。不看送出时桥接正在跑哪一轮：A 的工具拖到 B 那轮才送出，仍然算 A 的。
+// 没有来源、也没挂回复的送讯不归给任何一则。桥接自己的送讯不经过这里，另外凭 ticket 记帐。
 export function trackSocialSends(rest, onSent) {
 	return new Proxy(rest, {
 		get(target, key, receiver) {
@@ -168,13 +195,14 @@ export function trackSocialSends(rest, onSent) {
 				const channelId =
 					method === 'POST' &&
 					/^\/channels\/(\d+)\/messages$/.exec(String(path))?.[1];
-				const before = channelId && active.get(channelId);
+				const origin = channelId ? sendOrigin.getStore() : undefined;
 				const result = await target.request(method, path, body, form, ...rest);
 				if (!channelId || !result?.id) return result;
-				const after = active.get(channelId);
 				const messageId =
 					referenceOf(body, form) ??
-					(before && before === after ? before : undefined);
+					(origin?.messageId && String(origin.channelId) === channelId
+						? String(origin.messageId)
+						: undefined);
 				if (messageId)
 					try {
 						onSent(channelId, messageId, String(result.id));

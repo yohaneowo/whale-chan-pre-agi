@@ -16,8 +16,10 @@ const { AbortController } = globalThis;
 // 一张图最多画多久。VM 上 25 个作画回合：p50 184 秒、p90 481 秒、最长 497 秒；
 // 10 分钟涵盖全部，又不会让一张卡住的图占着画室太久。DISCORD_DRAW_DEADLINE_MS 可调。
 export const DEFAULT_DRAW_DEADLINE_MS = 600_000;
-// 期限到了以后给画室会话自己收尾（取消、写 turn/end）的时间；再久就不等，换下一张。
+// 期限到（或被叫停）以后给画室会话自己收尾（取消、写 turn/end）的时间；再久就不等，换下一张。
 const DRAW_GRACE_MS = 30_000;
+// 没画成时回一句短话最多等多久；Discord 一直不回就不等了（只记日志），换下一张。
+const NOTIFY_TIMEOUT_MS = 30_000;
 // 排队的上限（不含正在画的那张）：再多就请对方晚点再叫。
 const MAX_WAITING = 3;
 
@@ -56,6 +58,7 @@ export class Studio {
 		timer = defaultTimer,
 		deadlineMs = drawDeadlineMs(),
 		graceMs = DRAW_GRACE_MS,
+		notifyTimeoutMs = NOTIFY_TIMEOUT_MS,
 		maxWaiting = MAX_WAITING,
 	}) {
 		this.run = run;
@@ -65,7 +68,10 @@ export class Studio {
 		this.timer = timer;
 		this.deadlineMs = deadlineMs;
 		this.graceMs = graceMs;
+		this.notifyTimeoutMs = notifyTimeoutMs;
 		this.maxWaiting = maxWaiting;
+		// 已经被删掉的请求讯息（「频道:讯息」）：之后才交代的也不画。
+		this.deleted = new Set();
 		this.running = undefined;
 		this.waiting = [];
 		this.listeners = new Set();
@@ -123,6 +129,10 @@ export class Studio {
 			!job.brief
 		)
 			return { status: 'invalid' };
+		if (this.deleted.has(`${job.channelId}:${job.messageId}`)) {
+			this.log(`畫室 收到 #${job.messageId} status=deleted`);
+			return { status: 'deleted' };
+		}
 		const mine = (other) =>
 			other.channelId === job.channelId && other.authorId === job.authorId;
 		const waiting = this.waiting.findIndex(mine);
@@ -165,6 +175,20 @@ export class Studio {
 			job.channelId === String(channelId) &&
 			(owner || job.authorId === String(authorId));
 		return this.drop(match, 'cancelled');
+	}
+
+	// 请求的那则讯息被删了：这张不画了，也不补话（回覆对象已经不在，不贴成一般讯息）。
+	requestDeleted(channelId, messageId) {
+		const key = `${channelId}:${messageId}`;
+		this.deleted.add(key);
+		if (this.deleted.size > 256)
+			this.deleted.delete(this.deleted.values().next().value);
+		return this.drop(
+			(job) =>
+				job.channelId === String(channelId) &&
+				job.messageId === String(messageId),
+			'deleted',
+		);
 	}
 
 	// /stop：这个频道的画图全部停掉，不再补话。
@@ -215,6 +239,31 @@ export class Studio {
 		return this.idle;
 	}
 
+	// 没画成时回一句短话：有期限，Discord 一直不回就放弃（只记日志），不卡住画室。
+	async sendNote(job, text) {
+		const controller = new AbortController();
+		let cancel = () => {};
+		const late = new Promise((resolve) => {
+			cancel = this.timer(() => {
+				controller.abort();
+				resolve('timeout');
+			}, this.notifyTimeoutMs);
+		});
+		try {
+			return await Promise.race([
+				Promise.resolve()
+					.then(() => this.notify(job, text, controller.signal))
+					.then(
+						() => 'sent',
+						() => 'send-failed',
+					),
+				late,
+			]);
+		} finally {
+			cancel();
+		}
+	}
+
 	async draw(job) {
 		job.controller = new AbortController();
 		const started = this.now();
@@ -228,19 +277,25 @@ export class Studio {
 		});
 		let timedOut = false;
 		let cancelGrace = () => {};
-		// 期限到先发取消信号；画室会话再不回来就放弃它，换下一张（不让一张图卡死画室）。
+		// 每一段等待都有期限：期限到先发取消信号；被叫停（取消、/stop、请求被删）也一样。
+		// 发出取消以后画室会话再不回来就放弃它，换下一张（不让一张图卡死画室）。
 		const abandoned = new Promise((resolve) => {
-			const cancelDeadline = this.timer(() => {
-				timedOut = true;
-				job.controller.abort();
+			const giveUp = () => {
+				cancelGrace();
 				cancelGrace = this.timer(
 					() => resolve({ delivered: 'none', status: 'abandoned' }),
 					this.graceMs,
 				);
+			};
+			const cancelDeadline = this.timer(() => {
+				timedOut = !job.cancelled;
+				job.controller.abort();
 			}, this.deadlineMs);
+			job.controller.signal.addEventListener('abort', giveUp, { once: true });
 			job.clearTimers = () => {
 				cancelDeadline();
 				cancelGrace();
+				job.controller.signal.removeEventListener('abort', giveUp);
 			};
 		});
 		let result;
@@ -271,13 +326,7 @@ export class Studio {
 			text = timedOut ? STUDIO_TEXT.timeout : STUDIO_TEXT.failed;
 		}
 		let note = 'none';
-		if (text)
-			try {
-				await this.notify(job, text);
-				note = 'sent';
-			} catch {
-				note = 'send-failed';
-			}
+		if (text) note = await this.sendNote(job, text);
 		this.log(
 			`畫室 结果 #${job.messageId} status=${outcome} turn=${result?.status ?? 'none'} note=${note} secs=${Math.round((this.now() - started) / 1000)}`,
 		);
@@ -415,6 +464,8 @@ export function drawRequestTool(runtime) {
 					source.referenceAttachments?.map(({ id }) => id),
 			});
 			if (result.status === 'invalid') return NO('brief 要寫清楚要畫什麼。');
+			if (result.status === 'deleted')
+				return OK('對方那則請求已經刪掉了，不畫；這輪不用回話。');
 			if (result.status === 'full')
 				return OK(`畫室排滿了。照這句回對方：「${STUDIO_TEXT.full}」`);
 			if (result.status === 'queued')
@@ -512,11 +563,21 @@ export function connectStudio({
 				throw error;
 			}
 		},
-		notify: async (job, text) =>
-			rest.createMessage(
-				job.channelId,
-				job.guildId ? await toGroupText(text) : text,
-				job.messageId,
+		// 回覆原本那则；那则已经被删就让 Discord 拒绝（fail_if_not_exists），不贴成一般讯息。
+		notify: async (job, text, signal) =>
+			rest.request(
+				'POST',
+				`/channels/${job.channelId}/messages`,
+				{
+					content: job.guildId ? await toGroupText(text) : text,
+					allowed_mentions: { parse: [] },
+					message_reference: {
+						message_id: job.messageId,
+						fail_if_not_exists: true,
+					},
+				},
+				undefined,
+				signal,
 			),
 		log,
 		...options,

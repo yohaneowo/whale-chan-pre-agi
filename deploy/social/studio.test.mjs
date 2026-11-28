@@ -2,6 +2,7 @@
 // 画室：同一时间只画一张、其余排队并告知、失败或超时回一句、/stop 与取消、
 // draw_request 只认宿主核对过的本轮来源；turn-guard：同一则讯息共用期限与停止讯号、
 // 工具送讯照「是哪则讯息送出的」记帐、「正在输入」熄灯后不重送。
+// 第 3 轮审查：每一段等待都有期限、请求被删时安静停掉且不贴成一般群讯、工具送讯照发送来源归帐。
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -326,7 +327,16 @@ test('connectStudio：画室会话先登记再建立、每个聊天会话一个�
 	const studio = connectStudio({
 		runtime,
 		bridges: { group: bridge, owner: bridge },
-		rest: { createMessage: async (...args) => posted.push(args) },
+		rest: {
+			request: async (method, path, body, form, signal) =>
+				posted.push([
+					method,
+					path,
+					body,
+					form,
+					signal instanceof globalThis.AbortSignal,
+				]),
+		},
 		toGroupText: async (text) => text + '（繁）',
 		deliveries: () => ({ final, previews: 0 }),
 		timer: manualTimers().timer,
@@ -349,8 +359,20 @@ test('connectStudio：画室会话先登记再建立、每个聊天会话一个�
 	);
 	const prompt = created.length && runtime.studios.get(created[0].sessionId);
 	assert.equal(prompt, 'session-chat');
-	// 第二张 Krita 没交付：回覆原本那则，群聊转繁体。
-	assert.deepEqual(posted, [[ids(1), STUDIO_TEXT.failed + '（繁）', ids(102)]]);
+	// 第二张 Krita 没交付：回覆原本那则，群聊转繁体；那则被删了就让 Discord 拒绝，不掉成一般群讯。
+	assert.deepEqual(posted, [
+		[
+			'POST',
+			`/channels/${ids(1)}/messages`,
+			{
+				content: STUDIO_TEXT.failed + '（繁）',
+				allowed_mentions: { parse: [] },
+				message_reference: { message_id: ids(102), fail_if_not_exists: true },
+			},
+			undefined,
+			true,
+		],
+	]);
 });
 
 test('同一则讯息自动续做：期限与停止讯号沿用第一轮，不重新计时', async () => {
@@ -473,8 +495,9 @@ test('/stop：正在跑与已经排进队列的讯息都停，不再送答；之
 	assert.deepEqual(later.chunks, ['好']);
 });
 
-test('工具送讯照「是哪则讯息送出的」记帐：挂回复算被回复的那则；A 晚送达、那时在跑 B，不算给 B', async () => {
-	const { runSocialTurn, trackSocialSends } = await import('./turn-guard.mjs');
+test('工具送讯照「是哪则讯息送出的」记帐：挂回复算被回复的那则；没挂回复看工具执行时记下的来源', async () => {
+	const { runSocialTurn, runWithSocialSendOrigin, trackSocialSends } =
+		await import('./turn-guard.mjs');
 	const timers = manualTimers();
 	const beginTyping = () => () => {};
 	const sent = [];
@@ -489,11 +512,18 @@ test('工具送讯照「是哪则讯息送出的」记帐：挂回复算被回�
 		},
 		(channelId, messageId) => sent.push([channelId, messageId]),
 	);
+	const origin = (messageId) => ({
+		sessionId: 'chat',
+		channelId: '51',
+		messageId,
+	});
 	let late;
 	await runSocialTurn(
 		{ channelId: '51', messageId: 'A', beginTyping, timer: timers.timer },
 		async () => {
-			late = rest.request('POST', '/channels/51/messages', { content: 'slow' });
+			late = runWithSocialSendOrigin(origin('A'), () =>
+				rest.request('POST', '/channels/51/messages', { content: 'slow' }),
+			);
 			return { chunks: [], files: [] };
 		},
 	);
@@ -502,7 +532,7 @@ test('工具送讯照「是哪则讯息送出的」记帐：挂回复算被回�
 		async () => {
 			release();
 			await late;
-			// 挂了回复（Krita 交付）：算被回复的那则，不管此刻在跑谁。
+			// 挂了回复（Krita 交付）：算被回复的那则，不管来源是谁。
 			const form = new globalThis.FormData();
 			form.append(
 				'payload_json',
@@ -510,15 +540,90 @@ test('工具送讯照「是哪则讯息送出的」记帐：挂回复算被回�
 					message_reference: { message_id: '1000000000000000042' },
 				}),
 			);
-			await rest.request('POST', '/channels/51/messages', {}, form);
-			await rest.request('POST', '/channels/51/messages', { content: 'b' });
+			await runWithSocialSendOrigin(origin('B'), () =>
+				rest.request('POST', '/channels/51/messages', {}, form),
+			);
+			await runWithSocialSendOrigin(origin('B'), () =>
+				rest.request('POST', '/channels/51/messages', { content: 'b' }),
+			);
+			// 没有来源、也没挂回复（不是工具送的）：不归给此刻在跑的 B。
+			await rest.request('POST', '/channels/51/messages', { content: '?' });
+			// 来源是别的频道：不算。
+			await runWithSocialSendOrigin(
+				{ sessionId: 'chat', channelId: '99', messageId: 'B' },
+				() => rest.request('POST', '/channels/51/messages', { content: 'x' }),
+			);
 			return { chunks: [], files: [] };
 		},
 	);
 	assert.deepEqual(sent, [
+		['51', 'A'],
 		['51', '1000000000000000042'],
 		['51', 'B'],
 	]);
+});
+
+test('A 的工具跨轮才发出、没挂回复：照发送来源算给 A，不算给此刻在跑的 B（第 3 轮审查）', async () => {
+	const { runSocialTurn, socialSendOriginTool, trackSocialSends } =
+		await import('./turn-guard.mjs');
+	const timers = manualTimers();
+	const sent = [];
+	const rest = trackSocialSends(
+		{ request: async () => ({ id: 'sent-1' }) },
+		(channelId, messageId) => sent.push(messageId),
+	);
+	// runtime 注册工具时包的那一层：执行一开始问宿主「现在在跑哪则」。
+	let current = 'A';
+	let go;
+	const ready = new Promise((resolve) => (go = resolve));
+	const tool = socialSendOriginTool(
+		{
+			name: 'discord_send_message',
+			async execute(args, exec) {
+				assert.equal(this.name, 'discord_send_message', '保留原本的 this');
+				assert.equal(exec.agent.id, 'chat');
+				await ready;
+				return rest.request('POST', '/channels/51/messages', {
+					content: args.content,
+				});
+			},
+		},
+		(exec) => ({
+			sessionId: exec.agent.id,
+			channelId: '51',
+			messageId: current,
+		}),
+	);
+	const pending = tool.execute({ content: '工具A' }, { agent: { id: 'chat' } });
+	current = 'B';
+	await runSocialTurn(
+		{
+			channelId: '51',
+			messageId: 'B',
+			beginTyping: () => () => {},
+			timer: timers.timer,
+		},
+		async () => {
+			// 送出那一刻桥接在跑 B（送出前后都是 B）。
+			go();
+			await pending;
+			return { chunks: [], files: [] };
+		},
+	);
+	assert.deepEqual(sent, ['A']);
+	// 来源取不到（宿主出错）也照常执行，只是不归给任何一则。
+	const broken = socialSendOriginTool(
+		{
+			name: 't',
+			execute: () =>
+				rest.request('POST', '/channels/51/messages', { content: 'y' }),
+		},
+		() => {
+			throw new Error('坏了');
+		},
+	);
+	await broken.execute({}, { agent: { id: 'chat' } });
+	assert.deepEqual(sent, ['A']);
 });
 
 test('「正在输入」：熄灯后不再送，送到一半的也取消；不在 REST 里等限流重送', async () => {
@@ -588,4 +693,159 @@ test('画室判断不该画（最后回「不畫」）：照实说不画，不�
 	await flush(20);
 	await studio.idle;
 	assert.deepEqual(notes, [STUDIO_TEXT.declined]);
+});
+
+test('画室：补的那句一直送不出去也有期限，到了就放弃（只记日志），下一张照画（第 3 轮审查）', async () => {
+	const { Studio, STUDIO_TEXT } = await import('./studio.mjs');
+	const timers = manualTimers();
+	const logs = [];
+	const runs = [];
+	const signals = [];
+	const studio = new Studio({
+		run: (item) =>
+			new Promise((resolve) => {
+				runs.push(item.messageId);
+				resolve(
+					runs.length === 1
+						? { delivered: 'none', status: 'settled' }
+						: { delivered: 'final', status: 'answered' },
+				);
+			}),
+		// Discord 一直不回。
+		notify: (item, text, signal) => {
+			assert.equal(text, STUDIO_TEXT.failed);
+			signals.push(signal);
+			return new Promise(() => {});
+		},
+		timer: timers.timer,
+		notifyTimeoutMs: 45_000,
+		log: (line) => logs.push(line),
+	});
+	studio.request(job(1));
+	studio.request(job(2));
+	await flush(30);
+	assert.deepEqual(runs, [ids(101)], '补话还没放弃前，下一张还没开始');
+	timers.fire(45_000);
+	await flush(30);
+	await studio.idle;
+	assert.equal(signals[0].aborted, true, '放弃时也取消送到一半的请求');
+	assert.deepEqual(runs, [ids(101), ids(102)], '补话卡住不影响下一张');
+	assert.ok(
+		logs.some((line) =>
+			line.startsWith(
+				`畫室 结果 #${ids(101)} status=failed turn=settled note=timeout `,
+			),
+		),
+	);
+});
+
+test('画室：叫停（取消、/stop）后画室会话不回来，等一段收尾时间就换下一张，不等到画图期限', async () => {
+	const { Studio } = await import('./studio.mjs');
+	const timers = manualTimers();
+	const runs = [];
+	const studio = new Studio({
+		// 完全不理取消信号的画室会话。
+		run: (item) => {
+			runs.push(item.messageId);
+			return runs.length === 1
+				? new Promise(() => {})
+				: Promise.resolve({ delivered: 'final' });
+		},
+		notify: async () => assert.fail('叫停的不补话'),
+		timer: timers.timer,
+		deadlineMs: 600_000,
+		graceMs: 30_000,
+	});
+	studio.request(job(1));
+	studio.request(job(2));
+	await flush(20);
+	assert.equal(studio.cancel({ channelId: ids(1), authorId: ids(201) }), 1);
+	await flush(20);
+	assert.deepEqual(runs, [ids(101)]);
+	timers.fire(30_000);
+	await flush(30);
+	await studio.idle;
+	assert.deepEqual(runs, [ids(101), ids(102)]);
+	assert.equal(
+		timers.rows.some((row) => row.ms === 600_000 && !row.cleared),
+		false,
+		'换下一张时清掉上一张的期限',
+	);
+});
+
+test('画室：请求那则被删了，正在画的与排队的都安静停掉；之后再交代同一则也不画（第 3 轮审查）', async () => {
+	const { Studio, drawRequestTool } = await import('./studio.mjs');
+	const runs = [];
+	const notes = [];
+	const logs = [];
+	const studio = new Studio({
+		run: (item, signal) =>
+			new Promise((resolve) => {
+				runs.push({ item, signal });
+				signal.addEventListener('abort', () =>
+					resolve({ delivered: 'none', status: 'cancelled' }),
+				);
+			}),
+		notify: async (item, text) => notes.push(text),
+		timer: manualTimers().timer,
+		log: (line) => logs.push(line),
+	});
+	studio.request(job(1));
+	studio.request(job(2));
+	studio.request(job(3));
+	await flush(20);
+	// 排队中的 2 号被删：拿掉，不补话。
+	assert.equal(studio.requestDeleted(ids(1), ids(102)), 1);
+	assert.deepEqual(
+		studio.waiting.map((item) => item.messageId),
+		[ids(103)],
+	);
+	// 正在画的 1 号被删：发出取消，不补话。
+	assert.equal(studio.requestDeleted(ids(1), ids(101)), 1);
+	assert.equal(runs[0].signal.aborted, true);
+	await flush(20);
+	assert.equal(runs[1]?.item.messageId, ids(103), '换下一张');
+	studio.stop(runs[1].item, 'stopped');
+	await flush(20);
+	await studio.idle;
+	assert.deepEqual(notes, []);
+	assert.ok(
+		logs.some(
+			(line) => line === `畫室 结果 #${ids(102)} status=deleted secs=0`,
+		),
+	);
+	assert.ok(
+		logs.some((line) =>
+			line.startsWith(`畫室 结果 #${ids(101)} status=deleted `),
+		),
+	);
+	// 别的频道没有这则：不受影响；已经删掉的那则再交代就不收，别的频道同一个 ID 照常收。
+	assert.equal(studio.requestDeleted(ids(9), ids(101)), 0);
+	assert.equal(studio.request(job(1)).status, 'deleted');
+	assert.equal(studio.request(job(1, { channelId: ids(8) })).status, 'started');
+	// draw_request 照实告诉她不用回话。
+	const source = {
+		messageId: ids(104),
+		channelId: ids(1),
+		guildId: ids(2),
+		authorId: ids(204),
+		authorName: '阿明',
+	};
+	const agent = {
+		id: 'chat',
+		session: { id: 'session-chat' },
+	};
+	const runtime = {
+		studio,
+		studios: new Map(),
+		turns: new Map([['chat', source]]),
+		sourceForTurn: () => source,
+	};
+	studio.requestDeleted(ids(1), ids(104));
+	const result = await drawRequestTool(runtime).execute(
+		{ action: 'start', brief: '畫貓' },
+		{ agent },
+	);
+	assert.equal(result.ok, true);
+	assert.match(result.message, /刪掉了/);
 });

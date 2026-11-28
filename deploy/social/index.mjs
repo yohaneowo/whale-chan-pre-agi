@@ -38,6 +38,7 @@ import {
 import { TokenLedger } from './ledger.mjs';
 import { UsageLog, callKind } from './usage-log.mjs';
 import { Feedings } from './feedings.mjs';
+import { socialSendOriginTool } from './turn-guard.mjs';
 
 export const name = 'social-runtime';
 // 所有服务器、所有频道的群聊共用一份记忆：她是同一个人，在 A 频道听到的事到 B 频道也记得。
@@ -508,6 +509,17 @@ export class SocialRuntime {
 			exec.name !== 'remember'
 			? '群聊会话只允许聊天和记忆，系统操作请由拥有者在私人管理会话提出。'
 			: undefined;
+	}
+
+	// 工具执行一开始的来源：哪个会话、为哪则讯息在跑。这次执行里送出的讯息照它归帐（turn-guard.mjs），
+	// 不看送出时轮到谁。
+	sendOrigin(exec) {
+		const source = this.sourceForTurn(exec?.agent);
+		return {
+			sessionId: exec?.agent?.id,
+			channelId: source?.channelId,
+			messageId: source?.messageId,
+		};
 	}
 
 	sourceForTurn(agent) {
@@ -1390,15 +1402,20 @@ export class SocialRuntime {
 export async function apply(ctx, config = {}) {
 	const engine = await import('dsh-fish-memory');
 	runtime = new SocialRuntime(ctx, config, engine);
-	ctx.tools.register(runtime.rememberTool());
+	// 每个工具都包一层：执行一开始记下来源，之后送出的讯息照来源归帐。
+	const registerTool = (tool) =>
+		ctx.tools.register(
+			socialSendOriginTool(tool, (exec) => runtime.sendOrigin(exec)),
+		);
+	registerTool(runtime.rememberTool());
 	// bridge.mjs 静态引用本档，这里改用动态载入避免循环。
 	const { toGroupText, redactSecrets, toSimplifiedText, simplifiedNow } =
 		await import('./bridge.mjs');
 	for (const tool of discordTools(runtime, toGroupText, redactSecrets))
-		ctx.tools.register(tool);
-	for (const tool of chatTools(runtime)) ctx.tools.register(tool);
-	for (const tool of gifTools(runtime)) ctx.tools.register(tool);
-	for (const tool of balanceTools(runtime)) ctx.tools.register(tool);
+		registerTool(tool);
+	for (const tool of chatTools(runtime)) registerTool(tool);
+	for (const tool of gifTools(runtime)) registerTool(tool);
+	for (const tool of balanceTools(runtime)) registerTool(tool);
 	// 先载入繁转简字典，梗图拦截（同步）才用得到。
 	await toSimplifiedText('');
 	runtime.simplify = simplifiedNow;

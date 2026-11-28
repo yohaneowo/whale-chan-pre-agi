@@ -25,7 +25,8 @@ def fake_release():
     anchors = [anchor for anchor, _ in sp.LIFECYCLE]
     anchors += [sp.FOLLOWUP[0], port.RELEASE_WAIT, sp.NOTICE_TICKET[0], port.RELEASE_SEND, port.COMMITMENT_REPLY[0],
                 sp.TRACKED_REST[0], port.PARTICIPATION_LOG[0], port.LEASE_DECLARE[0], LEASE_BLOCK,
-                port.LEASE_END[0], port.HISTORY_GUIDE[0], port.SUBSCRIBE_ANCHOR, port.OLD_MESSAGE_FAILED, port.OLD_EDIT_FAILED]
+                port.LEASE_END[0], port.HISTORY_GUIDE[0], port.SUBSCRIBE_ANCHOR, port.OLD_MESSAGE_FAILED, port.OLD_EDIT_FAILED,
+                port.STUDIO_DELETE[0]]
     kept = [k for k in KEPT if k not in ("this.gatewayScopes.turn(agent,channelId,messageId)",
                                          "recordSocialCommitment(message, sent,", "tools.referenceHint(")]
     return "\n/*--*/\n".join(anchors + kept) + "\n"
@@ -67,6 +68,14 @@ class PortIndexTests(unittest.TestCase):
         # 闸道附上的工具说明：聊天会话改成交给画室。
         self.assertIn(".DRAW_GUIDE+tools.referenceHint(", ported)
 
+    def test_round_three_deleted_request_stops_the_studio(self):
+        ported = port.port_index(fake_release())
+        # 讯息被删（含批次删除）：通知画室安静停掉那张，图不会掉成一般群讯。
+        self.assertIn('socialArchive("delete",data);noteSocialStudioDeleted(data);};', ported)
+        self.assertIn("noteSocialStudioDeleted }", port.STUDIO_IMPORT)
+        self.assertIn("export function noteSocialStudioDeleted(data) {", port.BRIDGE_EXPORT)
+        self.assertIn("data.ids", port.BRIDGE_EXPORT)
+
     def test_drift_or_second_run_is_refused(self):
         with self.assertRaises(ValueError):
             port.port_index(fake_release().replace(port.RELEASE_WAIT, "await agent.whenIdle();"))
@@ -78,20 +87,37 @@ class PortIndexTests(unittest.TestCase):
 
 class RuntimeAndKritaTests(unittest.TestCase):
     def fake_runtime(self):
-        return "\n/*--*/\n".join(anchor for anchor, _ in port.RUNTIME) + "\n"
+        # apply 里注册工具（现行 release 有 8 处）：这里放在 apply 里，加上几处其他工具。
+        return (port.APPLY_START + "\n" + port.APPLY_RUNTIME[0]
+                + "\n/*--*/\n".join(anchor for anchor, _ in port.RUNTIME)
+                + "\n" + "\tctx.tools.register(other);\n" * 3)
 
     def test_studio_sessions_only_draw_and_chat_sessions_only_hand_off(self):
         ported = port.port_runtime(self.fake_runtime())
-        self.assertIn("ctx.tools.register(drawRequestTool(runtime));", ported)
+        self.assertIn("registerTool(drawRequestTool(runtime));", ported)
         self.assertIn("agent.ctx.tools.restrict({ allow: ['krita_batch'] });", ported)
         self.assertIn("allow: ['remember', 'chat_search', 'chat_open', 'draw_request'],", ported)
         self.assertNotIn("'chat_open', 'krita_batch'", ported)
-        self.assertIn("exec.name === 'krita_batch' && !this.studios.has(exec.agent?.id)", ported)
+        self.assertIn("if (exec.name === 'krita_batch') return '畫圖交給背景畫室", ported)
         # 画室的模型请求另外计数：画图时聊天不会被「目前有点忙」挡下。
         self.assertIn("studioCall ? this.studioInFlight >= 1 : this.inFlight >= 2", ported)
         self.assertIn("if (studioCall) this.studioInFlight++;\n\t\telse this.inFlight++;", ported)
         with self.assertRaises(ValueError):
             port.port_runtime(ported)
+
+    def test_round_three_studio_tools_privacy_and_send_origin(self):
+        ported = port.port_runtime(self.fake_runtime())
+        # 画室会话不管 groupTools 是 chat 还是 full 都能用 krita_batch，其余一律挡；不往下走群聊的限制。
+        self.assertIn("if (this.studios.has(exec.agent?.id)) return exec.name === 'krita_batch' ? undefined : '畫室只用 krita_batch 畫圖。';", ported)
+        # 画室会话不带记忆、人物卡与相关旧讯息（群聊会话会带拥有者私讯的记忆）。
+        self.assertIn("text: () => {\n\t\t\t\tif (this.studios.has(agent.id)) return '';", ported)
+        # 每个工具都包上送讯来源；apply 里只剩 registerTool 那一处直接注册。
+        self.assertIn("sendOrigin(exec) {", ported)
+        self.assertIn("socialSendOriginTool(tool, (exec) => runtime.sendOrigin(exec))", ported)
+        self.assertEqual(ported.count("ctx.tools.register("), 1)
+        self.assertIn('import { socialSendOriginTool } from "./turn-guard.mjs";', ported)
+        with self.assertRaises(ValueError):
+            port.port_runtime(self.fake_runtime().replace("\tctx.tools.register(other);\n" * 3, ""))
 
     def test_krita_works_stay_with_the_chat_session_and_deliveries_are_counted(self):
         fake = "\n".join(anchor for anchor, _ in port.KRITA) + "\n"
@@ -99,6 +125,9 @@ class RuntimeAndKritaTests(unittest.TestCase):
         self.assertIn("const session = runtime.studios?.get(agent?.id) ?? agent?.session?.id;", ported)
         self.assertIn("turn.previewsSent = (turn.previewsSent ?? 0) + 1;", ported)
         self.assertIn("export function kritaDeliveries(runtime, messageId) {", ported)
+        # 请求那则被删了：Discord 拒绝，不掉成一般群讯。
+        self.assertIn("fail_if_not_exists: true,", ported)
+        self.assertNotIn("fail_if_not_exists: false", ported)
         with self.assertRaises(ValueError):
             port.port_krita(ported)
 

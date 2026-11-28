@@ -449,7 +449,7 @@ export class NaturalParticipation {
 	}
 
 	// 工具（discord_send_message、Krita 预览／交付）在这一轮里送到频道的讯息，
-	// 由 turn-guard 按「桥接此刻在跑哪一则」记到那则呼叫名下。
+	// 由 turn-guard 按「是哪则讯息送出的」（挂的回复或工具执行时记下的来源）记到那则呼叫名下。
 	recordToolMessage(channelId, messageId) {
 		const call = this.calls.get(String(messageId));
 		if (call && call.channelId === String(channelId)) call.tool++;

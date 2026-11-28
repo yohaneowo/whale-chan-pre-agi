@@ -1,5 +1,6 @@
 // 重现并验收 2026-11-28「@ 了只显示正在输入、不回话」与第 1、2 轮审查列出的情境，
-// 以及背景画室（画图交给另一个会话，聊天不被卡住）。
+// 以及背景画室（画图交给另一个会话，聊天不被卡住）与第 3 轮审查的 5 条 High：画室不带私讯内容、
+// 每一段等待都有期限、请求被删时图不掉成一般群讯、工具送讯照发送来源归帐、画室在 chat／full 都能用 krita_batch。
 // 直接拿 VM release 副本里真正的桥接程式码来跑：index.js 的 enqueuePrompt／runPrompt／saveIncoming／
 // commandStop、DiscordRest 与 deliverMessage（送讯回圈），接上同一份副本的 natural-participation.mjs、
 // turn-guard.mjs 与 studio.mjs（画室：真的 Studio／connectStudio／draw_request，画室会话是假的）。
@@ -11,6 +12,7 @@
 // 判定是「每一则 @ 都有正确、及时的回应」：逐则讯息 ID 检查送出的内容、补的那句、先说的那句、
 // 几秒内回应、画好的图回覆到原本那则，每则都要有一组「收到／结果」纪录，「正在输入」一定熄灯、
 // 不超过期限（同一则讯息的每一轮加起来算），日志不能出现讯息内文。
+// 另外几项检查直接用副本里真的 social runtime（index.mjs）、krita-tools.mjs 与 DiscordRest（假 fetch）跑。
 // 任何一项不符就以代码 1 结束。
 import console from 'node:console';
 import { randomUUID } from 'node:crypto';
@@ -113,6 +115,12 @@ const deliverSource = declaration(
 	indexText,
 	'const deliverMessage = (message, naturalTicket) => {',
 );
+// 讯息被删：index.js 原本那一行（修正后会通知画室）。
+const deleteStart = indexText.indexOf('const onMessageDelete = (data) =>');
+const deleteSource = indexText.slice(
+	deleteStart,
+	indexText.indexOf('\n', deleteStart),
+);
 const patched = indexText.includes('runSocialTurn');
 
 // turn-guard（修正后才有）；修正前用副本 bridge.mjs 里原本的 settleSocialTurn／extractSocialReply。
@@ -156,6 +164,16 @@ let studioModule;
 const studioPath = join(runtimeDir, 'studio.mjs');
 if (existsSync(studioPath))
 	studioModule = await import(pathToFileURL(studioPath).href);
+// 桥接收到「讯息被删」时通知画室（修正后才有），取 bridge.mjs 里的原文，currentRuntime 换成情境自己的。
+const bridgeSource = readFileSync(join(runtimeDir, 'bridge.mjs'), 'utf8');
+const deletedSource = bridgeSource.includes(
+	'export function noteSocialStudioDeleted(',
+)
+	? declaration(
+			bridgeSource,
+			'export function noteSocialStudioDeleted(',
+		).replace(/^export /, '')
+	: undefined;
 
 const BOT = '1000000000000000001';
 const OWNER = '1000000000000000002';
@@ -262,10 +280,24 @@ class FakeAgent {
 				}),
 			tool: (name, args) =>
 				this.push('tool/call', { name, arguments: JSON.stringify(args) }),
-			post: (content) =>
-				this.rest.tracked.request('POST', `/channels/${CHANNEL}/messages`, {
-					content,
-				}),
+			// 工具送讯（discord_send_message 不挂回复）。after：工具开始以后过多久才真的送出。
+			// 修正后 runtime 在工具一开始执行时记下来源（哪个会话、为哪则讯息），这里照做。
+			post: (content, { after = 0 } = {}) => {
+				const send = async () => {
+					if (after) await delay(after);
+					return this.rest.tracked.request(
+						'POST',
+						`/channels/${CHANNEL}/messages`,
+						{ content },
+					);
+				};
+				return guard.runWithSocialSendOrigin
+					? guard.runWithSocialSendOrigin(
+							{ sessionId: this.id, channelId: CHANNEL, messageId: id },
+							send,
+						)
+					: send();
+			},
 			// Krita 的预览与交付：回覆原本那则请求。
 			reply: (content, replyTo) =>
 				this.rest.tracked.request('POST', `/channels/${CHANNEL}/messages`, {
@@ -329,6 +361,8 @@ async function play(scene) {
 	const posted = [];
 	const typing = [];
 	const id = () => String(nextId++);
+	// 被删掉的讯息：回覆它时，fail_if_not_exists=false 会掉成一般讯息（orphan），否则 Discord 拒绝（400）。
+	const deleted = new Set();
 	const logger = {
 		info: (text) => logs.push({ at: Date.now(), level: 'info', text }),
 		warn: (text) => logs.push({ at: Date.now(), level: 'warn', text }),
@@ -336,11 +370,14 @@ async function play(scene) {
 	const rest = {
 		async createMessage(channelId, content, replyTo) {
 			await scene.sendDelay?.(content);
+			// DiscordRest.createMessage 固定 fail_if_not_exists=false。
+			const orphan = Boolean(replyTo && deleted.has(replyTo));
 			const sent = {
 				id: id(),
 				at: Date.now(),
 				content,
-				replyTo,
+				replyTo: orphan ? undefined : replyTo,
+				orphan,
 				via: 'bridge',
 			};
 			posted.push(sent);
@@ -360,11 +397,18 @@ async function play(scene) {
 		async request(method, path, body) {
 			if (method === 'POST' && /\/messages$/.test(path)) {
 				await scene.toolDelay?.(body?.content ?? '');
+				const reference = body?.message_reference;
+				const orphan = Boolean(reference && deleted.has(reference.message_id));
+				if (orphan && reference.fail_if_not_exists !== false)
+					throw new Error(
+						`discord REST POST ${path} failed: 400 {"code":10008}`,
+					);
 				const sent = {
 					id: id(),
 					at: Date.now(),
 					content: body?.content ?? '',
-					replyTo: body?.message_reference?.message_id,
+					replyTo: orphan ? undefined : reference?.message_id,
+					orphan,
 					via: 'tool',
 				};
 				posted.push(sent);
@@ -619,6 +663,36 @@ async function play(scene) {
 			beginTypingFor,
 		}),
 	);
+
+	const onMessageDelete = deleteSource
+		? new Function(
+				'scope',
+				`with (scope) { ${deleteSource}; return onMessageDelete; }`,
+			)(
+				scope({
+					scopeAuthority: undefined,
+					socialArchive: () => {},
+					noteSocialStudioDeleted: deletedSource
+						? new Function(
+								'currentRuntime',
+								`${deletedSource}; return noteSocialStudioDeleted;`,
+							)(() => runtime)
+						: undefined,
+				}),
+			)
+		: () => {};
+	for (const item of scene.messages)
+		if (item.deleteAt !== undefined)
+			globalThis.setTimeout(() => {
+				const message = messages.get(item.key);
+				if (!message) return;
+				deleted.add(message.id);
+				onMessageDelete({
+					id: message.id,
+					channel_id: CHANNEL,
+					guild_id: GUILD,
+				});
+			}, item.deleteAt);
 
 	const handlers = [];
 	for (const [index, item] of scene.messages.entries()) {
@@ -1376,6 +1450,111 @@ const scenes = [
 			},
 		},
 	},
+	{
+		name: '画室回一句短话时 Discord 一直不回：不卡住画室，下一张照画',
+		messages: [
+			{ key: 'A', at: 0, content: `${mention} 畫一座城堡 PRIVATE-A` },
+			{
+				key: 'C',
+				at: 5_000,
+				content: `${mention} 畫一顆蘋果 PRIVATE-C`,
+				author: friend,
+			},
+		],
+		// 「卡住了」那句永远送不出去（不管走桥接的 createMessage 还是 REST）。
+		sendDelay: (content) => content === STUDIO_FAILED && new Promise(() => {}),
+		toolDelay: (content) => content === STUDIO_FAILED && new Promise(() => {}),
+		async model(turn, tools) {
+			return chatDraw(tools, turn, { minutes: 1 });
+		},
+		async studio(turn, tools) {
+			if (turn.key === 'A') {
+				await tools.wait(60_000);
+				return tools.fail();
+			}
+			return studioDraw(turn, tools, 1);
+		},
+		typingMax: 30_000,
+		check({ logs, messages }) {
+			const id = messages.get('A')?.id;
+			return logs.some(
+				(line) =>
+					line.text.startsWith(`畫室 结果 #${id} status=failed `) &&
+					line.text.includes('note=timeout'),
+			)
+				? []
+				: ['画室那句短话送不出去时，没有到期限就放弃'];
+		},
+		expect: {
+			A: { posts: [GO], within: 10_000, never: [STUCK] },
+			C: { posts: [QUEUED], final: 330_000, never: [STUCK] },
+		},
+	},
+	{
+		name: '请求讯息被删了：画室安静停掉，图不贴成一般群讯',
+		messages: [
+			{
+				key: 'A',
+				at: 0,
+				content: `${mention} 畫一隻貓 PRIVATE-A`,
+				deleteAt: 60_000,
+			},
+		],
+		async model(turn, tools) {
+			return chatDraw(tools, turn);
+		},
+		// 最坏的情况：画室会话照样画完，交付时 fail_if_not_exists=false（会掉成一般讯息）。
+		studio: (turn, tools) => studioDraw(turn, tools),
+		typingMax: 30_000,
+		check({ logs, posted, messages }) {
+			const problems = [];
+			const id = messages.get('A')?.id;
+			if (posted.some((row) => row.content.startsWith(FINAL)))
+				problems.push('请求被删以后，画好的图还是贴出来了');
+			for (const row of posted.filter((row) => row.orphan))
+				problems.push(
+					`回覆对象被删，「${row.content.slice(0, 12)}」掉成一般群讯`,
+				);
+			if (
+				!logs.some((line) =>
+					line.text.startsWith(`畫室 结果 #${id} status=deleted `),
+				)
+			)
+				problems.push('画室没有因为请求被删而停下');
+			return problems;
+		},
+		expect: {
+			A: { posts: [GO], within: 10_000, never: [STUCK, STUDIO_FAILED] },
+		},
+	},
+	{
+		name: 'A 的工具讯息跨轮才发出、没挂回复：算给 A，不算给 B',
+		messages: [
+			{ key: 'A', at: 0, content: `${mention} 傳個東西 PRIVATE-A` },
+			{ key: 'B', at: 10_000, content: `${mention} 說點什麼 PRIVATE-B` },
+		],
+		async model(turn, tools) {
+			if (turn.key === 'A') {
+				await tools.wait(270_000);
+				// 工具在 A 那轮开始，拖了 20 秒才真的送出：那时 A 已到期限、B 正在跑。
+				void tools.post('工具A', { after: 20_000 });
+				return tools.wait(60_000);
+			}
+			await tools.wait(25_000);
+		},
+		check({ posted, messages }) {
+			const sent = posted.find((row) => row.content === '工具A');
+			const b = messages.get('B');
+			const bStart = Date.parse(b?.timestamp ?? '');
+			return sent && sent.at > bStart + 270_000
+				? []
+				: ['工具A 应该在 B 那轮才送出（情境本身没有重现跨轮送讯）'];
+		},
+		expect: {
+			A: { replies: [STEPS], status: 'notice-sent' },
+			B: { replies: [STUCK], status: 'fallback-sent' },
+		},
+	},
 ];
 
 // 「正在输入」被限流：拿副本里真正的 DiscordRest 与 beginTypingFor 跑。第一次 typing 回 429（retry_after 1 秒），
@@ -1448,6 +1627,471 @@ async function typingRateLimited() {
 		: [];
 }
 
+// ---- 用副本里真的 social runtime、krita-tools、画室与 DiscordRest 跑的检查（第 3 轮审查） ----
+const engine = {
+	blank: () => ({ policy: {} }),
+	recall: (data) => ({ selected: data.memories.map((m) => ({ m })) }),
+};
+// 1×1 的 PNG（Krita 交付的替身）。
+const PNG =
+	'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+const work = (n) => 'work-' + String(n).padStart(24, '0');
+const sceneOf = (values) =>
+	new Proxy(values, {
+		has: () => true,
+		get: (target, key) =>
+			key === Symbol.unscopables
+				? undefined
+				: key in target
+					? target[key]
+					: globalThis[key],
+	});
+async function realRuntime(groupTools) {
+	const { SocialRuntime } = await import(
+		pathToFileURL(join(runtimeDir, 'index.mjs')).href
+	);
+	const stateRoot = mkdtempSync(join(tmpdir(), 'typing-hang-runtime-'));
+	const runtime = new SocialRuntime(
+		{ get: () => undefined },
+		{
+			stateRoot,
+			ownerIds: [OWNER],
+			allowedChannels: ['*'],
+			groupCwd: '/srv/dsh/discord',
+			groupTools,
+		},
+		engine,
+	);
+	return {
+		runtime,
+		cleanup: () => rmSync(stateRoot, { recursive: true, force: true }),
+	};
+}
+// 挂在真 runtime 上的假会话：记下系统提示的每一段、工具清单、inbox 监听；followup 跑 model。
+function runtimeAgent(id, { cwd = '/srv/dsh/discord', model } = {}) {
+	const agent = {
+		id,
+		events: [],
+		seq: 0,
+		contexts: [],
+		allowed: undefined,
+		listeners: new Map(),
+		inbox: { nextTurn: [], nextStep: [], remove: () => false },
+		session: { id, header: { cwd }, snapshotEvents: () => agent.events },
+		ctx: {
+			tools: {
+				restrict: ({ allow }) => {
+					agent.allowed = allow;
+				},
+				presentAs: () => {},
+			},
+			systemPrompt: {
+				context: (row) => agent.contexts.push(row),
+				section: (row) => agent.contexts.push(row),
+			},
+			on: (name, listener) => agent.listeners.set(name, listener),
+		},
+		push(type, data) {
+			agent.events.push({ seq: ++agent.seq, type, time: Date.now(), data });
+		},
+		// 模型看得到的系统提示（每一段都展开）。
+		prompt: () =>
+			agent.contexts
+				.map((row) => (typeof row.text === 'function' ? row.text() : row.text))
+				.join('\n'),
+		activity: Promise.resolve(),
+		followup(message) {
+			agent.listeners.get('agent/inbox/inserted')?.({ message });
+			agent.activity = (async () => {
+				agent.push('turn/start', {});
+				agent.push('user/message', message);
+				await model?.(agent, message);
+				agent.push('turn/end', { reason: { kind: 'completed' } });
+			})();
+		},
+		whenIdle: () => agent.activity,
+		cancel() {},
+	};
+	return agent;
+}
+const userTurn = (agent, messageId, text = '畫') => {
+	agent.push('turn/start', {});
+	agent.push('user/message', {
+		id: randomUUID(),
+		role: 'user',
+		content: [{ type: 'text', text }],
+		source: {
+			kind: 'user',
+			discordMessageId: messageId,
+			discordChannelId: CHANNEL,
+		},
+	});
+};
+const admitted = (runtime, author = { id: OWNER, username: '站長' }) => {
+	const messageId = String(nextId++);
+	runtime.admit({
+		id: messageId,
+		channel_id: CHANNEL,
+		guild_id: GUILD,
+		author,
+		content: `${mention} 幫我畫一隻貓`,
+	});
+	return messageId;
+};
+async function settle(done, ms = 120_000) {
+	for (let elapsed = 0; elapsed < ms && !done(); elapsed += 250) {
+		mock.timers.tick(250);
+		for (let round = 0; round < 6; round++) await realImmediate();
+	}
+}
+// 假 Discord 的 fetch：被删的讯息照 Discord 的规则（fail_if_not_exists=false 掉成一般讯息，否则 400）。
+function fakeDiscord() {
+	const created = [];
+	const deleted = new Set();
+	const fetch = async (url, options = {}) => {
+		if (options.method === 'POST' && /\/channels\/\d+\/messages$/.test(url)) {
+			const payload =
+				options.body instanceof globalThis.FormData
+					? JSON.parse(options.body.get('payload_json'))
+					: JSON.parse(options.body ?? '{}');
+			const reference = payload.message_reference;
+			const orphan = Boolean(reference && deleted.has(reference.message_id));
+			if (orphan && reference.fail_if_not_exists !== false)
+				return new globalThis.Response(
+					JSON.stringify({ code: 10008, message: 'Unknown Message' }),
+					{ status: 400 },
+				);
+			const row = {
+				id: String(nextId++),
+				content: payload.content ?? '',
+				replyTo: orphan ? undefined : reference?.message_id,
+				orphan,
+			};
+			created.push(row);
+			return new globalThis.Response(JSON.stringify(row), { status: 200 });
+		}
+		return new globalThis.Response(null, { status: 204 });
+	};
+	const DiscordRest = new Function(
+		'scope',
+		`with (scope) { return ${restSource.replace(/^var DiscordRest = /, '')} }`,
+	)(sceneOf({ fetch, API_BASE: 'https://discord.invalid/api/v10' }));
+	return { rest: new DiscordRest({ token: 'x' }), created, deleted };
+}
+const studioBridge = (create) => ({
+	config: { preset: '', cwd: '/srv/dsh/discord', titlePrefix: '' },
+	composeSetup: async () => ({ setup: async () => {} }),
+	sessionId: (raw) => 'session-studio-' + raw,
+	agentOptions: () => ({}),
+	userMessage: (content, source) => ({
+		id: randomUUID(),
+		role: 'user',
+		content,
+		source,
+	}),
+	ctx: { agents: { create } },
+});
+
+// 1. 群聊的画室会话不带私讯记忆、拥有者人物卡（正式设定 groupTools=full）。
+async function studioPrivacy() {
+	const problems = [];
+	const { runtime, cleanup } = await realRuntime('full');
+	try {
+		const SECRETS = ['DM-CANARY-記憶-7731', 'DM-CANARY-人物卡-7732'];
+		// 合成的私讯资料：拥有者私讯范围的记忆、拥有者人物卡上「私下」的条目。
+		runtime.memory.recallAcross = (scopes) =>
+			scopes.some((scope) => scope.startsWith('owner-'))
+				? [
+						{
+							id: 'm-1',
+							at: new Date().toISOString(),
+							authorId: OWNER,
+							authorName: '站長',
+							text: SECRETS[0],
+							scope: 'owner-' + OWNER,
+						},
+					]
+				: [];
+		runtime.notes.context = (people) =>
+			people.some(({ id }) => id === OWNER)
+				? `你對在場的人知道的事（人物卡）：\n【站長｜${OWNER}】\n- 私下：${SECRETS[1]}`
+				: '';
+		const messageId = admitted(runtime);
+		const chat = runtimeAgent('session-chat');
+		userTurn(chat, messageId);
+		runtime.prepare(chat, CHANNEL, messageId);
+		const chatPrompt = chat.prompt();
+		if (!SECRETS.every((secret) => chatPrompt.includes(secret)))
+			problems.push('合成的私讯资料没进到群聊会话（检查本身无效）');
+		const posted = [];
+		runtime.discordRest = {
+			request: async (method, path, body) => {
+				const row = {
+					id: String(nextId++),
+					content: body?.content ?? '',
+					replyTo: body?.message_reference?.message_id,
+				};
+				posted.push(row);
+				return row;
+			},
+		};
+		let studioAgent;
+		const studio = studioModule.connectStudio({
+			runtime,
+			bridges: {
+				group: studioBridge(async ({ sessionId }) => {
+					// 最坏的模型：把看到的系统提示与收到的讯息全部贴进交付的那则。
+					studioAgent = runtimeAgent(sessionId, {
+						model: async (agent, message) => {
+							const seen = [
+								agent.prompt(),
+								...message.content.map((block) => block.text),
+							].join('\n');
+							await runtime.discordRest.request(
+								'POST',
+								`/channels/${CHANNEL}/messages`,
+								{
+									content: `${FINAL}\n${seen}`,
+									message_reference: {
+										message_id: message.source.discordMessageId,
+									},
+								},
+							);
+							agent.push('assistant/message', {
+								message: { content: [{ type: 'text', text: '畫好了' }] },
+							});
+						},
+					});
+					return { agent: studioAgent };
+				}),
+			},
+			rest: { request: async () => ({ id: '1' }) },
+			deliveries: (id) => ({
+				final: posted.filter((row) => row.replyTo === id).length,
+				previews: 0,
+			}),
+		});
+		const result = await studioModule
+			.drawRequestTool(runtime)
+			.execute({ action: 'start', brief: '畫一隻橘貓' }, { agent: chat });
+		if (!result.ok) problems.push('draw_request 没有收下');
+		await settle(() => !studio.running && !studio.waiting.length);
+		if (!studioAgent) problems.push('画室会话没有建立');
+		else {
+			const studioPrompt = studioAgent.prompt();
+			for (const secret of SECRETS)
+				if (studioPrompt.includes(secret))
+					problems.push(`画室会话的上下文出现私讯内容（${secret.slice(10)}）`);
+		}
+		if (!posted.some((row) => row.replyTo === messageId))
+			problems.push('画室没有把图回覆到原本那则（检查本身无效）');
+		for (const secret of SECRETS)
+			if (posted.some((row) => row.content.includes(secret)))
+				problems.push(`画室的输出出现私讯内容（${secret.slice(10)}）`);
+	} finally {
+		cleanup();
+	}
+	return problems;
+}
+
+// 2. 请求那则被删了：真的 krita_batch 交付与画室补的那句都不掉成一般群讯（真 DiscordRest，假 fetch）。
+async function deletedRequest() {
+	const problems = [];
+	const { runtime, cleanup } = await realRuntime('full');
+	try {
+		const discord = fakeDiscord();
+		runtime.discordRest = discord.rest;
+		const messageId = admitted(runtime);
+		const studioAgent = runtimeAgent('session-studio-krita');
+		runtime.studios.set(studioAgent.id, 'session-chat');
+		userTurn(studioAgent, messageId);
+		runtime.prepare(studioAgent, CHANNEL, messageId);
+		const { kritaTools } = await import(
+			pathToFileURL(join(runtimeDir, 'krita-tools.mjs')).href
+		);
+		let job = 0;
+		const krita = kritaTools(runtime, {
+			call: async (socket, data) =>
+				data.cancel ? {} : { ok: true, png: PNG, job: work(job), revision: 2 },
+		}).find((tool) => tool.name === 'krita_batch');
+		job = 1;
+		await krita.execute(
+			{ action: 'deliver', job: work(1) },
+			{ agent: studioAgent },
+		);
+		if (!discord.created.some((row) => row.replyTo === messageId))
+			problems.push('Krita 交付没有回覆到原本那则（检查本身无效）');
+		const before = discord.created.length;
+		discord.deleted.add(messageId);
+		job = 2;
+		const result = await krita.execute(
+			{ action: 'deliver', job: work(2) },
+			{ agent: studioAgent },
+		);
+		if (discord.created.length > before)
+			problems.push(
+				`请求被删后，Krita 的图贴成了一般群讯（${discord.created.length - before} 则）`,
+			);
+		if (result.ok) problems.push('请求被删后，Krita 交付仍回报成功');
+		// 画室没收到删除通知（例如闸道漏了这个事件）时，补的那句也不能掉成一般群讯。
+		const failing = studioBridge(async () => {
+			throw new Error('建立失败');
+		});
+		failing.composeSetup = async () => {
+			throw new Error('建立失败');
+		};
+		const studio = studioModule.connectStudio({
+			runtime,
+			bridges: { group: failing, owner: failing },
+			rest: discord.rest,
+			deliveries: () => ({ final: 0, previews: 0 }),
+		});
+		studio.request({
+			channelId: CHANNEL,
+			guildId: GUILD,
+			messageId,
+			authorId: OWNER,
+			authorName: '站長',
+			chatSessionId: 'session-chat',
+			brief: '畫一隻貓',
+		});
+		await settle(() => !studio.running && !studio.waiting.length);
+		if (discord.created.length > before)
+			problems.push('请求被删后，画室补的那句贴成了一般群讯');
+	} finally {
+		cleanup();
+	}
+	return problems;
+}
+
+// 3. 画室会话在 groupTools=chat 与 full 都能用 krita_batch（且只能用它）；聊天会话都不能用。
+async function studioToolsByMode() {
+	const problems = [];
+	for (const mode of ['chat', 'full']) {
+		const { runtime, cleanup } = await realRuntime(mode);
+		try {
+			const studioAgent = runtimeAgent('session-studio-tools');
+			const ownerStudio = runtimeAgent('session-studio-owner', {
+				cwd: '/srv/dsh/owner',
+			});
+			const chat = runtimeAgent('session-chat');
+			runtime.studios.set(studioAgent.id, chat.id);
+			runtime.studios.set(ownerStudio.id, 'session-owner');
+			const blocked = (agent, name) =>
+				runtime.toolGuard({ agent, name, arguments: {} }) !== undefined;
+			if (blocked(studioAgent, 'krita_batch'))
+				problems.push(`groupTools=${mode}：群聊画室的 krita_batch 被挡下`);
+			if (blocked(ownerStudio, 'krita_batch'))
+				problems.push(`groupTools=${mode}：私讯画室的 krita_batch 被挡下`);
+			for (const name of ['remember', 'bash', 'discord_send_message'])
+				if (!blocked(studioAgent, name))
+					problems.push(`groupTools=${mode}：画室会话可以用 ${name}`);
+			if (!blocked(chat, 'krita_batch'))
+				problems.push(`groupTools=${mode}：聊天会话可以直接用 krita_batch`);
+			if (blocked(chat, 'draw_request'))
+				problems.push(`groupTools=${mode}：聊天会话不能用 draw_request`);
+			runtime.mount(studioAgent);
+			runtime.mount(chat);
+			if (JSON.stringify(studioAgent.allowed) !== '["krita_batch"]')
+				problems.push(
+					`groupTools=${mode}：画室会话的工具清单不是只有 krita_batch`,
+				);
+			if (chat.allowed?.includes('krita_batch'))
+				problems.push(`groupTools=${mode}：聊天会话的工具清单有 krita_batch`);
+		} finally {
+			cleanup();
+		}
+	}
+	return problems;
+}
+
+// 4. 工具送讯照发送来源归帐：runtime 注册的每个工具都包了来源；A 的工具拖到 B 那轮才送出仍算 A。
+async function sendOriginCheck() {
+	if (!guard.socialSendOriginTool)
+		return ['turn-guard 没有记下工具送讯的来源，仍照「送出时轮到谁」归帐'];
+	const problems = [];
+	const indexSource = readFileSync(join(runtimeDir, 'index.mjs'), 'utf8');
+	const apply = indexSource.slice(
+		indexSource.indexOf('export async function apply('),
+	);
+	if (
+		apply.split('ctx.tools.register(').length !== 2 ||
+		!apply.includes(
+			'socialSendOriginTool(tool, (exec) => runtime.sendOrigin(exec))',
+		)
+	)
+		problems.push('runtime 有工具没有包上送讯来源');
+	const { runtime, cleanup } = await realRuntime('full');
+	try {
+		const a = admitted(runtime);
+		const b = admitted(runtime, friend);
+		const chat = runtimeAgent('session-chat');
+		userTurn(chat, a);
+		runtime.prepare(chat, CHANNEL, a);
+		const sent = [];
+		const tracked = guard.trackSocialSends(
+			{ request: async () => ({ id: String(nextId++) }) },
+			(channelId, messageId) => sent.push(messageId),
+		);
+		const tool = guard.socialSendOriginTool(
+			{
+				name: 'discord_send_message',
+				execute: async () => {
+					await delay(20_000);
+					return tracked.request('POST', `/channels/${CHANNEL}/messages`, {
+						content: '工具A',
+					});
+				},
+			},
+			(exec) => runtime.sendOrigin(exec),
+		);
+		const pending = tool.execute({}, { agent: chat });
+		// A 那轮结束，轮到 B（会话事件与桥接此刻在跑的都换成 B），工具才送出。
+		chat.push('turn/end', { reason: { kind: 'cancelled' } });
+		userTurn(chat, b);
+		let finished = false;
+		const turn = guard
+			.runSocialTurn(
+				{ channelId: CHANNEL, messageId: b, beginTyping: () => () => {} },
+				async () => {
+					await pending;
+					return { chunks: [], files: [] };
+				},
+			)
+			.finally(() => {
+				finished = true;
+			});
+		await settle(() => finished, 60_000);
+		await turn;
+		if (sent.join() !== a)
+			problems.push(
+				`工具A 记到 ${sent.map((id) => (id === a ? 'A' : id === b ? 'B' : '?')).join('、') || '没有人'}（应该是 A）`,
+			);
+	} finally {
+		cleanup();
+	}
+	return problems;
+}
+
+const runtimeChecks = [
+	{
+		name: '群聊画室不带私讯记忆与拥有者人物卡（上下文与输出）',
+		run: studioPrivacy,
+	},
+	{
+		name: '请求被删：真 krita_batch 交付与画室补话都不掉成一般群讯',
+		run: deletedRequest,
+	},
+	{
+		name: '画室会话在 groupTools=chat 与 full 都能用 krita_batch，聊天会话都不能',
+		run: studioToolsByMode,
+	},
+	{
+		name: '工具送讯照发送来源归帐（真 runtime 的 sendOrigin）',
+		run: sendOriginCheck,
+	},
+];
+
 console.log(`release 副本：${patched ? '已移植修正' : '未移植（现行版本）'}`);
 let failed = 0;
 for (const scene of scenes) {
@@ -1474,6 +2118,20 @@ if (!values.only || '「正在输入」被限流'.includes(values.only)) {
 	failed += problems.length ? 1 : 0;
 	console.log(`
 ${problems.length ? '✖' : '✔'} 「正在输入」被限流：熄灯后不再重送`);
+	for (const problem of problems) console.log(`    问题：${problem}`);
+}
+for (const check of runtimeChecks) {
+	if (values.only && !check.name.includes(values.only)) continue;
+	let problems;
+	try {
+		problems = await check.run();
+	} catch (error) {
+		problems = [
+			`检查本身出错：${String(error?.message ?? error).slice(0, 120)}`,
+		];
+	}
+	failed += problems.length ? 1 : 0;
+	console.log(`\n${problems.length ? '✖' : '✔'} ${check.name}`);
 	for (const problem of problems) console.log(`    问题：${problem}`);
 }
 mock.timers.reset();
