@@ -1,0 +1,12 @@
+# 闲置时重启 Krita，清掉越长越大的记忆体（规则见 krita_idle_restart.py 开头）。由 krita-idle-restart.timer 触发。
+[Unit]
+Description=闲置时重启 Krita（记忆体过大或每日闲置时段）
+After=krita-gate.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /opt/krita-gate/krita_idle_restart.py
+StateDirectory=krita-guard
+StateDirectoryMode=0700
+TimeoutStartSec=300
+NoNewPrivileges=yes

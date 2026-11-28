@@ -1,0 +1,17 @@
+# krita-guard：保护 dsh，Krita 拖累她时先停 Krita，压力退了自动开回来（规则见 krita_guard.py 开头）。
+# 不再 Requires=/PartOf= krita-gate：guard 停掉 gate 以后自己还在，才能自动恢复；停 gate 也不会把它收掉。
+[Unit]
+Description=监测 Krita 作品服务和 DSH 健康（只看 dsh 自己的压力，自动恢复）
+After=dsh.service krita-gate.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /opt/krita-gate/krita_guard.py
+Restart=always
+RestartSec=10
+StateDirectory=krita-guard
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

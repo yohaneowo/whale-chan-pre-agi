@@ -1,0 +1,10 @@
+# 每 10 分钟检查一次要不要在闲置时重启 Krita。
+[Unit]
+Description=每 10 分钟检查 Krita 要不要闲置重启
+
+[Timer]
+OnCalendar=*:0/10
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

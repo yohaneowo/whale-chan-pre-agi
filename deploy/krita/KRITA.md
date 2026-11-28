@@ -3,6 +3,7 @@
 老板授权在 VM 102 装 Krita 6.0.4 AppImage、xvfb、固定 commit 的 krita6-mcp，做原型。
 
 限制：
+
 - 她不给 sudo，由维护帐号代装。
 - 不改 `NoNewPrivileges`，不改防火墙，不用 nft。
 - Krita 用独立帐号、独立服务。
@@ -11,18 +12,18 @@
 
 ## 放了什么
 
-| 东西 | 位置 | 拥有者／权限 |
-|---|---|---|
-| Krita 6.0.4（AppImage 解开，sha256 `4ec9a458…de9f`，KDE 公布值） | `/opt/krita/6.0.4`，`current` 连结 | root，唯读 |
-| krita6-mcp，commit `36388b85d96f526c61d97a400989c09b96c5c30a` | `/opt/krita6-mcp/36388b8`，`current` 连结 | root，唯读 |
-| uv 0.13.6（只给上游检查用，sha256 `f29c3e94…3645`） | `/opt/krita-tools/uv-0.13.6` | root，唯读 |
-| bridge 外挂（已启用） | `/var/lib/krita/.local/share/krita/pykrita/` | root，唯读；`kritarc` 归 krita |
-| krita-gate、监控、上游检查、量测脚本 | `/opt/krita-gate/` | root，唯读 |
-| 系统帐号 `krita`（nologin），群组 `kritaio`（成员：krita、dsh） | — | — |
-| 共用资料夹最上层 | `/srv/dsh/krita-io`；Krita 和 gate 看到的是 `/srv/krita-io` | root:kritaio 0750（谁都不能把 in／out 换成连结） |
-| `in/`：她放要汇入的图 | `/srv/dsh/krita-io/in` | dsh:kritaio 2750（krita 只能读） |
-| `out/`：Krita 存的 .kra、PNG 和预览 | `/srv/dsh/krita-io/out` | krita:kritaio 2750（dsh 只能读，没办法在里面放连结） |
-| 服务 | `krita.service`、`krita-gate.service` | 装好但**不启用、不启动** |
+| 东西                                                             | 位置                                                        | 拥有者／权限                                         |
+| ---------------------------------------------------------------- | ----------------------------------------------------------- | ---------------------------------------------------- |
+| Krita 6.0.4（AppImage 解开，sha256 `4ec9a458…de9f`，KDE 公布值） | `/opt/krita/6.0.4`，`current` 连结                          | root，唯读                                           |
+| krita6-mcp，commit `36388b85d96f526c61d97a400989c09b96c5c30a`    | `/opt/krita6-mcp/36388b8`，`current` 连结                   | root，唯读                                           |
+| uv 0.13.6（只给上游检查用，sha256 `f29c3e94…3645`）              | `/opt/krita-tools/uv-0.13.6`                                | root，唯读                                           |
+| bridge 外挂（已启用）                                            | `/var/lib/krita/.local/share/krita/pykrita/`                | root，唯读；`kritarc` 归 krita                       |
+| krita-gate、监控、上游检查、量测脚本                             | `/opt/krita-gate/`                                          | root，唯读                                           |
+| 系统帐号 `krita`（nologin），群组 `kritaio`（成员：krita、dsh）  | —                                                           | —                                                    |
+| 共用资料夹最上层                                                 | `/srv/dsh/krita-io`；Krita 和 gate 看到的是 `/srv/krita-io` | root:kritaio 0750（谁都不能把 in／out 换成连结）     |
+| `in/`：她放要汇入的图                                            | `/srv/dsh/krita-io/in`                                      | dsh:kritaio 2750（krita 只能读）                     |
+| `out/`：Krita 存的 .kra、PNG 和预览                              | `/srv/dsh/krita-io/out`                                     | krita:kritaio 2750（dsh 只能读，没办法在里面放连结） |
+| 服务                                                             | `krita.service`、`krita-gate.service`                       | 装好但**不启用、不启动**                             |
 
 系统套件只多装 `xvfb`。AppImage 需要系统的 `libEGL.so.1`（`libegl1`、`libgl1-mesa-dri`）；VM 102 已经有，安装脚本同一行列出来只是确认，不会改动。`xauth`、`dbus-run-session` 本来就有。
 
@@ -31,7 +32,7 @@
 - **资源**：Krita 有自己的 cgroup，MemoryMax 1600M、MemoryHigh 1200M、不用 swap、CPU 200%。
   - 超过 1600M 时，只有 Krita 自己的 cgroup 会被 OOM，不会波及 dsh。这一点由 cgroup 保证。
   - `OOMScoreAdjust=800` 只是让整台 VM 内存不够（全域 OOM）时，Krita 比较可能先被杀。这**不保证**一定先杀 Krita、不会杀到 dsh。
-  - 真正的保护是 cgroup 上限，加上 krita-guard 每 5 秒检查一次：VM 可用内存低于 450 MB、或内存／CPU 压力过高，就先停掉 Krita 和检查程式。
+  - 真正的保护是 cgroup 上限，加上 krita-guard 每 5 秒检查一次，dsh 受影响时先停掉 Krita（规则见下面「正式环境的 guard 与闲置重启」）。
 - **沙盒**：`ProtectSystem=strict`、`ProtectHome`、`PrivateTmp`、`PrivateDevices`。能写的只有 `/var/lib/krita` 和共用资料夹。bot 的私人位置都遮起来：`/srv/dsh`、`/var/lib/dsh`、`/opt/dsh`、`/root`，以及有的话 `/etc/dsh`、`/var/backups/dsh`（设定备份）、`/var/log/dsh`、`/run/dsh`。2026-11-01 查过，VM 上目前没有 `/etc/dsh`。
 - **网路**：`IPAddressDeny=any` 加 `IPAddressAllow=localhost`，只能被本机连，自己也不能外连。
 
@@ -141,6 +142,20 @@ sudo sh ~/stage-krita/update_krita_files.sh ~/stage-krita
 4. 用 `update_krita_files.sh` 装上新的 unit 档（先停服务）。
 5. 重跑 `probe_krita`、`smoke_krita`：报告里的 `krita` 版本要是新版本，Python／PyQt 版本也记下来。krita6-mcp 上游测过的组合不一定包括新版本，有差异要写进这份文件。
 6. 都通过了，才照「启动」那段起服务。
+
+## 正式环境的 guard 与闲置重启（2026-11-28 起）
+
+旧的 `krita_guard.sh` 看整台的记忆体压力，Krita 自己顶到 MemoryHigh、开新画布时整台压力会跳到 20% 以上（dsh 其实没受影响），一个取样就把 krita-gate 停掉，而且 guard 自己 `PartOf=krita-gate` 跟着被收掉、Krita 也没真的停、不会自动恢复。现在换成：
+
+- `krita_guard.py`（`krita-works-guard.service`，常驻、`Restart=always`，不再 Requires=/PartOf= krita-gate）：
+  - 只看 **dsh 自己**的 `memory.pressure`（some avg10 > 20%）、整台 CPU 压力（> 60%）、可用记忆体（< 450 MB），要**连续 15 秒以上**才停；整台和 krita 自己的压力只写进日志（`psi_mem`、`krita_psi_mem`）。
+  - dsh 不是 active、被自动重启、有 OOM kill：立刻停。
+  - 停的是 `krita.service`（krita-gate 跟着停），记忆体真的放掉。
+  - **自动恢复**：dsh active、dsh 压力回到 0%（avg10 < 1%）连续 90 秒，就 `systemctl start krita-gate.service`，日志记一笔 `RECOVER`。1 小时内因压力被停满 3 次就不再自动恢复（`LOCKED`），要人手动 start；有人手动 start 时记 `MANUAL`。
+  - Krita 和 gate 都没在跑（手动停、闲置重启中）时什么都不做，所以手动停掉不会被它开回来。
+- `krita_idle_restart.py`（`krita-idle-restart.timer`，每 10 分钟）：gate 的 CPU 用量 30 分钟没变过（没人画），而且 Krita 匿名记忆体 ≥ 1100 MB，或台北时间 4 点且 Krita 已跑 20 小时以上，就重启 Krita。日志记 `IDLE-RESTART`。
+- 部署：`sh deploy_guard.sh <资料夹>`，会先备份到 `/var/backups/krita-guard-<时间>/` 并写好那里的 `rollback.sh`。测试：`python3 -m unittest test_krita_guard`；真机验证：`guard_livetest.sh`（另起一个测试 guard，只把 dsh 压力换成假的，真的停 / 开一次 Krita，并用 `measure_cold_start.py` 量冷启动）。
+- 2026-11-28 实测：假 dsh 压力 30% 第 15 秒停，改回 0% 后 91 秒自动开回；Krita 冷启动桥接就绪 5.4 秒、第一张空白画布 0.5 秒；重启前 anon 1220 MB、重启后约 350 MB。重启前 Krita 已顶在 MemoryHigh 上，开一张新画布就让 krita 自己的压力到约 80%、整台约 70%，dsh 压力仍是 0%，新 guard 没有误停。
 
 ## 停止（一行）
 
